@@ -56,12 +56,12 @@ Extract a newer ZIP and run from that extracted folder:
 .\update-tray.ps1 -SourceDir $PWD.Path
 ```
 
-The updater uses the new release's setup script and requests one UAC prompt for the protected machine files, while user settings and receipts remain unelevated. Admin input is a separate optional component; use `-IncludeAgent` to update its binaries and tasks. Tray helper repair can only use the setup source already protected under Program Files; if that source is unavailable or untrusted, extract a new release and run its `setup-tray.ps1`. A candidate ZIP is not an automatic updater service.
+The updater uses the new release's setup script and requests one UAC prompt for the protected machine files, while user settings and receipts remain unelevated. Full updates refresh both privileged helpers; `-IncludeAgent` remains accepted for compatibility. To restore an older version, run setup from that trusted release; the unelevated tray cannot replace Program Files binaries. Tray helper repair can only use the setup source already protected under Program Files; if that source is unavailable or untrusted, extract a new release and run its `setup-tray.ps1`. A candidate ZIP is not an automatic updater service.
 
 ## Remove or diagnose
 
 Remove BubblePlay through Windows Settings > Apps, or run `uninstall-tray.ps1` from its install folder. The uninstall retains user configuration unless `-RemoveData` is explicitly supplied.
 
-Installed executables, scripts and runtime assets live in `%ProgramFiles%\BubblePlay`, with privileged helpers in `agent`. Configuration, bounded logs and receipts live in `%LOCALAPPDATA%\BubblePlay`. Host credentials are protected with CurrentUser DPAPI. Keep raw configuration, relay secrets and unrelated desktop/file content out of bug reports.
+Installed executables, scripts and runtime assets live in `%ProgramFiles%\BubblePlay`, with privileged helpers in `agent`. Configuration, bounded logs and receipts live in `%LOCALAPPDATA%\BubblePlay`. Host credentials use CurrentUser DPAPI with fixed BubblePlay application entropy; valid legacy blobs migrate on their next successful load. Keep raw configuration, relay secrets and unrelated desktop/file content out of bug reports.
 
 A clean second-PC installation and update of the protected Program Files layout remain release acceptance checks.

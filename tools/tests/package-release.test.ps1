@@ -68,6 +68,7 @@ try {
         Assert ($manifest.sourceDirty -eq $true -and $manifest.sourceState -eq 'uncommitted') 'Dirty candidate is explicitly identified.'
         Assert ($manifest.releaseIntent -eq 'candidate' -and -not $manifest.productLicenseIncluded) 'Candidate does not imply product licensing.'
         Assert ($manifest.files.Count -eq 9) 'Manifest inventories every payload file.'
+        Assert ($manifest.profile -eq 'per-machine-tray') 'Release declares the protected machine install layout.'
     }
     finally { $zip.Dispose() }
     $count++
@@ -111,6 +112,36 @@ try {
     $parameters.OutputDir = Join-Path $fixture 'hash-mismatch'
     Expect-Failure { & $Builder @parameters -ExpectedBinaryHashes @{ 'bubbleplay-host.exe' = ('0' * 64) } } 'hash does not match'
     Assert (-not (Test-Path -LiteralPath $parameters.OutputDir)) 'Wrong binary identity never reaches output.'
+    $count++
+
+    # Optional Flutter runtime belongs to the same protected program package.
+    # It includes root DLLs and nested assets, never symbols/configs or tools.
+    $appDir = Join-Path $fixture 'flutter-release'
+    [void][IO.Directory]::CreateDirectory((Join-Path $appDir 'data\flutter_assets'))
+    foreach ($name in @('bubbleplay_app.exe', 'flutter_windows.dll', 'bubbleplay_app_core.dll')) {
+        Copy-Item -LiteralPath (Join-Path $binaryDir 'bubbleplay-host.exe') -Destination (Join-Path $appDir $name)
+    }
+    Write-Fixture (Join-Path $appDir 'data\icudtl.dat') 'Synthetic runtime data.'
+    Write-Fixture (Join-Path $appDir 'data\flutter_assets\AssetManifest.bin') 'Synthetic asset manifest.'
+    foreach ($name in @('host.json', '.env', 'symbols.pdb', 'probe.exe', 'host.log')) {
+        Write-Fixture (Join-Path $appDir $name) 'EXCLUDED_SYNTHETIC_PRIVATE_MARKER'
+    }
+    $parameters.AppDir = $appDir
+    $parameters.OutputDir = Join-Path $fixture 'with-app'
+    $appPackage = & $Builder @parameters
+    $zip = [IO.Compression.ZipFile]::OpenRead($appPackage.path)
+    try {
+        foreach ($name in @('bubbleplay_app.exe', 'flutter_windows.dll', 'bubbleplay_app_core.dll', 'data/icudtl.dat', 'data/flutter_assets/AssetManifest.bin')) {
+            Assert ($null -ne $zip.GetEntry($name)) "App runtime file is packaged: $name"
+        }
+        foreach ($name in @('host.json', '.env', 'symbols.pdb', 'probe.exe', 'host.log')) {
+            Assert ($null -eq $zip.GetEntry($name)) "Unrelated app output stays excluded: $name"
+        }
+        $reader = New-Object IO.StreamReader($zip.GetEntry('release-manifest.json').Open())
+        try { $manifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+        Assert ($manifest.files.Count -eq 15) 'Manifest covers the licensed base payload and every Flutter runtime file.'
+    }
+    finally { $zip.Dispose() }
     $count++
     Write-Output "$count package checks passed; no executables or installer scripts were run."
 }

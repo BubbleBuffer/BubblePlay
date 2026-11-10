@@ -1,72 +1,59 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Uninstall BubblePlay for the current user (the "Apps" entry runs this).
-
+    Remove the protected Program Files install with one UAC prompt.
 .DESCRIPTION
-    Elevated part (ONE UAC prompt, only when something machine-wide is
-    installed): unregister the \BubblePlay\AdminAgent and \BubblePlay\SecureDesktop tasks, delete
-    %ProgramFiles%\BubblePlay\agent, the AdminModeOff task and
-    HKLM\SOFTWARE\BubblePlay policy key, and remove leftovers of the old elevated
-    host path (\BubblePlay\ElevatedHost, %ProgramFiles%\BubblePlay\elevated).
-    %ProgramFiles%\BubblePlay is removed when it ends up empty.
-
-    User part (no elevation): quit the tray (its host and agent exit with
-    it), remove the HKCU Run value, the Start-menu shortcut, the HKCU
-    uninstall entry and %LOCALAPPDATA%\Programs\BubblePlay. The data folder
-    %LOCALAPPDATA%\BubblePlay (host.json with DPAPI-protected tokens, logs,
-    receipts) is kept unless -RemoveData is given.
-
-    -WhatIf previews everything without elevating or changing anything.
+    Only the protected Program Files script runs elevated. It removes machine
+    tasks, policy and program files. The unelevated parent removes HKCU entries,
+    legacy per-user binaries and, with -RemoveData, LOCALAPPDATA\BubblePlay.
+    Links at every depth are refused. -WhatIf changes nothing.
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
-param(
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\BubblePlay'),
-    [switch]$RemoveData,
-    # Internal: the elevated half, started by this script through one UAC prompt.
-    [switch]$MachinePhase,
-    # Internal: this copy runs from %TEMP% so the install folder can be deleted.
-    [switch]$Relocated
-)
-
+param([string]$InstallDir, [switch]$RemoveData, [switch]$MachinePhase)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-$ProgramFilesRoot = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
-$MachineDir = Join-Path $ProgramFilesRoot 'BubblePlay'
-$AgentDir = Join-Path $MachineDir 'agent'
-$LegacyElevatedDir = Join-Path $MachineDir 'elevated'
-$TaskPath = '\BubblePlay\'
-$Tasks = @('AdminAgent', 'SecureDesktop', 'AdminModeOff', 'ElevatedHost')
-$AdminModeRegistryPath = 'SOFTWARE\BubblePlay'
-$AdminModeKey = 'HKLM:\SOFTWARE\BubblePlay'
-$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$RunValue = 'BubblePlayTray'
-$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BubblePlay'
-$StartMenuShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'BubblePlay.lnk'
-$SendToShortcut = Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay.lnk'
-$DataDir = Join-Path $env:LOCALAPPDATA 'BubblePlay'
-$PowerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
-$IsWhatIf = [bool]$WhatIfPreference
-$IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator)
-
-function Write-Step([string]$Name, [string]$Status, [string]$Detail) {
-    $label = if ($IsWhatIf -and $Status -eq 'planned') { 'PLAN' } else { $Status.ToUpperInvariant() }
-    Write-Host ("[{0,-9}] {1}: {2}" -f $label, $Name, $Detail)
+if (-not [Environment]::Is64BitProcess) { throw 'Use 64-bit PowerShell for the Windows x64 BubblePlay package.' }
+$SystemDirectory = [Environment]::GetFolderPath('System')
+$SystemModuleRoot = [IO.Path]::Combine($PSHOME, 'Modules')
+$WindowsModuleRoot = [IO.Path]::Combine($SystemDirectory, 'WindowsPowerShell\v1.0\Modules')
+$IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($IsElevated -or $MachinePhase) {
+    $env:PSModulePath = $SystemModuleRoot + ';' + $WindowsModuleRoot
+    $PSModuleAutoLoadingPreference = 'None'
+    foreach ($name in 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Security') {
+        Import-Module ([IO.Path]::Combine($SystemModuleRoot, $name, "$name.psd1")) -ErrorAction Stop
+    }
 }
-
+$ProgramFilesRoot = [Environment]::GetFolderPath('ProgramFiles')
+$MachineDir = Join-Path $ProgramFilesRoot 'BubblePlay'
+if (-not $InstallDir) { $InstallDir = $MachineDir }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+if ($InstallDir -ine $MachineDir.TrimEnd('\')) { throw "InstallDir must be $MachineDir." }
+$TaskPath = '\BubblePlay\'
+$Tasks = @('AdminAgent', 'SecureDesktop', 'AdminModeOff', 'ElevatedHost', 'LaunchTray')
+$AdminModeRegistryPath = 'SOFTWARE\BubblePlay'
+$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$UninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\BubblePlay'
+$RunValue = 'BubblePlayTray'
+$LegacyUserDir = $null; $DataDir = $null
+if (-not $MachinePhase -and -not $IsElevated) {
+    $LegacyUserDir = Join-Path $env:LOCALAPPDATA 'Programs\BubblePlay'
+    $DataDir = Join-Path $env:LOCALAPPDATA 'BubblePlay'
+}
+$PowerShellExe = Join-Path $SystemDirectory 'WindowsPowerShell\v1.0\powershell.exe'
+$IsWhatIf = [bool]$WhatIfPreference
+$IsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$TrustedSids = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+$WriteRights = [int64]([Security.AccessControl.FileSystemRights]::WriteData -bor [Security.AccessControl.FileSystemRights]::AppendData -bor
+    [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+    [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+    [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership) -bor 0x40000000 -bor 0x10000000
 function Invoke-Schtasks([string[]]$Arguments) {
-    $exe = Join-Path $env:SystemRoot 'System32\schtasks.exe'
-    # Native stderr ("task not found") must not become a terminating error.
     $ErrorActionPreference = 'Continue'
-    $null = & $exe @Arguments 2>&1
+    $null = & (Join-Path $SystemDirectory 'schtasks.exe') @Arguments 2>&1
     return $LASTEXITCODE
 }
-
 function Test-Task([string]$Name) { (Invoke-Schtasks @('/query', '/tn', "$TaskPath$Name")) -eq 0 }
-
 function Test-AdminModeKeyExists {
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
     try {
@@ -75,158 +62,149 @@ function Test-AdminModeKeyExists {
         $key.Dispose()
         return $true
     }
-    catch { return $true } # Inaccessible policy still requires elevated removal.
+    catch { return $true }
     finally { $base.Dispose() }
 }
 
-function Get-MachineWork {
-    $work = @()
-    foreach ($name in $Tasks) { if (Test-Task $name) { $work += "unregister task $TaskPath$name" } }
-    foreach ($dir in @($AgentDir, $LegacyElevatedDir)) { if (Test-Path -LiteralPath $dir) { $work += "delete $dir" } }
-    if (Test-AdminModeKeyExists) { $work += "delete $AdminModeKey" }
-    return , $work
-}
-
-function Remove-WithRetry([string]$Path) {
-    $resolved = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $allowed = @($AgentDir, $LegacyElevatedDir, $InstallDir, $DataDir) | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
-    if ($allowed -notcontains $resolved) { throw "Refusing unexpected delete target: $resolved" }
-    if ((Test-Path -LiteralPath $resolved) -and ((Get-Item -LiteralPath $resolved -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing reparse-point delete: $resolved" }
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
-    while (Test-Path -LiteralPath $Path) {
-        try { Remove-Item -Recurse -Force -LiteralPath $Path; return }
-        catch { if ([DateTime]::UtcNow -gt $deadline) { throw }; Start-Sleep -Milliseconds 500 }
+function Assert-NoReparse([string]$Path) {
+    $absolute = [IO.Path]::GetFullPath($Path)
+    while ($absolute) {
+        $item = Get-Item -LiteralPath $absolute -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Reparse paths are not accepted: $absolute" }
+        $parent = [IO.Path]::GetDirectoryName($absolute)
+        if ($parent -eq $absolute) { break }
+        $absolute = $parent
     }
 }
 
+
+function Get-SafeTreeFiles([string]$Path, [switch]$IncludeDirectories) {
+    Assert-NoReparse $Path
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force) {
+        Assert-NoReparse $item.FullName
+        if ($item.PSIsContainer) {
+            if ($IncludeDirectories) { $item }
+            Get-SafeTreeFiles $item.FullName -IncludeDirectories:$IncludeDirectories
+        }
+        else { $item }
+    }
+}
+
+
+function Remove-SafeTree([string]$Path) {
+    Assert-NoReparse $Path
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    # Preflight the entire tree before deleting anything, then recheck each entry.
+    $null = @(Get-SafeTreeFiles $Path)
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force) {
+        Assert-NoReparse $item.FullName
+        if ($item.PSIsContainer) { Remove-SafeTree $item.FullName }
+        else { Remove-Item -LiteralPath $item.FullName -Force }
+    }
+    Assert-NoReparse $Path
+    [IO.Directory]::Delete($Path, $false)
+}
+
+
+function Get-UnsafeAclFindings([string]$Path) {
+    $findings = @()
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $findings += "$Path is a reparse point" }
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($TrustedSids -notcontains $owner) { $findings += "$Path owner $owner is not SYSTEM/Administrators/TrustedInstaller" }
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne 'Allow') { continue }
+        $sid = $rule.IdentityReference.Value
+        # CREATOR OWNER only applies to objects owned by the (trusted) creator.
+        if ($TrustedSids -contains $sid -or $sid -eq 'S-1-3-0') { continue }
+        if (([int64]$rule.FileSystemRights -band $WriteRights) -ne 0) {
+            $findings += "$Path grants $($rule.FileSystemRights) to $sid"
+        }
+    }
+    return , $findings
+}
+
+
+function Assert-ProtectedUninstaller {
+    $expected = Join-Path $MachineDir 'uninstall-tray.ps1'
+    Assert-NoReparse $expected
+    if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) { throw 'Protected uninstaller is missing. Run current setup to migrate/repair this installation first.' }
+    foreach ($path in @($ProgramFilesRoot, $MachineDir, $expected)) {
+        $findings = Get-UnsafeAclFindings $path
+        if ($findings.Count) { throw "Unsafe protected uninstaller: $($findings -join '; ')" }
+    }
+}
+function Stop-InstallProcesses([string]$Root) {
+    Get-Process bubbleplay_tray, bubbleplay-host, bubbleplay_app, bubbleplay_admin_agent, bubbleplay_secure_helper -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and $_.Path.StartsWith($Root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+}
 function Invoke-MachineSteps {
+    Assert-ProtectedUninstaller
+    # Preflight the entire tree before removing tasks or policy. Each deletion
+    # rechecks ancestors and children, and .NET nonrecursive deletion cannot
+    # traverse a junction on Windows PowerShell 5.1.
+    $null = @(Get-SafeTreeFiles $MachineDir)
+    foreach ($item in Get-SafeTreeFiles $MachineDir -IncludeDirectories) {
+        $findings = Get-UnsafeAclFindings $item.FullName
+        if ($findings.Count) { throw "Unsafe protected uninstall tree: $($findings -join '; ')" }
+    }
     foreach ($name in $Tasks) {
         if (-not (Test-Task $name)) { continue }
-        if ($PSCmdlet.ShouldProcess("$TaskPath$name", 'End and unregister')) {
-            # SecureDesktop is a launcher: ending the task does not end its child.
+        if ($PSCmdlet.ShouldProcess("$TaskPath$name", 'End and unregister task')) {
             if ($name -ne 'SecureDesktop') { [void](Invoke-Schtasks @('/end', '/tn', "$TaskPath$name")) }
-            [void](Invoke-Schtasks @('/delete', '/tn', "$TaskPath$name", '/f'))
-            Write-Step 'task' 'done' "Removed $TaskPath$name."
+            $code = Invoke-Schtasks @('/delete', '/tn', "$TaskPath$name", '/f')
+            if ($code -ne 0) { throw "Failed to remove $TaskPath$name ($code)." }
         }
-        else { Write-Step 'task' 'planned' "Remove $TaskPath$name." }
     }
-    foreach ($dir in @($AgentDir, $LegacyElevatedDir)) {
-        if (-not (Test-Path -LiteralPath $dir)) { continue }
-        if ($PSCmdlet.ShouldProcess($dir, 'Stop its processes and delete')) {
-            Get-Process bubbleplay_admin_agent, bubbleplay_secure_helper, bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
-                Where-Object { $_.Path -and $_.Path.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase) } |
-                Stop-Process -Force -ErrorAction SilentlyContinue
-            Remove-WithRetry $dir
-            Write-Step 'machine-files' 'done' "Deleted $dir."
+    if ((Test-AdminModeKeyExists) -and $PSCmdlet.ShouldProcess('HKLM:\SOFTWARE\BubblePlay', 'Delete protected Admin mode policy')) {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        try { $base.DeleteSubKeyTree($AdminModeRegistryPath, $false) } finally { $base.Dispose() }
+    }
+    if ($PSCmdlet.ShouldProcess($MachineDir, 'Stop installed processes and delete protected program tree')) {
+        Stop-InstallProcesses $MachineDir
+        Set-Location -LiteralPath $SystemDirectory
+        $deadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (Test-Path -LiteralPath $MachineDir) {
+            try { Remove-SafeTree $MachineDir }
+            catch { if ([DateTime]::UtcNow -gt $deadline) { throw }; Start-Sleep -Milliseconds 300 }
         }
-        else { Write-Step 'machine-files' 'planned' "Delete $dir." }
-    }
-    if (Test-AdminModeKeyExists) {
-        if ($PSCmdlet.ShouldProcess($AdminModeKey, 'Delete protected Admin mode policy key')) {
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-            try { $base.DeleteSubKeyTree($AdminModeRegistryPath, $false) }
-            finally { $base.Dispose() }
-            Write-Step 'admin-mode-policy' 'done' "Deleted $AdminModeKey."
-        }
-        else { Write-Step 'admin-mode-policy' 'planned' "Delete $AdminModeKey." }
-    }
-    if ((Test-Path -LiteralPath $MachineDir) -and -not (Get-ChildItem -LiteralPath $MachineDir -Force | Select-Object -First 1)) {
-        if ($PSCmdlet.ShouldProcess($MachineDir, 'Delete empty folder')) { Remove-Item -Force -LiteralPath $MachineDir }
     }
 }
-
 if ($MachinePhase) {
     if (-not $IsElevated -and -not $IsWhatIf) { throw '-MachinePhase must run elevated.' }
+    if ([IO.Path]::GetFullPath($PSCommandPath) -ine (Join-Path $MachineDir 'uninstall-tray.ps1')) { throw 'Machine uninstall must execute the protected Program Files script.' }
     Invoke-MachineSteps
-    exit 0
+    return
 }
-
-# Run from a temporary copy so the install folder (which holds this script)
-# can be deleted.
-if (-not $Relocated -and -not $IsWhatIf -and $PSCommandPath.StartsWith("$InstallDir\", [StringComparison]::OrdinalIgnoreCase)) {
-    $copy = Join-Path ([IO.Path]::GetTempPath()) ("bubbleplay-uninstall-{0}.ps1" -f [Guid]::NewGuid().ToString('N'))
-    Copy-Item -LiteralPath $PSCommandPath -Destination $copy
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$copy`"", '-Relocated', '-InstallDir', "`"$InstallDir`"")
-    if ($RemoveData) { $arguments += '-RemoveData' }
-    $child = Start-Process -FilePath $PowerShellExe -ArgumentList $arguments -Wait -PassThru -NoNewWindow
-    exit $child.ExitCode
+if ($IsElevated) { throw 'Run uninstall from a normal desktop PowerShell; only the protected machine child runs elevated.' }
+# The parent keeps its parsed script in memory while the machine child removes
+# Program Files. No elevated TEMP copy or delayed command is ever created.
+foreach ($root in @($MachineDir, $LegacyUserDir)) {
+    if ($PSCmdlet.ShouldProcess($root, 'Quit installed tray and app')) {
+        $tray = Join-Path $root 'bubbleplay_tray.exe'
+        Assert-NoReparse $tray
+        if (Test-Path -LiteralPath $tray -PathType Leaf) { Start-Process -FilePath $tray -ArgumentList '--quit' -Wait -WindowStyle Hidden }
+        Stop-InstallProcesses $root
+    }
 }
-Set-Location -LiteralPath ([IO.Path]::GetTempPath())
-
-try {
-    # 1. Elevated part first (one UAC prompt), only if something is installed.
-    $work = Get-MachineWork
-    if ($work.Count -eq 0) { Write-Step 'machine' 'unchanged' 'No admin agent or old elevated host installed (no UAC prompt).' }
-    elseif ($IsElevated) { Invoke-MachineSteps }
-    elseif ($PSCmdlet.ShouldProcess('uninstall-tray.ps1 -MachinePhase', 'Elevate once (UAC)')) {
-        Write-Step 'elevate' 'running' ("one UAC prompt to: " + ($work -join '; '))
-        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-MachinePhase')
-        try { $child = Start-Process -FilePath $PowerShellExe -ArgumentList $arguments -Verb RunAs -Wait -PassThru -WindowStyle Hidden }
-        catch { throw "The administrator prompt was declined or failed ($($_.Exception.Message)); nothing was removed." }
-        if ($child.ExitCode -ne 0) { throw "The elevated part failed with exit code $($child.ExitCode); nothing else was removed." }
-        Write-Step 'elevate' 'done' 'Admin agent and old elevated host removed.'
-    }
-    else { Write-Step 'elevate' 'planned' ("one UAC prompt to: " + ($work -join '; ')) }
-
-    # 2. User part.
-    $tray = Join-Path $InstallDir 'bubbleplay_tray.exe'
-    if (Get-Process bubbleplay_tray -ErrorAction SilentlyContinue) {
-        if ($PSCmdlet.ShouldProcess('bubbleplay_tray', 'Quit tray')) {
-            if (Test-Path -LiteralPath $tray) { Start-Process -FilePath $tray -ArgumentList '--quit' -Wait -WindowStyle Hidden }
-            Start-Sleep -Milliseconds 500
-            Get-Process bubbleplay_tray, bubbleplay-host, bubbleplay_admin_agent -ErrorAction SilentlyContinue |
-                Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) } |
-                Stop-Process -Force -ErrorAction SilentlyContinue
-            Write-Step 'tray' 'done' 'Tray stopped.'
-        }
-        else { Write-Step 'tray' 'planned' 'Quit the running tray.' }
-    }
-    $props = Get-ItemProperty -Path $RunKey -ErrorAction SilentlyContinue
-    if ($props -and $props.PSObject.Properties[$RunValue]) {
-        if ($PSCmdlet.ShouldProcess("$RunKey\$RunValue", 'Remove autostart')) { Remove-ItemProperty -Path $RunKey -Name $RunValue; Write-Step 'autostart' 'done' 'Removed.' }
-        else { Write-Step 'autostart' 'planned' "Remove HKCU Run\$RunValue." }
-    }
-    foreach ($item in @($StartMenuShortcut, $SendToShortcut, $UninstallKey)) {
-        if (-not (Test-Path -LiteralPath $item)) { continue }
-        if ($PSCmdlet.ShouldProcess($item, 'Remove')) { Remove-Item -Recurse -Force -LiteralPath $item; Write-Step 'registration' 'done' "Removed $item." }
-        else { Write-Step 'registration' 'planned' "Remove $item." }
-    }
-    # Flutter app files that update-tray.ps1 mirrored into the install folder (listed in app-files.json).
-    $appManifest = Join-Path $InstallDir 'app-files.json'
-    if (Test-Path -LiteralPath $appManifest -PathType Leaf) {
-        $appFiles = @()
-        try {
-            foreach ($file in @((Get-Content -LiteralPath $appManifest -Raw | ConvertFrom-Json).files)) {
-                $relative = [string]$file.path
-                if ($relative -and -not [IO.Path]::IsPathRooted($relative) -and -not (($relative -split '[\\/]') -contains '..')) {
-                    $appFiles += (Join-Path $InstallDir $relative)
-                }
-            }
-        }
-        catch { }
-        $appRunning = @(Get-Process bubbleplay_app -ErrorAction SilentlyContinue |
-                Where-Object { $_.Path -and $_.Path.StartsWith("$InstallDir\", [StringComparison]::OrdinalIgnoreCase) })
-        if ($PSCmdlet.ShouldProcess($InstallDir, "Remove $($appFiles.Count) Flutter app file(s) listed in app-files.json")) {
-            foreach ($process in $appRunning) {
-                [void]$process.CloseMainWindow()
-                if (-not $process.WaitForExit(10000)) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
-            }
-            foreach ($path in $appFiles) { Remove-Item -Force -LiteralPath $path -ErrorAction SilentlyContinue }
-            Remove-Item -Force -LiteralPath $appManifest -ErrorAction SilentlyContinue
-            Write-Step 'app-files' 'done' "Removed $($appFiles.Count) Flutter app file(s)."
-        }
-        else { Write-Step 'app-files' 'planned' "Remove $($appFiles.Count) Flutter app file(s) listed in app-files.json." }
-    }
-    if (Test-Path -LiteralPath $InstallDir) {
-        if ($PSCmdlet.ShouldProcess($InstallDir, 'Delete per-user install')) { Remove-WithRetry $InstallDir; Write-Step 'files' 'done' "Deleted $InstallDir." }
-        else { Write-Step 'files' 'planned' "Delete $InstallDir." }
-    }
-    if ($RemoveData -and (Test-Path -LiteralPath $DataDir)) {
-        if ($PSCmdlet.ShouldProcess($DataDir, 'Delete data (host.json, logs, receipts)')) { Remove-WithRetry $DataDir; Write-Step 'data' 'done' "Deleted $DataDir." }
-        else { Write-Step 'data' 'planned' "Delete $DataDir." }
-    }
-    elseif (Test-Path -LiteralPath $DataDir) { Write-Step 'data' 'kept' "$DataDir kept (pass -RemoveData to delete it)." }
+Set-Location -LiteralPath $SystemDirectory
+$machineWork = (Test-Path -LiteralPath $MachineDir) -or (Test-AdminModeKeyExists)
+foreach ($name in $Tasks) { if (Test-Task $name) { $machineWork = $true } }
+if ($machineWork -and $PSCmdlet.ShouldProcess($MachineDir, 'Elevate protected uninstaller once (UAC)')) {
+    Assert-ProtectedUninstaller
+    $protected = Join-Path $MachineDir 'uninstall-tray.ps1'
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$protected`"", '-MachinePhase')
+    $child = Start-Process -FilePath $PowerShellExe -ArgumentList $arguments -Verb RunAs -Wait -PassThru -WindowStyle Hidden
+    if ($child.ExitCode -ne 0) { throw "Machine uninstall failed with exit code $($child.ExitCode). User configuration was retained." }
 }
-finally {
-    if ($Relocated) { Remove-Item -Force -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue }
+$props = Get-ItemProperty -Path $RunKey -ErrorAction SilentlyContinue
+if ($props -and $props.PSObject.Properties[$RunValue] -and $PSCmdlet.ShouldProcess("$RunKey\$RunValue", 'Remove user autostart')) { Remove-ItemProperty -Path $RunKey -Name $RunValue }
+foreach ($item in @((Join-Path ([Environment]::GetFolderPath('Programs')) 'BubblePlay.lnk'), (Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay.lnk'))) {
+    if ((Test-Path -LiteralPath $item) -and $PSCmdlet.ShouldProcess($item, 'Remove user shortcut')) { Remove-Item -LiteralPath $item -Force }
 }
+if ((Test-Path -LiteralPath $UninstallKey) -and $PSCmdlet.ShouldProcess($UninstallKey, 'Remove user uninstall registration')) { Remove-Item -LiteralPath $UninstallKey -Recurse -Force }
+if ((Test-Path -LiteralPath $LegacyUserDir) -and $PSCmdlet.ShouldProcess($LegacyUserDir, 'Delete legacy per-user program files')) { Remove-SafeTree $LegacyUserDir }
+if ($RemoveData -and (Test-Path -LiteralPath $DataDir) -and $PSCmdlet.ShouldProcess($DataDir, 'Delete user config, logs and receipts')) { Remove-SafeTree $DataDir }
+elseif (Test-Path -LiteralPath $DataDir) { Write-Host "User data kept in $DataDir (pass -RemoveData to delete)." }

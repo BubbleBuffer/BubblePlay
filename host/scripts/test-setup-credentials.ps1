@@ -1,4 +1,4 @@
-# Synthetic configuration tests. Import only function ASTs; never execute setup.
+# Synthetic credential and filesystem boundary checks; never install or elevate.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $path = Join-Path $PSScriptRoot 'setup-tray.ps1'
@@ -79,3 +79,55 @@ Invoke-ServicesPreview -WhatIf
 if ($stepDetails[0] -ne 'services planned Stop and delete: BubblePlayTransport (ProgramData is kept).') { throw "Transport removal must be planned and recorded: $($stepDetails[0])" }
 if ($stepDetails[1] -notlike 'services-kept skipped *') { throw 'The kept services must be recorded.' }
 Write-Output 'setup credential tests passed (boundaries, fresh/saved/migrated config, removed-field rewrite, explicit empty/token-only updates, Transport removal; no writes).'
+
+# Import the real protection and tree-deletion functions without executing setup.
+# Only synthetic credentials and a uniquely named temporary fixture are used.
+foreach ($name in @('ConvertTo-Hex', 'ConvertFrom-Hex', 'Protect-UserHex', 'Unprotect-Hex', 'Assert-NoReparse', 'Get-SafeTreeFiles', 'Remove-SafeTree')) {
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    if (-not $node) { throw "Missing tested function $name." }
+    Invoke-Expression $node.Extent.Text
+}
+Add-Type -AssemblyName System.Security
+$encoded = Protect-UserHex $goodToken
+if ((Unprotect-Hex $encoded) -ne $goodToken -or $script:LegacyUserProtection) { throw 'App-entropy token must decrypt without legacy fallback.' }
+$bytes = [Text.Encoding]::UTF8.GetBytes($goodToken)
+try {
+    $legacy = ConvertTo-Hex ([Security.Cryptography.ProtectedData]::Protect($bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser))
+}
+finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+if ((Unprotect-Hex $legacy) -ne $goodToken -or -not $script:LegacyUserProtection) { throw 'Legacy null-entropy token must remain readable and be marked for rewrite.' }
+$wrongEntropy = [Text.Encoding]::UTF8.GetBytes('synthetic.other.application')
+$rejected = $false
+try { $null = [Security.Cryptography.ProtectedData]::Unprotect((ConvertFrom-Hex $encoded), $wrongEntropy, [Security.Cryptography.DataProtectionScope]::CurrentUser) } catch { $rejected = $true }
+if (-not $rejected) { throw 'An app-entropy blob must reject different entropy.' }
+
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+$fixture = Join-Path $tempRoot ('bubbleplay-install-test-' + [Guid]::NewGuid().ToString('N'))
+$tree = Join-Path $fixture 'install'
+$outside = Join-Path $fixture 'outside'
+$link = Join-Path $tree 'data\assets\linked'
+try {
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $link))
+    [void][IO.Directory]::CreateDirectory($outside)
+    $sentinel = Join-Path $outside 'keep.txt'
+    [IO.File]::WriteAllText($sentinel, 'outside sentinel')
+    $null = New-Item -ItemType Junction -Path $link -Target $outside
+    Assert-Rejected { Remove-SafeTree $tree } 'Reparse'
+    if ([IO.File]::ReadAllText($sentinel) -ne 'outside sentinel') { throw 'Deletion followed a nested junction.' }
+    if (-not (Test-Path -LiteralPath $tree)) { throw 'Unsafe tree must remain after rejection.' }
+    [IO.Directory]::Delete($link)
+    Remove-SafeTree $tree
+    if (Test-Path -LiteralPath $tree) { throw 'Ordinary tree removal must complete.' }
+    if (-not (Test-Path -LiteralPath $sentinel)) { throw 'Ordinary removal changed the outside sentinel.' }
+}
+finally {
+    $absolute = [IO.Path]::GetFullPath($fixture)
+    if (-not $absolute.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture cleanup escaped the temporary directory.' }
+    if (Test-Path -LiteralPath $link) { [IO.Directory]::Delete($link) }
+    if (Test-Path -LiteralPath $fixture) { Remove-SafeTree $fixture }
+}
+# Public entry points must reject arbitrary machine install roots before UAC.
+Assert-Rejected { & $path -InstallDir (Join-Path $tempRoot 'not-program-files') -WhatIf } 'InstallDir must'
+$uninstaller = Join-Path $PSScriptRoot 'uninstall-tray.ps1'
+Assert-Rejected { & $uninstaller -InstallDir (Join-Path $tempRoot 'not-program-files') -WhatIf } 'InstallDir must'
+Write-Output 'Installer boundary tests passed (synthetic DPAPI entropy, nested-junction refusal, safe deletion and fixed machine paths).'
