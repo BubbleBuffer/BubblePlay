@@ -159,10 +159,15 @@ class FileTransfers(
         val batch = Batch(random.nextInt().toLong() and FileWire.U32_MAX, purpose, 0)
         val jobs = ArrayList<Upload>()
         for (uri in uris.take(FileWire.MAX_BATCH)) {
+            val rejection = ShareParse.rejectionReason(uri.scheme, uri.authority, app.packageName)
+            if (rejection != null) {
+                Log.w(TAG, "upload dropped: $rejection")
+                continue
+            }
             val job = try { prepare(uri, purpose, batch, jobs.size) } catch (e: TooLarge) {
                 fail(Direction.UP, e.name, ERR_TOO_LARGE); null
             } catch (e: Exception) {
-                Log.w(TAG, "upload: unreadable $uri: ${e.message}")
+                Log.w(TAG, "upload: unreadable content")
                 fail(Direction.UP, uri.lastPathSegment ?: FileNames.FALLBACK_UPLOAD, ERR_UNREADABLE); null
             }
             if (job != null) jobs += job

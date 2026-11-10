@@ -65,16 +65,39 @@ class FileNamesTest {
     fun shareIntentParsing() {
         val send = ShareParse.ACTION_SEND
         val multi = ShareParse.ACTION_SEND_MULTIPLE
-        assertEquals(listOf("a"), ShareParse.collect(send, "a", null, emptyList()).items)
+        val a = "content://external/a"
+        val b = "content://external/b"
+        val c1 = "content://external/c1"
+        val c2 = "content://external/c2"
+        val x = "content://external/x"
+        fun collect(action: String?, stream: String?, streams: List<String?>?, clip: List<String?>): ShareParse.Result<String> =
+            ShareParse.collect(action, stream, streams, clip, applicationId = "de.bubblebuffer.bubbleplay", uriParts = {
+                val uri = java.net.URI(it)
+                uri.scheme to uri.authority
+            })
+        assertEquals(listOf(a), collect(send, a, null, emptyList()).items)
         // Only ClipData filled (some apps): falls back to it.
-        assertEquals(listOf("c1", "c2"), ShareParse.collect(send, null, null, listOf("c1", null, "c2")).items)
-        assertEquals(listOf("a", "b"), ShareParse.collect(multi, null, listOf("a", null, "b", "a"), listOf("x")).items)
-        assertEquals(emptyList<String>(), ShareParse.collect(send, null, null, emptyList<String>()).items)
-        assertEquals(emptyList<String>(), ShareParse.collect("android.intent.action.VIEW", "a", null, emptyList()).items)
-        val many = (1..70).map { "u$it" }
-        val result = ShareParse.collect(multi, null, many, emptyList())
+        assertEquals(listOf(c1, c2), collect(send, null, null, listOf(c1, null, c2)).items)
+        assertEquals(listOf(a, b), collect(multi, null, listOf(a, null, b, a), listOf(x)).items)
+        assertEquals(emptyList<String>(), collect(send, null, null, emptyList()).items)
+        assertEquals(emptyList<String>(), collect("android.intent.action.VIEW", a, null, emptyList()).items)
+        val many = (1..70).map { "content://external/u$it" }
+        val result = collect(multi, null, many, emptyList())
         assertEquals(64, result.items.size)
         assertEquals(6, result.dropped)
-        assertEquals("u1", result.items.first())
+        assertEquals("content://external/u1", result.items.first())
+        // Reject private paths and app-owned providers through both share entry paths.
+        val forbidden = listOf("file:///data/user/0/de.bubblebuffer.bubbleplay/files/key",
+            "content://de.bubblebuffer.bubbleplay.files/key", "content://de.bubblebuffer.bubbleplay/key",
+            "content://DE.BUBBLEBUFFER.BUBBLEPLAY.files/key", "content://10@de.bubblebuffer.bubbleplay.files/key",
+            "https://external/file", "content:///missing-authority")
+        for (uri in forbidden) {
+            assertEquals(emptyList<String>(), collect(send, uri, null, emptyList()).items)
+            assertEquals(emptyList<String>(), collect(send, null, null, listOf(uri)).items)
+        }
+        assertEquals(listOf(a, b), collect(multi, null, forbidden + listOf(a, b), emptyList()).items)
+        // Prefix lookalikes are external authorities, not this app's providers.
+        val lookalike = "content://de.bubblebuffer.bubbleplayother.files/public"
+        assertEquals(listOf(lookalike), collect(send, lookalike, null, emptyList()).items)
     }
 }

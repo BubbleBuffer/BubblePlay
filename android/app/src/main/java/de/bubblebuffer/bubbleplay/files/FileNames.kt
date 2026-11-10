@@ -86,19 +86,39 @@ object ShareParse {
 
     class Result<T>(val items: List<T>, val dropped: Int)
 
+    /** Shared by intent intake and the final upload boundary, before any provider is opened. */
+    fun rejectionReason(scheme: String?, authority: String?, applicationId: String): String? = when {
+        !scheme.equals("content", ignoreCase = true) -> "non-content scheme"
+        authority.isNullOrEmpty() -> "missing authority"
+        authority.substringAfterLast('@').let {
+            it.equals(applicationId, ignoreCase = true) || it.startsWith("$applicationId.", ignoreCase = true)
+        } -> "app-owned authority"
+        else -> null
+    }
+
     /**
      * ACTION_SEND uses EXTRA_STREAM, ACTION_SEND_MULTIPLE the stream list;
      * either falls back to the ClipData items (some apps only fill those).
-     * Duplicates are dropped; more than [max] items keeps the first [max].
+     * Only external content providers are accepted. Duplicates are dropped;
+     * more than [max] accepted items keeps the first [max].
      */
-    fun <T : Any> collect(action: String?, stream: T?, streams: List<T?>?, clip: List<T?>, max: Int = FileWire.MAX_BATCH): Result<T> {
+    fun <T : Any> collect(
+        action: String?, stream: T?, streams: List<T?>?, clip: List<T?>,
+        applicationId: String, uriParts: (T) -> Pair<String?, String?>,
+        max: Int = FileWire.MAX_BATCH, onRejected: (String) -> Unit = {},
+    ): Result<T> {
         val primary: List<T?> = when (action) {
             ACTION_SEND -> listOfNotNull(stream)
             ACTION_SEND_MULTIPLE -> streams.orEmpty()
             else -> return Result(emptyList(), 0)
         }
         val chosen = primary.filterNotNull().ifEmpty { clip.filterNotNull() }
-        val unique = LinkedHashSet(chosen).toList()
+        val unique = LinkedHashSet(chosen).filter { uri ->
+            val (scheme, authority) = uriParts(uri)
+            val reason = rejectionReason(scheme, authority, applicationId)
+            if (reason != null) onRejected(reason)
+            reason == null
+        }
         return Result(unique.take(max), (unique.size - max).coerceAtLeast(0))
     }
 }

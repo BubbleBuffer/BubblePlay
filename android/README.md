@@ -10,7 +10,7 @@ On a fresh install, create or import a device key, then pair each PC with its re
 ## How it works
 
 - **Device key and PC list:** the app opens to the PC list only with an unlocked device key. Without a key it shows setup (create or import); a locked key shows an unlock step (`ui/DeviceKeyActivity.kt`, `START_UNLOCK`). Each PC row shows its name, ID, relay host and a status line: "Not connected yet", or "Last seen …" plus the last problem (in the danger colour) if the last session ended with one. The list never shows "online".
-  - **Pairing:** Pair a PC takes the relay address, the PC ID, the code shown on the PC and an optional name (`ui/PairActivity.kt`). A `bubbleplay://pair` link only fills the form; it never submits. Each paired PC is kept on the phone with its name and relay.
+  - **Pairing:** Pair a PC takes the relay address, the PC ID, the code shown on the PC and an optional name (`ui/PairActivity.kt`). A `bubbleplay://pair` link only fills the form; it never submits. Its relay host is shown prominently before pairing, and the chosen relay host stays visible during number comparison. Each paired PC is kept on the phone with its name and relay.
   - Tap a PC to connect through its saved relay.
 - **Signaling:** `/ws?pc=<id>` uses a signed viewer hello and relay challenge, then authenticates the PC against its pinned public key. All endpoint control messages, including input, use the encrypted ctl channel. A relay refusal (1008) or changed PC key stops automatic reconnect; tap the status line to retry or pair again.
 - **Media:** `/media-ws?epoch=…&pc=…` uses the current signaling ticket and v4 framing; it starts after authentication.
@@ -74,7 +74,7 @@ See [file-transfer behavior](../docs/architecture/file-transfer.md) and the [sha
   - Share sheet: "BubblePlay" accepts `SEND`/`SEND_MULTIPLE` of any type, purpose `save`. Without a session it opens the PC list; the files wait there until you pick a PC, then they upload. At most 64 files go; the rest are reported.
   - The Attach icon in the quick bar opens the system picker (multiple).
   - Shortcuts → Paste: a content URI on the phone clipboard is uploaded with purpose `paste` instead of pasting text.
-  - Files are read through `ContentResolver`; no storage permission. A source without a known size is copied to the app cache first.
+  - Files are read through `ContentResolver`; no storage permission. Only `content://` sources from external providers are accepted; file URIs and this app's own provider authorities are discarded before opening. A source without a known size is copied to the app cache first.
 - **Download:** a `file-offer` shows a chip above the bar. Download requests each item, writes it to `Download/BubblePlay` via MediaStore (pending until the SHA-256 and size check out, deleted otherwise), then shows a notification and an in-app notice with Open / Share. Notification permission is asked on the first download (Android 13+). A withdrawn offer removes the chip.
 - **Progress:** a slim row per direction above the bar (name, percent, cancel). Cancel stops the active transfer and its queue.
 - **Lifetime:** transfers belong to the stream session and continue in the background while the background service runs. Ending the session (disconnect, or the 30 s background stop without the service) cancels them all. If the host leaves or the epoch changes, the file socket drops: the transfer in flight fails, and queued ones retry on a new socket (up to 3 failed opens, 10 s wait for the host's file socket). Partial downloads are always discarded.
