@@ -4,6 +4,8 @@ Status: approved 2026-10-08 (Admin mode storage revised 2026-10-08); Milestones 
 
 ## Current state
 
+Client image verification blocks other programs, but not code injected into a BubblePlay process by the same user. With Admin mode on, same-user malware can therefore still send elevated and secure-desktop input; keep Admin mode off unless you need it.
+
 - The host runs as the interactive user. Desktop Duplication `E_ACCESSDENIED` and access-lost are treated as a temporarily unavailable source. Signaling and RTC/WSS sessions stay alive; the viewer holds the last frame and input is suspended with held keys/buttons released.
 - Recovery probes run every 500 ms independently of media admission. Monitor and follow-window switches are refused while capture is unavailable; recovery uses the previously selected monitor. Normal capture requires the input desktop to be Default both before and after acquisition; access denied, unreadable names or non-Default names block recovery even if DDA yields a stale frame. Helper secure reports also block normal recovery. The first verified Default DDA frame starts a new media generation and forces a keyframe. Normal input checks Default again immediately before injection.
 - On a secure desktop the host sends `desktop-state` with `state:"unavailable"`, `desktop:"secure"`, `reason:"secure-desktop"`, `secureKind:"uac"|"lock"|"other"` and `secureCapabilities:[]`. The medium-integrity host enumerates consent windows only when Windows permits it, queries WTS lock state, and reports `other` when it cannot identify the kind. These optional fields preserve older desktop-state messages.
