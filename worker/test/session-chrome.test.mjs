@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import {
   SETTINGS_KEY, SETTINGS_VERSION, DEFAULT_SETTINGS,
   loadSettings, normalizeSettings, qualityStorageView, saveSettings,
@@ -9,6 +10,37 @@ import {
   SHORTCUTS, chordLabel, chordSteps, createEdgeReveal, keyName, popoverPosition, shortcutsFor,
 } from "../public/chrome.js";
 import { parseQualityPreset } from "../public/transport.js";
+
+test("endpoint errors render as literal text in the multiline diagnostics HUD", async () => {
+  const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+  const handler = source.match(/async function handleEndpointSignal\([^]*?\n\}/)?.[0];
+  const start = source.indexOf("function qualityHudText()");
+  const end = source.indexOf("// ---- signaling", start);
+  assert.ok(handler && start >= 0 && end > start, "load the endpoint handler and scheduled HUD renderer");
+  const payload = '<img src=x onerror="globalThis.hudXss = true">';
+  let renderHud;
+  const hud = { textContent: "", classList: { add() {} } };
+  Object.defineProperty(hud, "innerHTML", {
+    set() { assert.fail("untrusted HUD text must never reach an HTML parser"); },
+  });
+  const socket = {};
+  const context = {
+    ws: socket, signalingGeneration: 1, authenticatedSession: { controlReady: true },
+    hud, hudState: {}, cursorReconciler: null, hostQuality: null,
+    clientBuild: "test-build", fullFrameDiagnostic: false, viewportTelemetry: {},
+    diagnosticsOutput: null, diagnosticsVisible: false,
+    recordSignalingError() {}, viewerLog() {}, endAuthenticatedSession() {}, renderConnectionStatus() {},
+    setInterval(fn) { renderHud = fn; },
+  };
+  runInNewContext(`${handler}\n${source.slice(start, end)}\nthis.receive = handleEndpointSignal;`, context);
+  await context.receive(socket, 1, { type: "error", message: payload });
+  renderHud();
+  assert.ok(hud.textContent.startsWith(`ws err:${payload} | ice `));
+  assert.equal(hud.textContent.split("\n").length, 7);
+  assert.equal(context.hudXss, undefined);
+  const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
+  assert.match(html, /#hud\s*\{[^}]*white-space:\s*pre\s*;/);
+});
 
 function memoryStorage(entries = {}) {
   const map = new Map(Object.entries(entries));
