@@ -28,10 +28,8 @@ use windows::Win32::System::Threading::{
     SYNCHRONIZATION_SYNCHRONIZE,
 };
 
-use super::logic::decode_hex;
-
 // The DPAPI helpers live in the host library so the trusted device list shares them.
-pub use bubbleplay_host::dpapi::{dpapi_protect_bytes, dpapi_unprotect_bytes};
+pub use bubbleplay_host::dpapi::dpapi_protect_bytes;
 
 pub use bubbleplay_host::admin_agent::protocol::{AGENT_MUTEX, AGENT_STOP_EVENT, TRAY_MUTEX};
 /// On-demand task that starts the elevated admin input agent
@@ -63,14 +61,6 @@ impl Drop for Handle {
             let _ = unsafe { CloseHandle(self.0) };
         }
     }
-}
-
-/// Decrypt a hex DPAPI blob (CurrentUser or LocalMachine scope).
-pub fn dpapi_unprotect_hex(value: &str) -> Result<Vec<u8>> {
-    let mut encrypted = decode_hex(value)?;
-    let plain = dpapi_unprotect_bytes(&encrypted);
-    encrypted.fill(0);
-    plain
 }
 
 /// Job object that kills every assigned process when the last handle closes,
@@ -334,6 +324,49 @@ pub fn end_agent_task() {
     let _ = schtasks(&["/end", "/tn", AGENT_TASK]);
 }
 
+/// The tray can repair only the package already installed by an administrator.
+pub fn agent_update_script() -> Result<PathBuf> {
+    Ok(bubbleplay_host::admin_agent::trust::program_files()
+        .context("Program Files missing; run the new release's setup-tray.ps1 again")?
+        .join("BubblePlay")
+        .join("setup-tray.ps1"))
+}
+
+pub fn validate_agent_update_script(script: &Path) -> Result<()> {
+    let expected = agent_update_script()?;
+    if !script
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        bail!(
+            "agent repair requires {}; run the new release's setup-tray.ps1 again",
+            expected.display()
+        );
+    }
+    bubbleplay_host::secure_helper::trust::protected_install_file(script)
+        .context("agent repair files are not protected; run the new release's setup-tray.ps1 again")
+}
+
+/// Validate the actual script and source directory before reaching the public
+/// elevation primitive. All elevated inputs come from the protected install.
+pub fn run_agent_update(script: &Path) -> Result<u32> {
+    validate_agent_update_script(script)?;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_System, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    let text = unsafe { SHGetKnownFolderPath(&FOLDERID_System, KF_FLAG_DEFAULT, None) }
+        .context("resolve Windows System32")?;
+    let system = unsafe { text.to_string() };
+    unsafe { CoTaskMemFree(Some(text.0.cast())) };
+    let powershell = PathBuf::from(system?).join(r"WindowsPowerShell\v1.0\powershell.exe");
+    let dir = script.parent().context("setup directory missing")?;
+    let params = format!(
+        "-NoProfile -ExecutionPolicy Bypass -File \"{}\" -AgentOnly -SourceDir \"{}\"",
+        script.display(),
+        dir.display()
+    );
+    run_elevated_and_wait(&powershell, &params, dir)
+}
+
 /// Run `program params` elevated (one UAC prompt) and wait for it. Returns
 /// the exit code; an error when the prompt was declined or the start failed.
 pub fn run_elevated_and_wait(program: &Path, params: &str, dir: &Path) -> Result<u32> {
@@ -418,5 +451,19 @@ pub fn open_folder(path: &Path) {
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_update_refuses_script_outside_protected_program_files_before_elevation() {
+        let script = std::env::temp_dir().join("setup-tray.ps1");
+        let error = run_agent_update(&script).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("run the new release's setup-tray.ps1 again"));
     }
 }

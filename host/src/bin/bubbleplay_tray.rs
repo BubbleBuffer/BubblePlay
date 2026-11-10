@@ -78,10 +78,11 @@ use logic::{
     CMD_SECURE_HELPER_UPDATE, SECURE_HELPER_UPDATE_LABEL,
 };
 use platform::{
-    acquire_single_instance, create_manual_event, data_dir, end_agent_task, ensure_agent_task,
-    host_exe_beside, named_mutex_exists, open_folder, read_run_value, run_admin_mode_off_task,
-    run_agent_task, run_elevated_and_wait, run_secure_helper_task, secure_helper_task_exists,
-    set_event, set_run_value, sha256_file, system_uses_light_theme, wide, Handle, AGENT_MUTEX,
+    acquire_single_instance, agent_update_script, create_manual_event, data_dir, end_agent_task,
+    ensure_agent_task, host_exe_beside, named_mutex_exists, open_folder, read_run_value,
+    run_admin_mode_off_task, run_agent_task, run_agent_update, run_elevated_and_wait,
+    run_secure_helper_task, secure_helper_task_exists, set_event, set_run_value, sha256_file,
+    system_uses_light_theme, validate_agent_update_script, wide, Handle, AGENT_MUTEX,
     AGENT_STOP_EVENT, SECURE_HELPER_TASK, TRAY_MUTEX,
 };
 use supervisor::{HostEvent, SupervisorConfig, SupervisorThread};
@@ -575,7 +576,7 @@ impl App {
         match error {
             LinkError::Busy => "the secure helper already has a host client".into(),
             LinkError::Unavailable => "the secure helper did not answer".into(),
-            LinkError::Incompatible { helper_min, helper_max } => format!("secure helper protocol {helper_min}-{helper_max}; host needs {SECURE_PROTOCOL_MIN}-{SECURE_PROTOCOL_MAX}"),
+            LinkError::Incompatible { helper_min, helper_max } => format!("secure helper protocol {helper_min}-{helper_max}; host needs {SECURE_PROTOCOL_MIN}-{SECURE_PROTOCOL_MAX}; if protected repair cannot resolve this, run the new release's setup-tray.ps1"),
             LinkError::Untrusted => "secure helper identity verification failed".into(),
             LinkError::Protocol => "secure helper protocol verification failed".into(),
         }
@@ -794,7 +795,7 @@ impl App {
                 agent_min,
                 agent_max,
             } => {
-                let reason = format!("the admin agent speaks protocol {agent_min}-{agent_max}, the host needs {PROTOCOL_MIN}-{PROTOCOL_MAX}");
+                let reason = format!("the admin agent speaks protocol {agent_min}-{agent_max}, the host needs {PROTOCOL_MIN}-{PROTOCOL_MAX}; if protected repair cannot resolve this, run the new release's setup-tray.ps1");
                 self.report_agent_failure(&reason);
                 self.set_agent(AgentStatus::NeedsUpdate { reason });
             }
@@ -873,33 +874,24 @@ impl App {
             post(0);
             return;
         }
-        let Some(dir) = std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        else {
-            return;
+        let script = match agent_update_script().and_then(|script| {
+            validate_agent_update_script(&script)?;
+            Ok(script)
+        }) {
+            Ok(script) => script,
+            Err(error) => {
+                self.set_agent(AgentStatus::NeedsUpdate {
+                    reason: error.to_string(),
+                });
+                return;
+            }
         };
-        let script = dir.join("setup-tray.ps1");
-        if !script.is_file() {
-            self.set_agent(AgentStatus::NeedsUpdate {
-                reason: format!("{} is missing; run setup-tray.ps1 again", script.display()),
-            });
-            return;
-        }
-        let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
-        let powershell =
-            PathBuf::from(system).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-        let params = format!(
-            "-NoProfile -ExecutionPolicy Bypass -File \"{}\" -AgentOnly -SourceDir \"{}\"",
-            script.display(),
-            dir.display()
-        );
-        tracing::info!(%params, "running the elevated admin agent update");
+        tracing::info!(script=%script.display(), "running the protected admin agent update");
         self.agent_update_running = true;
         let spawned = std::thread::Builder::new()
             .name("agent-update".into())
             .spawn(move || {
-                let code = match run_elevated_and_wait(&powershell, &params, &dir) {
+                let code = match run_agent_update(&script) {
                     Ok(code) => code,
                     Err(error) => {
                         tracing::warn!(?error, "elevated agent update did not run");
@@ -940,7 +932,7 @@ impl App {
             let reason = if code == u32::MAX {
                 "the admin prompt was declined or failed".to_string()
             } else {
-                format!("the agent update failed (exit {code}; see receipts\\setup-tray-machine-*.json)")
+                format!("the agent update failed (exit {code}); run the new release's setup-tray.ps1 again")
             };
             self.secure_helper = SecureHelperStatus::NeedsUpdate {
                 reason: reason.clone(),
@@ -1050,6 +1042,11 @@ impl App {
 
     /// A previous host exists and differs from the installed one.
     fn can_roll_back(&self) -> bool {
+        if std::env::current_exe()
+            .is_ok_and(|exe| bubbleplay_host::admin_agent::trust::is_under_program_files(&exe))
+        {
+            return false;
+        }
         match (self.previous_hash(), self.host_hash.as_deref()) {
             (Some(previous), Some(current)) => !previous.eq_ignore_ascii_case(current),
             (Some(_), None) => true,
@@ -1104,6 +1101,11 @@ impl App {
     /// replaced binary is kept as `previous\bubbleplay-host.failed.exe`.
     fn restore_previous_host(&mut self) -> Result<()> {
         let (host, previous, failed) = self.host_paths().context("host paths")?;
+        if bubbleplay_host::admin_agent::trust::is_under_program_files(&host) {
+            anyhow::bail!(
+                "Program Files updates require the release's setup-tray.ps1; run setup again"
+            );
+        }
         if !previous.is_file() {
             anyhow::bail!("{} is missing", previous.display());
         }

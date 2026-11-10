@@ -48,9 +48,14 @@ pub fn is_process_elevated() -> bool {
 
 /// `%ProgramFiles%` (the native one on 64-bit Windows).
 pub fn program_files() -> Option<PathBuf> {
-    std::env::var_os("ProgramW6432")
-        .or_else(|| std::env::var_os("ProgramFiles"))
-        .map(PathBuf::from)
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    // Resolve the OS-owned location, not an inheritable environment override.
+    let text =
+        unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }.ok()?;
+    let path = unsafe { text.to_string() };
+    unsafe { CoTaskMemFree(Some(text.0.cast())) };
+    path.ok().map(PathBuf::from)
 }
 
 /// True when `path` lies below `%ProgramFiles%` (admin-only by default).

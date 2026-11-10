@@ -170,22 +170,56 @@ pub fn protected_image(path: &Path) -> Result<()> {
             .eq_ignore_ascii_case(&expected.to_string_lossy()),
         "unexpected helper image"
     );
-    let root = crate::admin_agent::trust::program_files().unwrap();
+    protected_install_file(path)
+}
+/// Verify a shipped file and each directory up to Program Files. Neither
+/// reparse points nor user-writable ownership/ACLs can authorize elevation or
+/// a privileged pipe client.
+pub fn protected_install_file(path: &Path) -> Result<()> {
+    let root = crate::admin_agent::trust::program_files()
+        .ok_or_else(|| anyhow::anyhow!("Program Files missing"))?;
+    let install = root.join("BubblePlay");
+    let prefix = format!("{}\\", install.display());
+    ensure!(
+        path.is_absolute()
+            && path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with(&prefix.to_ascii_lowercase())
+            && !path.components().any(|c| matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )),
+        "image is outside Program Files\\BubblePlay"
+    );
+    ensure!(
+        std::fs::symlink_metadata(path)?.is_file(),
+        "installed file missing"
+    );
     let mut p = Some(path);
+    let mut reached_root = false;
     while let Some(part) = p {
         ensure!(
             std::fs::symlink_metadata(part)?.file_attributes() & 0x400 == 0,
-            "reparse point in helper image path"
+            "reparse point in protected install path"
         );
-        if part.starts_with(&root) {
-            protected_acl(part)?;
-        }
-        if part == root {
+        protected_acl(part)?;
+        if part
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&root.to_string_lossy())
+        {
+            reached_root = true;
             break;
         }
         p = part.parent();
     }
+    ensure!(reached_root, "protected path does not reach Program Files");
     Ok(())
+}
+/// Shared admission rule for both privileged servers. Session and SID checks
+/// are performed independently by their pipe servers.
+pub fn protected_client_image(path: &Path) -> Result<()> {
+    protected_install_file(path)
 }
 pub fn guard() -> Result<()> {
     ensure!(
@@ -268,6 +302,17 @@ pub fn query_sddl(sid: &str, access: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_image_outside_protected_install_is_refused() {
+        // Exercise the same public validator used by both production servers,
+        // with a real image under target/ rather than a synthetic ACL predicate.
+        let image = std::env::current_exe().unwrap();
+        assert!(
+            protected_client_image(&image).is_err(),
+            "{}",
+            image.display()
+        );
+    }
     #[test]
     fn object_acls_grant_only_required_console_rights() {
         let sid = "S-1-5-21-1-2-3-1001";
