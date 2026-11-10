@@ -21,10 +21,10 @@ use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde::Deserialize;
-use tungstenite::client::IntoClientRequest;
+use tungstenite::client::{connect_with_config, IntoClientRequest};
 use tungstenite::http::Request;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect_with_config, Message, WebSocket};
+use tungstenite::{Message, WebSocket};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Data-socket ticket from a keyed host's signaling `hello-ok`: 32 random bytes in unpadded

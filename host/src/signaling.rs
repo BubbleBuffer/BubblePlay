@@ -4444,7 +4444,7 @@ mod keyed_registration_tests {
     }
 
     fn client(port: u16) -> WebSocket<MaybeTlsStream<TcpStream>> {
-        let mut ws = tungstenite::connect_with_config(
+        let mut ws = tungstenite::client::connect_with_config(
             format!("ws://127.0.0.1:{port}/ws"),
             Some(crate::wss_v4::host_websocket_config()),
             3,
@@ -4776,7 +4776,7 @@ mod phase2_socket_tests {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
         });
-        let ws = tungstenite::connect_with_config(
+        let ws = tungstenite::client::connect_with_config(
             format!("ws://{address}/ws"),
             Some(crate::wss_v4::host_websocket_config()),
             3,

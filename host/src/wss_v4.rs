@@ -3037,7 +3037,12 @@ mod tests {
             while !matches!(ws.read(), Ok(Message::Close(_)) | Err(_)) {}
         });
         let connector: Connector = Box::new(move || {
-            Ok(tungstenite::connect_with_config(url.as_str(), Some(host_websocket_config()), 3)?.0)
+            Ok(tungstenite::client::connect_with_config(
+                url.as_str(),
+                Some(host_websocket_config()),
+                3,
+            )?
+            .0)
         });
         let link = V4Link::spawn(connector, 6_000_000, 6_000_000).unwrap();
         let activity = Activity::new().unwrap();
@@ -3109,8 +3114,11 @@ mod tests {
             sessions
         });
         let connector: Connector = Box::new(move || {
-            let (ws, _) =
-                tungstenite::connect_with_config(url.as_str(), Some(host_websocket_config()), 3)?;
+            let (ws, _) = tungstenite::client::connect_with_config(
+                url.as_str(),
+                Some(host_websocket_config()),
+                3,
+            )?;
             Ok(ws)
         });
         let link = V4Link::spawn(connector, 6_000_000, 6_000_000).unwrap();
@@ -3251,7 +3259,12 @@ mod tests {
         let exit = ExitFlag(ended);
         Box::new(move || {
             let _ = &exit;
-            Ok(tungstenite::connect_with_config(url.as_str(), Some(host_websocket_config()), 3)?.0)
+            Ok(tungstenite::client::connect_with_config(
+                url.as_str(),
+                Some(host_websocket_config()),
+                3,
+            )?
+            .0)
         })
     }
 

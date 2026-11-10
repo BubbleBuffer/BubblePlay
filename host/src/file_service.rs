@@ -512,8 +512,9 @@ type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 fn connect_file_socket(worker_url: &str, epoch: &str, route: &RelayRoute) -> Result<Socket> {
     let request = host_socket_request_routed(worker_url, epoch, HostSocket::File, route)?;
-    let (mut ws, _) = tungstenite::connect_with_config(request, Some(host_websocket_config()), 3)
-        .context("connect file socket")?;
+    let (mut ws, _) =
+        tungstenite::client::connect_with_config(request, Some(host_websocket_config()), 3)
+            .context("connect file socket")?;
     ws.send(Message::text(data_hello("file-host", route)))
         .context("send file hello")?;
     ws.flush().context("flush file hello")?;
