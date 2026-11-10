@@ -48,14 +48,13 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
-    LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, SetMenuDefaultItem, SetProcessDPIAware, SetTimer, TrackPopupMenu,
-    TranslateMessage, HICON, HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MENU_ITEM_FLAGS, MF_CHECKED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_ENDSESSION,
-    WM_LBUTTONUP, WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPED,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, LoadImageW,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetMenuDefaultItem, SetProcessDPIAware, SetTimer, TrackPopupMenu, TranslateMessage, HICON,
+    HMENU, IMAGE_ICON, LR_DEFAULTCOLOR, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONUP, WM_NULL,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use bubbleplay_host::admin_agent::client::{probe, ProbeResult, AGENT_EXE};
@@ -83,7 +82,7 @@ use platform::{
     run_admin_mode_off_task, run_agent_task, run_agent_update, run_elevated_and_wait,
     run_secure_helper_task, secure_helper_task_exists, set_event, set_run_value, sha256_file,
     system_uses_light_theme, validate_agent_update_script, wide, Handle, AGENT_MUTEX,
-    AGENT_STOP_EVENT, SECURE_HELPER_TASK, TRAY_MUTEX,
+    AGENT_STOP_EVENT, SECURE_HELPER_TASK, TRAY_MUTEX, TRAY_QUIT_EVENT,
 };
 use supervisor::{HostEvent, SupervisorConfig, SupervisorThread};
 use update::{
@@ -227,21 +226,12 @@ fn send_files(paths: Vec<PathBuf>) -> Result<i32> {
 }
 
 fn quit_running_tray() -> Result<i32> {
-    let class = wide(scoped(WINDOW_CLASS));
-    // SAFETY: class is NUL-terminated.
-    let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) }) else {
-        return Ok(0);
-    };
-    // SAFETY: posting to a window owned by another process of the same user.
-    let _ = unsafe { PostMessageW(Some(hwnd), WM_QUIT_REQUEST, WPARAM(0), LPARAM(0)) };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if !named_mutex_exists(&scoped(TRAY_MUTEX)) {
-            return Ok(0);
-        }
-        std::thread::sleep(Duration::from_millis(200));
+    // This command only requests shutdown. Avoid desktop window discovery and
+    // never wait for the other process's message loop or child cleanup.
+    if named_mutex_exists(&scoped(TRAY_MUTEX)) {
+        platform::signal_existing_event(&scoped(TRAY_QUIT_EVENT))?;
     }
-    Ok(1)
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +324,7 @@ struct App {
     announce_ready: bool,
     agent_pipe: String,
     stop_event: Handle,
+    quit_event: Handle,
     icon: TrayIcon,
     shown: Option<String>,
     taskbar_created: u32,
@@ -1679,7 +1670,13 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_TIMER => {
-            with_app(|app| app.tick());
+            with_app(|app| {
+                if platform::event_is_signaled(&app.quit_event) {
+                    app.handle_command(CMD_QUIT);
+                } else {
+                    app.tick();
+                }
+            });
             LRESULT(0)
         }
         // The taskbar theme changed: swap the light/dark tray icon now rather than on the next tick.
@@ -1743,6 +1740,11 @@ unsafe extern "system" fn window_proc(
 }
 
 fn run_tray() -> Result<i32> {
+    let Some(_instance) = acquire_single_instance(&scoped(TRAY_MUTEX))? else {
+        return Ok(0);
+    };
+    // Publish the quit endpoint before icon, logging or child initialization.
+    let quit_event = create_manual_event(&scoped(TRAY_QUIT_EVENT))?;
     // SAFETY: opt this tray process into system DPI before creating any windows,
     // so small-icon metrics select the matching embedded frame (16/20/24/32/40/48 px).
     let _ = unsafe { SetProcessDPIAware() };
@@ -1751,9 +1753,6 @@ fn run_tray() -> Result<i32> {
     let test_mode = std::env::var_os("BUBBLEPLAY_TRAY_DATA_DIR").is_some();
     let logs = logs_dir(&data);
     let _log_guard = init_tracing(&logs);
-    let Some(_instance) = acquire_single_instance(&scoped(TRAY_MUTEX))? else {
-        return Ok(0);
-    };
     tracing::info!(pid = std::process::id(), data = %data.display(), "tray starting");
     // Signaled to ask the admin agent to exit; the agent also exits when
     // this tray's mutex disappears.
@@ -1828,6 +1827,7 @@ fn run_tray() -> Result<i32> {
         announce_ready: false,
         agent_pipe: agent_pipe(),
         stop_event,
+        quit_event,
         icon,
         shown: None,
         taskbar_created,

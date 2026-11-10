@@ -64,6 +64,8 @@ The updater uses the new release's setup script and requests one UAC prompt for 
 
 Remove BubblePlay through Windows Settings > Apps, or run `uninstall-tray.ps1` from its install folder. The uninstall retains user configuration unless `-RemoveData` is explicitly supplied.
 
+`bubbleplay_tray.exe --quit` requests shutdown without waiting for the tray to finish. Setup limits its quit command to 10 seconds and can then stop a remaining tray only after matching its exact installed executable path.
+
 Installed executables, scripts and runtime assets live in `%ProgramFiles%\BubblePlay`, with privileged helpers in `agent`. Configuration, bounded logs and receipts live in `%LOCALAPPDATA%\BubblePlay`. Host credentials use CurrentUser DPAPI with fixed BubblePlay application entropy; valid legacy blobs migrate on their next successful load. Keep raw configuration, relay secrets and unrelated desktop/file content out of bug reports.
 
 A clean second-PC installation and update of the protected Program Files layout remain release acceptance checks.

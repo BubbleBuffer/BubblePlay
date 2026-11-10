@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_OBJECT_0,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -24,14 +24,16 @@ use windows::Win32::System::Registry::{
     RRF_RT_REG_DWORD,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, OpenMutexW, ResetEvent, SetEvent, WaitForSingleObject,
-    SYNCHRONIZATION_SYNCHRONIZE,
+    CreateEventW, CreateMutexW, OpenEventW, OpenMutexW, ResetEvent, SetEvent, WaitForSingleObject,
+    EVENT_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
 };
 
 // The DPAPI helpers live in the host library so the trusted device list shares them.
 pub use bubbleplay_host::dpapi::dpapi_protect_bytes;
 
 pub use bubbleplay_host::admin_agent::protocol::{AGENT_MUTEX, AGENT_STOP_EVENT, TRAY_MUTEX};
+/// Owned by the tray; `--quit` opens and signals it without entering User32.
+pub const TRAY_QUIT_EVENT: &str = r"Local\BubblePlayTray.Quit";
 /// On-demand task that starts the elevated admin input agent
 /// (`%ProgramFiles%\BubblePlay\agent\bubbleplay_admin_agent.exe`).
 pub const AGENT_TASK: &str = r"\BubblePlay\AdminAgent";
@@ -128,6 +130,29 @@ pub fn create_manual_event(name: &str) -> Result<Handle> {
     let handle = unsafe { CreateEventW(None, true, false, PCWSTR(name.as_ptr())) }
         .context("CreateEventW")?;
     Ok(Handle(handle))
+}
+
+/// Signal an existing event only. Absence is normal when the tray is not running.
+pub fn signal_existing_event(name: &str) -> Result<bool> {
+    let name = wide(name);
+    // SAFETY: name is NUL-terminated; the handle is owned and closed on return.
+    let event = match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) } {
+        Ok(handle) => Handle(handle),
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error).context("open tray quit event"),
+    };
+    // SAFETY: this is a valid event handle with EVENT_MODIFY_STATE access.
+    unsafe { SetEvent(event.0) }.context("signal tray quit event")?;
+    Ok(true)
+}
+
+pub fn event_is_signaled(event: &Handle) -> bool {
+    // SAFETY: the caller owns the event; a zero timeout cannot block.
+    (unsafe { WaitForSingleObject(event.0, 0) }) == WAIT_OBJECT_0
 }
 
 pub fn set_event(event: &Handle, signaled: bool) {
