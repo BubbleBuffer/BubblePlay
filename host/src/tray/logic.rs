@@ -1,14 +1,22 @@
 //! Platform-independent tray logic: restart backoff, child-output log classification,
 //! persisted settings, stored host configuration and host argument building.
-//! Everything here is unit-tested; Win32 glue lives in the tray binary.
+//! Durable file replacement uses Win32 write-through on Windows.
 
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+};
 
 pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -160,7 +168,8 @@ impl StoredHostConfig {
     }
 
     /// Loads the relay credential and migrates a valid legacy DPAPI token atomically. Unknown
-    /// configuration fields are kept; a failed decrypt or migration prevents the host start.
+    /// configuration fields are kept; the old file stays as `.bak` and the replacement is read
+    /// and decrypted before success. A failed decrypt or migration prevents the host start.
     pub fn load_with_token(path: &Path) -> Result<(Self, String)> {
         Self::load_with_token_codec(
             path,
@@ -187,8 +196,40 @@ impl StoredHostConfig {
             config.token_dpapi_hex = protected.iter().map(|byte| format!("{byte:02X}")).collect();
             let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
             document["tokenDpapiHex"] = serde_json::Value::String(config.token_dpapi_hex.clone());
-            write_atomic(path, &serde_json::to_vec_pretty(&document)?)
-                .context("migrating legacy relay credential")?;
+            let migrated = serde_json::to_vec_pretty(&document)?;
+            let mut backup_name = path
+                .file_name()
+                .context("host config has no file name")?
+                .to_os_string();
+            backup_name.push(".bak");
+            write_atomic(&path.with_file_name(backup_name), &bytes)
+                .context("backing up legacy relay credential")?;
+            write_atomic(path, &migrated).context("migrating legacy relay credential")?;
+            let verified = (|| -> Result<()> {
+                let saved = fs::read(path).context("reading migrated relay credential")?;
+                anyhow::ensure!(
+                    saved == migrated,
+                    "migrated host config differs from written data"
+                );
+                let saved: Self =
+                    serde_json::from_slice(&saved).context("parsing migrated host config")?;
+                saved.validate()?;
+                let encrypted = zeroize::Zeroizing::new(decode_hex(&saved.token_dpapi_hex)?);
+                let (plain, legacy) = unprotect(&encrypted)?;
+                let plain = zeroize::Zeroizing::new(plain);
+                anyhow::ensure!(
+                    !legacy && plain.as_slice() == token.as_bytes(),
+                    "migrated relay credential did not round-trip with application entropy"
+                );
+                Ok(())
+            })();
+            if let Err(error) = verified {
+                write_atomic(path, &bytes).context(
+                    "restoring original host config after migration verification failed",
+                )?;
+                return Err(error)
+                    .context("verifying migrated relay credential; original restored");
+            }
         }
         Ok((config, token))
     }
@@ -551,14 +592,72 @@ impl ViewerGate {
     }
 }
 
+struct PendingWrite(PathBuf);
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Flush a uniquely owned temporary file, close it, and replace the destination with a
+/// write-through rename in the same directory. A failed operation removes only our own temp.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    let mut random = [0; 8];
+    OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|_| anyhow::anyhow!("creating tray config temporary name failed"))?;
+    let temporary = path.with_file_name(format!(
+        "{}.{}.{:016x}.tmp",
+        path.file_name()
+            .context("tray config has no file name")?
+            .to_string_lossy(),
+        std::process::id(),
+        u64::from_le_bytes(random)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .context("creating tray config temporary file")?;
+    let owned = PendingWrite(temporary);
+    let written = (|| -> Result<()> {
+        file.write_all(bytes)
+            .context("writing tray config temporary file")?;
+        file.sync_all()
+            .context("syncing tray config temporary file")
+    })();
+    drop(file);
+    written?;
+    replace_config_file(&owned.0, path)
+}
+
+#[cfg(windows)]
+fn replace_config_file(source: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both null-terminated buffers remain live through this synchronous call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .with_context(|| format!("replacing {}", target.display()))
+}
+
+#[cfg(not(windows))]
+fn replace_config_file(source: &Path, target: &Path) -> Result<()> {
+    fs::rename(source, target).with_context(|| format!("replacing {}", target.display()))
 }
 
 /// Quote a path for the HKCU Run value.
@@ -1164,6 +1263,7 @@ mod tests {
     fn legacy_relay_token_migrates_once_and_keeps_other_config_fields() {
         let dir = temp_dir("legacy-relay-token");
         let path = dir.join("host.json");
+        let backup = dir.join("host.json.bak");
         let legacy = serde_json::json!({
             "worker": "wss://w.example/host-ws",
             "tokenDpapiHex": "6F6C64", // Synthetic legacy ciphertext: "old".
@@ -1185,6 +1285,18 @@ mod tests {
         )
         .is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!backup.exists());
+
+        // A protector returning unreadable ciphertext must fail the on-disk verification,
+        // restore the original, and retain the flushed backup for recovery.
+        assert!(StoredHostConfig::load_with_token_codec(
+            &path,
+            |_| Ok(b"unreadable".to_vec()),
+            unprotect,
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&backup).unwrap(), before);
 
         let (stored, token) = StoredHostConfig::load_with_token_codec(
             &path,
@@ -1198,6 +1310,7 @@ mod tests {
         assert_eq!(stored.token_dpapi_hex, "6E6577");
         assert_eq!(stored.monitor.as_deref(), Some("primary"));
         assert_eq!(token, "relay token");
+        assert_eq!(fs::read(&backup).unwrap(), before);
         let migrated = fs::read(&path).unwrap();
         let mut expected = legacy;
         expected["tokenDpapiHex"] = "6E6577".into();
@@ -1206,13 +1319,21 @@ mod tests {
             expected
         );
 
-        StoredHostConfig::load_with_token_codec(
+        let (reloaded, reloaded_token) = StoredHostConfig::load_with_token_codec(
             &path,
             |_| anyhow::bail!("must not rewrite migrated token"),
             unprotect,
         )
         .unwrap();
+        assert_eq!(reloaded, stored);
+        assert_eq!(reloaded_token, token);
         assert_eq!(fs::read(&path).unwrap(), migrated);
+        assert_eq!(fs::read(&backup).unwrap(), before);
+        assert!(fs::read_dir(&dir).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
         fs::remove_dir_all(dir).unwrap();
     }
 
