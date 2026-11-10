@@ -588,16 +588,44 @@ function Remove-LegacyUserFiles([hashtable]$Sources) {
     if ($PSCmdlet.ShouldProcess($LegacyUserDir, 'Delete legacy per-user program files after verifying protected replacement (data retained)')) { Remove-SafeTree $LegacyUserDir }
 }
 
-function Set-UserRegistration {
-    # Autostart
+function Test-UserInstallExists {
+    foreach ($path in @($TrayExe, (Join-Path $LegacyUserDir 'bubbleplay_tray.exe'), $HostConfigPath, $TraySettingsPath, $UninstallKey)) {
+        if (Test-Path -LiteralPath $path) { return $true }
+    }
+    return $null -ne (Get-RunValue)
+}
+
+function Set-UserAutostart([bool]$ExistingInstall) {
+    # Updating the command of an enabled legacy install must not enable a user
+    # who disabled autostart. Keep tray.json independent of the HKCU Run state.
     $command = "`"$TrayExe`""
-    if ((Get-RunValue) -eq $command) { Add-Step 'autostart' 'unchanged' "HKCU Run\$RunValue already set." }
+    $current = Get-RunValue
+    if ($ExistingInstall -and [string]::IsNullOrWhiteSpace($current)) {
+        Add-Step 'autostart' 'unchanged' 'Existing install has autostart disabled; HKCU Run is unchanged.'
+    }
+    elseif ($current -eq $command) { Add-Step 'autostart' 'unchanged' "HKCU Run\$RunValue already set." }
     elseif ($PSCmdlet.ShouldProcess("$RunKey\$RunValue", "Set to $command")) {
         New-Item -Path $RunKey -Force -ErrorAction SilentlyContinue | Out-Null
         Set-ItemProperty -Path $RunKey -Name $RunValue -Value $command
         Add-Step 'autostart' 'done' "HKCU Run\$RunValue = $command"
     }
     else { Add-Step 'autostart' 'planned' "Set HKCU Run\$RunValue = $command" }
+
+    if ($ExistingInstall) {
+        Add-Step 'tray-settings' 'unchanged' 'Existing tray settings, including startAtLogin, are unchanged.'
+        return
+    }
+    $settings = [ordered]@{ startAtLogin = $true }
+    if ($PSCmdlet.ShouldProcess($TraySettingsPath, 'Write fresh-install startAtLogin=true')) {
+        New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+        [IO.File]::WriteAllText($TraySettingsPath, ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+        Add-Step 'tray-settings' 'done' 'Fresh install: startAtLogin=true'
+    }
+    else { Add-Step 'tray-settings' 'planned' "Write $TraySettingsPath (fresh install, startAtLogin=true)." }
+}
+
+function Set-UserRegistration([bool]$ExistingInstall) {
+    Set-UserAutostart $ExistingInstall
 
     # Start-menu shortcut
     if ($PSCmdlet.ShouldProcess($StartMenuShortcut, "Create shortcut to $TrayExe")) {
@@ -649,15 +677,6 @@ function Set-UserRegistration {
         Add-Step 'uninstall-entry' 'done' "$UninstallKey -> $uninstallCommand"
     }
     else { Add-Step 'uninstall-entry' 'planned' "Register $UninstallKey (UninstallString: $uninstallCommand)" }
-
-    # Admin mode is machine policy; never retain or migrate tray.json adminMode.
-    $settings = [ordered]@{ startAtLogin = $true }
-    if ($PSCmdlet.ShouldProcess($TraySettingsPath, 'Write startAtLogin=true')) {
-        New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-        [IO.File]::WriteAllText($TraySettingsPath, ($settings | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
-        Add-Step 'tray-settings' 'done' 'startAtLogin=true'
-    }
-    else { Add-Step 'tray-settings' 'planned' "Write $TraySettingsPath (startAtLogin=true)." }
 }
 
 function Start-Tray {
@@ -1181,12 +1200,25 @@ function Write-Receipt {
         Write-Output $json
         return
     }
-    $dir = Join-Path $DataDir 'receipts'
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $kind = 'setup-tray'
-    $path = Join-Path $dir ("{0}-{1}.json" -f $kind, [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'))
-    [IO.File]::WriteAllText($path, $json, [Text.UTF8Encoding]::new($false))
-    Write-Host "Receipt: $path"
+    try {
+        $dir = Join-Path $DataDir 'receipts'
+        # Includes DataDir itself and every ancestor. Check before creation so
+        # even an absent receipts folder below a junction cannot redirect writes.
+        Assert-NoReparse $dir
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Assert-NoReparse $dir
+        $path = Join-Path $dir ("setup-tray-{0}-{1}.json" -f [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ'), [Guid]::NewGuid().ToString('N'))
+        Assert-NoReparse $path
+        # Never replace an existing file, including a planted link or hard link.
+        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+            $stream.Write($bytes, 0, $bytes.Length)
+        }
+        finally { $stream.Dispose() }
+        Write-Host "Receipt: $path"
+    }
+    catch { Write-Warning "Skipping setup receipt: $($_.Exception.Message)" -WarningAction Continue }
 }
 
 try {
@@ -1239,6 +1271,9 @@ try {
         }
         else {
             if (-not $AppOnly) {
+                # Capture before config creation or the machine copy would make
+                # every fresh install look like an update.
+                $existingUserInstall = Test-UserInstallExists
                 $configState = Update-HostConfig
                 if ($configState -eq 'machine') { throw 'The legacy service config is unreadable as this user. Supply -WorkerUrl and -Token; elevation never reads or writes user configuration.' }
             }
@@ -1255,7 +1290,7 @@ try {
                 }
             }
             if (-not $AppOnly) {
-                Set-UserRegistration
+                Set-UserRegistration $existingUserInstall
                 if ($sources) { Remove-LegacyUserFiles $sources }
                 $stale = Join-Path $DataDir 'elevated-runner.json'
                 if ((Test-Path -LiteralPath $stale) -and $PSCmdlet.ShouldProcess($stale, 'Delete stale legacy heartbeat')) { Remove-Item -LiteralPath $stale -Force }
