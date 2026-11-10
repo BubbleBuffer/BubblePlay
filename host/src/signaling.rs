@@ -23,6 +23,7 @@ use tungstenite::{client_tls_with_config, Error as WsError, Message, WebSocket};
 
 use crate::device_key::{relay_origin, DeviceId, DeviceIdentity};
 use crate::wss_media::{RelayRoute, RelayTicket};
+use crate::wss_v4::host_websocket_config;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::json;
@@ -2658,7 +2659,7 @@ fn connect_with_timeout(
         .context("set signaling handshake read timeout")?;
     tcp.set_write_timeout(Some(SIGNALING_HANDSHAKE_TIMEOUT))
         .context("set signaling handshake write timeout")?;
-    client_tls_with_config(request, tcp, None, None)
+    client_tls_with_config(request, tcp, Some(host_websocket_config()), None)
         .map_err(|error| anyhow::anyhow!("websocket handshake failed: {error:?}"))
 }
 
@@ -4443,9 +4444,13 @@ mod keyed_registration_tests {
     }
 
     fn client(port: u16) -> WebSocket<MaybeTlsStream<TcpStream>> {
-        let mut ws = tungstenite::connect(format!("ws://127.0.0.1:{port}/ws"))
-            .unwrap()
-            .0;
+        let mut ws = tungstenite::connect_with_config(
+            format!("ws://127.0.0.1:{port}/ws"),
+            Some(crate::wss_v4::host_websocket_config()),
+            3,
+        )
+        .unwrap()
+        .0;
         if let MaybeTlsStream::Plain(stream) = ws.get_mut() {
             stream
                 .set_read_timeout(Some(Duration::from_secs(3)))
@@ -4771,9 +4776,13 @@ mod phase2_socket_tests {
                 .recv_timeout(Duration::from_secs(10))
                 .unwrap();
         });
-        let ws = tungstenite::connect(format!("ws://{address}/ws"))
-            .unwrap()
-            .0;
+        let ws = tungstenite::connect_with_config(
+            format!("ws://{address}/ws"),
+            Some(crate::wss_v4::host_websocket_config()),
+            3,
+        )
+        .unwrap()
+        .0;
         let ticket = "4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6-_z9_v8";
         let route = RelayRoute::keyed(
             "ABCD-EFGH-JKMN-PQRS".to_owned(),

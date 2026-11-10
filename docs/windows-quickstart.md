@@ -15,7 +15,7 @@ Use infrastructure you trust: TLS protects each WebSocket connection, but the re
 
 ## Install the candidate ZIP
 
-Extract the complete ZIP into a folder. Keep its scripts beside the three executables. Open a normal PowerShell in that folder and enter your own relay address and TOKEN:
+Extract the complete ZIP into a new folder, keeping all executables, scripts and runtime assets together. Open a normal PowerShell as the desktop user in that folder and enter your own relay address and TOKEN:
 
 ```powershell
 $relay = Read-Host 'Your relay host WebSocket URL, for example wss://bubbleplay.example.com/host-ws'
@@ -32,7 +32,9 @@ Preview installation, then install without the optional elevated input helper:
 Remove-Variable registration
 ```
 
-`-SkipAgent` installs the normal per-user host and tray. Do not use it to downgrade an existing installation that relies on the elevated helper: it also removes an installed helper. For a new installation that needs input in elevated apps, omit `-SkipAgent`; setup requests one UAC prompt for the optional input helper and any necessary legacy cleanup. This helper only injects validated Windows input; it is separate from the private Node companion.
+Setup requests one UAC prompt to install all shipped executables, scripts and runtime assets under `%ProgramFiles%\BubblePlay`; the privileged helpers remain in its `agent` subfolder. Configuration, user data, autostart registration and receipts are written by the original unelevated desktop user under `%LOCALAPPDATA%\BubblePlay` or HKCU. Approve UAC using the same account, and start setup from the newly extracted release you chose to install.
+
+`-SkipAgent` leaves out the optional privileged helpers. Do not use it to downgrade an existing installation that relies on them: it also removes installed helpers. For secure desktop capture or input in elevated apps, omit `-SkipAgent`. The input helper only injects validated Windows input; it is separate from the private Node companion. When migrating an older `%LOCALAPPDATA%\Programs\BubblePlay` installation, setup verifies the protected machine copy before removing the old program files; it retains the user's data.
 
 Windows may warn about the unsigned binaries. The candidate does not bypass those warnings. Compare the ZIP's SHA256 with the published receipt before running it once a release exists.
 
@@ -54,12 +56,12 @@ Extract a newer ZIP and run from that extracted folder:
 .\update-tray.ps1 -SourceDir $PWD.Path
 ```
 
-The tray keeps the previous host for rollback. Admin input is a separate optional component; update only installs it when `-IncludeAgent` is supplied. A candidate ZIP is not an automatic updater service.
+The updater uses the new release's setup script and requests one UAC prompt for the protected machine files, while user settings and receipts remain unelevated. Admin input is a separate optional component; use `-IncludeAgent` to update its binaries and tasks. Tray helper repair can only use the setup source already protected under Program Files; if that source is unavailable or untrusted, extract a new release and run its `setup-tray.ps1`. A candidate ZIP is not an automatic updater service.
 
 ## Remove or diagnose
 
 Remove BubblePlay through Windows Settings > Apps, or run `uninstall-tray.ps1` from its install folder. The uninstall retains user configuration unless `-RemoveData` is explicitly supplied.
 
-Installed executables live in `%LOCALAPPDATA%\Programs\BubblePlay`. Configuration and bounded logs live in `%LOCALAPPDATA%\BubblePlay`. Host credentials are protected with CurrentUser DPAPI. Keep raw configuration, relay secrets and unrelated desktop/file content out of bug reports.
+Installed executables, scripts and runtime assets live in `%ProgramFiles%\BubblePlay`, with privileged helpers in `agent`. Configuration, bounded logs and receipts live in `%LOCALAPPDATA%\BubblePlay`. Host credentials are protected with CurrentUser DPAPI. Keep raw configuration, relay secrets and unrelated desktop/file content out of bug reports.
 
-This guide has been checked against source and a locally built package. A clean second-PC installation remains a release acceptance check.
+A clean second-PC installation and update of the protected Program Files layout remain release acceptance checks.

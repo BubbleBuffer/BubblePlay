@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use crate::audio::AudioFrame;
 use crate::wss_v4::{
-    V4AudioSubmit, V4Events, V4Link, V4Reserve, V4Stats, V4Submit, V4_HEADER_BYTES,
+    host_websocket_config, V4AudioSubmit, V4Events, V4Link, V4Reserve, V4Stats, V4Submit,
+    V4_HEADER_BYTES,
 };
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -23,7 +24,7 @@ use serde::Deserialize;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::http::Request;
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect, Message, WebSocket};
+use tungstenite::{connect_with_config, Message, WebSocket};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Data-socket ticket from a keyed host's signaling `hello-ok`: 32 random bytes in unpadded
@@ -309,7 +310,8 @@ fn connect_media_socket(
     route: &RelayRoute,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>> {
     let request = media_request(worker_url, epoch, route)?;
-    let (mut ws, _) = connect(request).context("connect media socket")?;
+    let (mut ws, _) = connect_with_config(request, Some(host_websocket_config()), 3)
+        .context("connect media socket")?;
     set_socket_timeouts(&mut ws, Duration::from_millis(500))?;
     ws.send(Message::text(data_hello("media-host", route)))
         .context("send media hello")?;

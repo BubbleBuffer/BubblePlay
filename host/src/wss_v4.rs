@@ -42,6 +42,7 @@ use crate::audio::AudioFrame;
 use crate::frame_damage::DamageRect;
 use crate::link_capacity::{Capacity, CapacityEstimator};
 use tracing::{debug, info, warn};
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -53,6 +54,16 @@ pub const V4_FLAG_KEY: u8 = 0x01;
 pub const V4_FLAG_REFINE: u8 = 0x02;
 const V4_KNOWN_FLAGS: u8 = V4_FLAG_KEY | V4_FLAG_REFINE;
 pub const V4_MAX_REASON_CHARS: usize = 64;
+
+/// Bound relay reads before protocol decoding or reassembly can allocate an
+/// oversized message. Leave room for the 8 MiB media payload and wire headers;
+/// the smaller per-protocol limits still apply after the socket read.
+pub(crate) fn host_websocket_config() -> WebSocketConfig {
+    const MAX_BYTES: usize = 9 * 1024 * 1024;
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_BYTES))
+        .max_frame_size(Some(MAX_BYTES))
+}
 
 /// In-flight budget: skip (before encode) once un-ACKed bytes exceed the
 /// airtime budget at the current bitrate, or once the frame cap of un-ACKed
@@ -3025,7 +3036,9 @@ mod tests {
             // Leave the connection alive until the host shuts down.
             while !matches!(ws.read(), Ok(Message::Close(_)) | Err(_)) {}
         });
-        let connector: Connector = Box::new(move || Ok(tungstenite::connect(url.as_str())?.0));
+        let connector: Connector = Box::new(move || {
+            Ok(tungstenite::connect_with_config(url.as_str(), Some(host_websocket_config()), 3)?.0)
+        });
         let link = V4Link::spawn(connector, 6_000_000, 6_000_000).unwrap();
         let activity = Activity::new().unwrap();
         link.set_activity(activity.clone());
@@ -3096,7 +3109,8 @@ mod tests {
             sessions
         });
         let connector: Connector = Box::new(move || {
-            let (ws, _) = tungstenite::connect(url.as_str())?;
+            let (ws, _) =
+                tungstenite::connect_with_config(url.as_str(), Some(host_websocket_config()), 3)?;
             Ok(ws)
         });
         let link = V4Link::spawn(connector, 6_000_000, 6_000_000).unwrap();
@@ -3237,7 +3251,7 @@ mod tests {
         let exit = ExitFlag(ended);
         Box::new(move || {
             let _ = &exit;
-            Ok(tungstenite::connect(url.as_str())?.0)
+            Ok(tungstenite::connect_with_config(url.as_str(), Some(host_websocket_config()), 3)?.0)
         })
     }
 
