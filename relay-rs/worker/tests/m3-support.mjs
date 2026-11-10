@@ -693,6 +693,13 @@ export async function startRelay({ persistDir, maxConnections = 256, ntfy = null
           ip: null,
         });
         if (res.status === 500) {
+          // The HTTP response can beat Wrangler's asynchronous console forwarding.
+          // Keep the startup diagnostic before stopping the child and snapshotting its log.
+          const logDeadline = Date.now() + 2_000;
+          while (!output.includes('relay configuration rejected:')
+              && !output.includes('relay wake failed') && Date.now() < logDeadline) {
+            await sleep(25);
+          }
           throw new Error(`relay configuration rejected (500)\n${output.slice(-4000)}`);
         }
         if (res.status === 200) break;
