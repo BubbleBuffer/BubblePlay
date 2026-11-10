@@ -60,16 +60,47 @@ are an error. Every validation error names the field it is about.
 | `listen` | `0.0.0.0:8080` | An IP address and port. Host names are not accepted. |
 | `assets_dir` | `/assets` | The static files. |
 | `state_dir` | `/data` | Where `pcs.json` and `gate.json` live. |
-| `token` | required | The first-registration ticket. `BP_RELAY_TOKEN` overrides it. |
-| `admin_token` | required | Bearer token for `/healthz` from outside loopback. `BP_RELAY_ADMIN_TOKEN` overrides it. |
-| `max_connections` | `32` | At least 1. Enforced by the relay core, which is not wired in yet. |
+| `token` | required | At least 32 characters. The first-registration ticket. `BP_RELAY_TOKEN` overrides it. |
+| `admin_token` | required | At least 32 characters. Bearer token for management and non-local `/healthz`, including requests from trusted loopback proxies. `BP_RELAY_ADMIN_TOKEN` overrides it. |
+| `max_connections` | `32` | At least 1. Counts authenticated sockets; a verified replacement may reuse its current peer's slot. |
+| `max_unauthenticated_connections` | `16` | At least 1. Separate cap for upgraded sockets awaiting hello or proof. |
+| `max_unauthenticated_per_prefix` | `4` | At least 1. Unauthenticated sockets per IPv4 /24 or IPv6 /56. |
+| `upgrade_rate_per_prefix` | `30` | At least 1. Upgrade attempts per prefix in 60 seconds, checked before accepting the WebSocket. |
+| `ntfy_publish_limit` / `ntfy_publish_window_s` | `10` / `600` | Positive integers. Global approval-notification budget, shared across prefixes. |
+| `auth_failure_limit` / `auth_failure_window_s` | `5` / `600` | Positive integers. Shared per-prefix failed registration, management and health bearer budget. |
 | `approval_ttl_s` | `90` | Must be 30 to 120 seconds. |
 | `trusted_proxy_cidrs` | `[]` | CIDR ranges of reverse proxies. `X-Forwarded-For` is read only when the direct peer is in one of them. |
 | `turn` | none | Optional. `host`, `secret` (at least 32 bytes) and `ttl_s` (default `21600`, 300 to 86400). |
 | `ntfy` | none | Optional. `url` (http or https), `topic` and `token`. Without it the gate has no approval path and an unapproved navigation is dropped. Approval messages carry the approve and deny bearers in their action headers. Publishes use rustls with the bundled webpki roots and a 10 s timeout. |
 
 Environment values win over the file. An empty value is an error. Secrets never appear in
-logs or in `Debug` output.
+logs or in `Debug` output. Both bearer settings require at least 32 characters; `bp-relay init <path>`
+generates fresh 256-bit values.
+
+**Configure `trusted_proxy_cidrs` when running behind a reverse proxy.** List only the actual
+proxy networks (required behind Caddy or Coolify): otherwise forwarded client addresses are ignored and visitors share the proxy's
+prefix budgets; forwarding headers from an untrusted peer produce a rate-limited warning.
+A peer in `trusted_proxy_cidrs` must present the `/healthz` admin bearer even on loopback;
+the `healthcheck` subcommand supplies the configured admin token; `GET /presence` remains public under its separate limits.
+
+Unauthenticated sockets use their own capacity and a 10 s hello deadline followed by a 10 s proof
+deadline, so they cannot consume authenticated slots or replace a proven host. At a full
+unauthenticated cap, new upgrades are refused until capacity reopens; existing authenticated sockets
+and valid proofs already in progress continue to work.
+Native HTTP headers and request bodies each have a 10 s deadline, and native WebSocket reads
+start at 64 KiB before switching to the route's authenticated limit (512 KiB signaling,
+8 MiB plus 28 bytes media, 64 KiB plus 16 bytes files); hello JSON remains limited to 16 KiB.
+Cloudflare exposes complete WebSocket messages, so its adapter applies the 64 KiB check after
+platform delivery and cannot lower the platform's receive-buffer limit.
+
+The Worker uses `MAX_CONNECTIONS`, `MAX_UNAUTHENTICATED_CONNECTIONS`,
+`MAX_UNAUTHENTICATED_PER_PREFIX`, `UPGRADE_RATE_PER_PREFIX`, `NTFY_PUBLISH_LIMIT`,
+`NTFY_PUBLISH_WINDOW_S`, `AUTH_FAILURE_LIMIT` and `AUTH_FAILURE_WINDOW_S` with the same defaults.
+Rate counters live in memory and reset on restart or Durable Object hibernation.
+
+Unapproved navigation first redirects to the same URL with the short-lived Secure, HttpOnly,
+SameSite=Strict `__Host-bp_wait` cookie. Joining or claiming that approval requires both the
+cookie and its original network prefix; sharing a NAT alone does not grant the approval.
 
 ## State files
 
@@ -95,6 +126,8 @@ Static assets are served under these rules. Only GET and HEAD are served. Paths 
 `..` cannot leave `assets_dir`. A path with a backslash is a 404. A dotfile, a directory or a
 missing file is a 404. A request for `/index.html` redirects to `./`. Responses carry
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+Served assets also carry a Content Security Policy and `X-Frame-Options: DENY`; the policy
+permits the viewer's same-origin modules, hashed inline bootstrap and Argon2 WebAssembly.
 
 ## Docker
 
