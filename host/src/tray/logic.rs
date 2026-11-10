@@ -150,12 +150,47 @@ pub struct StoredHostConfig {
 }
 
 impl StoredHostConfig {
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let config: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Loads the relay credential and migrates a valid legacy DPAPI token atomically. Unknown
+    /// configuration fields are kept; a failed decrypt or migration prevents the host start.
+    pub fn load_with_token(path: &Path) -> Result<(Self, String)> {
+        Self::load_with_token_codec(
+            path,
+            bubbleplay_host::dpapi::dpapi_protect_bytes,
+            bubbleplay_host::dpapi::dpapi_unprotect_bytes_with_migration,
+        )
+    }
+
+    fn load_with_token_codec(
+        path: &Path,
+        protect: impl Fn(&[u8]) -> Result<Vec<u8>>,
+        unprotect: impl Fn(&[u8]) -> Result<(Vec<u8>, bool)>,
+    ) -> Result<(Self, String)> {
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut config: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        config.validate()?;
+        let encrypted = zeroize::Zeroizing::new(decode_hex(&config.token_dpapi_hex)?);
+        let (plain, legacy) = unprotect(&encrypted)?;
+        let token = String::from_utf8(plain).context("stored token is not UTF-8")?;
+        if legacy {
+            let protected = protect(token.as_bytes())
+                .context("protecting legacy relay credential with application entropy")?;
+            config.token_dpapi_hex = protected.iter().map(|byte| format!("{byte:02X}")).collect();
+            let mut document: serde_json::Value = serde_json::from_slice(&bytes)?;
+            document["tokenDpapiHex"] = serde_json::Value::String(config.token_dpapi_hex.clone());
+            write_atomic(path, &serde_json::to_vec_pretty(&document)?)
+                .context("migrating legacy relay credential")?;
+        }
+        Ok((config, token))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1123,6 +1158,62 @@ mod tests {
                 OsString::from("--cpu-mode"),
             ]
         );
+    }
+
+    #[test]
+    fn legacy_relay_token_migrates_once_and_keeps_other_config_fields() {
+        let dir = temp_dir("legacy-relay-token");
+        let path = dir.join("host.json");
+        let legacy = serde_json::json!({
+            "worker": "wss://w.example/host-ws",
+            "tokenDpapiHex": "6F6C64", // Synthetic legacy ciphertext: "old".
+            "monitor": "primary",
+            "futureSetting": {"keep": true},
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let unprotect = |bytes: &[u8]| match bytes {
+            b"old" => Ok((b"relay token".to_vec(), true)),
+            b"new" => Ok((b"relay token".to_vec(), false)),
+            _ => anyhow::bail!("injected unprotect failure"),
+        };
+        // A failed migration is a failed load, preserving the original file.
+        let before = fs::read(&path).unwrap();
+        assert!(StoredHostConfig::load_with_token_codec(
+            &path,
+            |_| anyhow::bail!("injected protect failure"),
+            unprotect,
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let (stored, token) = StoredHostConfig::load_with_token_codec(
+            &path,
+            |plain| {
+                assert_eq!(plain, b"relay token");
+                Ok(b"new".to_vec())
+            },
+            unprotect,
+        )
+        .unwrap();
+        assert_eq!(stored.token_dpapi_hex, "6E6577");
+        assert_eq!(stored.monitor.as_deref(), Some("primary"));
+        assert_eq!(token, "relay token");
+        let migrated = fs::read(&path).unwrap();
+        let mut expected = legacy;
+        expected["tokenDpapiHex"] = "6E6577".into();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&migrated).unwrap(),
+            expected
+        );
+
+        StoredHostConfig::load_with_token_codec(
+            &path,
+            |_| anyhow::bail!("must not rewrite migrated token"),
+            unprotect,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), migrated);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

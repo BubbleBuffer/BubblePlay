@@ -22,7 +22,7 @@ use super::device_key_file;
 use super::logic::{
     build_host_args, log_child_line, Backoff, HostState, StoredHostConfig, TraySettings,
 };
-use super::platform::{dpapi_unprotect_hex, KillOnCloseJob};
+use super::platform::KillOnCloseJob;
 
 /// Stdin line that asks the host to tell connected pipe clients to show the
 /// Devices app. The host side defines the same literal.
@@ -184,9 +184,7 @@ struct Secrets {
 }
 
 fn load(config: &SupervisorConfig) -> Result<(StoredHostConfig, Secrets)> {
-    let stored = StoredHostConfig::load(&config.host_config)?;
-    let token = String::from_utf8(dpapi_unprotect_hex(&stored.token_dpapi_hex)?)
-        .context("stored token is not UTF-8")?;
+    let (stored, token) = StoredHostConfig::load_with_token(&config.host_config)?;
     bubbleplay_host::logging::redact::register_secret(&token);
     Ok((stored, Secrets { token }))
 }

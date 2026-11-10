@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use bp_device_key::{DeviceKeyError, KeyFile};
+use bubbleplay_host::dpapi::dpapi_unprotect_bytes_with_migration;
 use rand_core::{OsRng, RngCore};
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
@@ -17,7 +18,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use zeroize::Zeroizing;
 
-use super::platform::{dpapi_protect_bytes, dpapi_unprotect_bytes, wide};
+use super::platform::{dpapi_protect_bytes, wide};
 
 pub const HANDOFF_ENV: &str = bubbleplay_host::device_key::HANDOFF_ENV;
 const FILE_NAME: &str = "device-key.bpkey";
@@ -28,17 +29,19 @@ pub fn path_beside(host_config: &Path) -> PathBuf {
 
 /// Load or create the PC key and return validated plain JSON for the child command only.
 /// Existing files are never replaced by this operation, including a file created concurrently,
-/// except a file that unprotects to a key file in another format: that counts as no key.
+/// except a validated legacy DPAPI blob is migrated with application entropy, or a file that
+/// unprotects to a key file in another format: that counts as no key.
 pub fn handoff(path: &Path, label: &str, created: &str) -> Result<Zeroizing<String>> {
-    handoff_with_codec(
+    handoff_with_migrating_codec(
         path,
         label,
         created,
         dpapi_protect_bytes,
-        dpapi_unprotect_bytes,
+        dpapi_unprotect_bytes_with_migration,
     )
 }
 
+#[cfg(test)]
 fn handoff_with_codec(
     path: &Path,
     label: &str,
@@ -46,10 +49,22 @@ fn handoff_with_codec(
     protect: impl Fn(&[u8]) -> Result<Vec<u8>>,
     unprotect: impl Fn(&[u8]) -> Result<Vec<u8>>,
 ) -> Result<Zeroizing<String>> {
+    handoff_with_migrating_codec(path, label, created, protect, |bytes| {
+        unprotect(bytes).map(|plain| (plain, false))
+    })
+}
+
+fn handoff_with_migrating_codec(
+    path: &Path,
+    label: &str,
+    created: &str,
+    protect: impl Fn(&[u8]) -> Result<Vec<u8>>,
+    unprotect: impl Fn(&[u8]) -> Result<(Vec<u8>, bool)>,
+) -> Result<Zeroizing<String>> {
     let mut replace = false;
     let stored = match fs::read(path) {
         Ok(bytes) => {
-            if is_other_format(&bytes, &unprotect) {
+            if is_other_format(&bytes, &|bytes| unprotect(bytes).map(|(plain, _)| plain)) {
                 tracing::warn!("the stored PC key is in an unsupported format; creating a new one");
                 replace = true;
                 None
@@ -71,9 +86,15 @@ fn handoff_with_codec(
             fs::read(path).context("reading newly created PC key")?
         }
     };
-    let bytes = Zeroizing::new(unprotect(&protected).context("unprotecting PC key")?);
+    let (plain, legacy) = unprotect(&protected).context("unprotecting PC key")?;
+    let bytes = Zeroizing::new(plain);
     let text = std::str::from_utf8(&bytes).context("PC key is not UTF-8")?;
     validate_plain(text)?;
+    if legacy {
+        let migrated =
+            protect(&bytes).context("protecting legacy PC key with application entropy")?;
+        write_atomic(path, &migrated, true).context("migrating legacy PC key")?;
+    }
     Ok(Zeroizing::new(text.to_owned()))
 }
 
@@ -260,6 +281,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bubbleplay_host::dpapi::dpapi_unprotect_bytes;
     use std::cell::Cell;
 
     const CREATED: &str = "2026-10-13T09:30:00Z";
@@ -330,6 +352,39 @@ mod tests {
             dpapi_unprotect_bytes(&protected).unwrap(),
             b"device key round trip"
         );
+    }
+
+    #[test]
+    fn legacy_pc_key_is_migrated_once_after_validation() {
+        let dir = Scratch::new();
+        let path = dir.key();
+        let original = plain("legacy PC");
+        let legacy = [b"legacy:".as_slice(), original.as_bytes()].concat();
+        fs::write(&path, &legacy).unwrap();
+        let unprotect = |bytes: &[u8]| {
+            if let Some(plain) = bytes.strip_prefix(b"legacy:") {
+                Ok((plain.to_vec(), true))
+            } else {
+                open(bytes).map(|plain| (plain, false))
+            }
+        };
+        assert!(handoff_with_migrating_codec(&path, "PC", CREATED, fail, unprotect).is_err());
+        assert_eq!(fs::read(&path).unwrap(), legacy);
+        let first =
+            handoff_with_migrating_codec(&path, "unused", CREATED, seal, unprotect).unwrap();
+        assert_eq!(first.as_str(), original);
+        let migrated = fs::read(&path).unwrap();
+        assert_eq!(migrated, seal(original.as_bytes()).unwrap());
+        let second =
+            handoff_with_migrating_codec(&path, "unused", CREATED, fail, unprotect).unwrap();
+        assert_eq!(first.as_str(), second.as_str());
+        assert_eq!(fs::read(&path).unwrap(), migrated);
+        dir.no_temps();
+
+        let invalid = b"legacy:{not JSON";
+        fs::write(&path, invalid).unwrap();
+        assert!(handoff_with_migrating_codec(&path, "PC", CREATED, seal, unprotect).is_err());
+        assert_eq!(fs::read(&path).unwrap(), invalid);
     }
 
     #[test]
