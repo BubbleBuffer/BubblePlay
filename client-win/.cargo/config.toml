@@ -1,0 +1,4 @@
+# Same static C runtime as host/.cargo/config.toml: the viewer exe must not import
+# VCRUNTIME140*.dll or MSVCP140*.dll. The Universal CRT stays dynamic.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

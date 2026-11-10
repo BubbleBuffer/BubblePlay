@@ -15,3 +15,6 @@ AWS_LC_SYS_LINK_WHOLE_ARCHIVE = "1"
 # rust-lld can report success without producing BubblePlay's Windows executables.
 [target.x86_64-pc-windows-msvc]
 linker = "link.exe"
+# Link the C runtime statically, so the exes do not import VCRUNTIME140*.dll or MSVCP140*.dll
+# and run on a machine without the Visual C++ Redistributable. The Universal CRT stays dynamic.
+rustflags = ["-C", "target-feature=+crt-static"]
