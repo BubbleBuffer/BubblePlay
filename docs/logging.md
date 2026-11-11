@@ -95,6 +95,10 @@ The browser's `bootstrap-inline` trace (target `trace`, written once when the pa
 
 The phone app's Kotlin core (`app-android-core`, target `Session`) logs one info line when the app goes to the background and media stops (`backgrounded: media stopped`, field `graceMs`), one when it returns within the 5 minute grace and the first live frame is shown (`resumed within grace: first frame after N ms`, fields `firstFrameMs`, `backgroundMs`) and one when the grace runs out and the session is disconnected (`grace expired: disconnected`, fields `backgroundMs`, `graceMs`). The field names avoid the redacted words; `RedactTest` checks they pass. See [reconnect](architecture/reconnect.md).
 
+## Dialog follow lines (2026-11-11)
+
+When an elevation prompt is on another monitor than the streamed one, the host logs one info line when it shows that monitor and one when it goes back, both with target `bubbleplay_host` and field `monitor` (and `restore` on the first): `dialog follow: elevation prompt, showing its monitor` / `dialog follow: elevation prompt gone, restoring monitor` for a prompt on the normal desktop, `dialog follow: UAC prompt on the secure desktop, showing its monitor` / `dialog follow: secure desktop ended, restoring monitor` for the secure desktop. A warn line says the primary monitor was unavailable. See [follow-active-window.md](architecture/follow-active-window.md#elevation-prompt-on-another-monitor).
+
 ## Frozen foreground app (2026-11-09)
 
 While a viewer is attached, the host checks the foreground window on the 250 ms foreground tick (`host/src/input_stall.rs`). When the window is hung (`IsHungAppWindow`), DWM's `Ghost` stand-in is foreground, or the cursor has stayed `Wait` for 5 s, it logs one warn line per episode: `foreground app stopped responding while a viewer is attached`. A new episode starts only after a sample with none of the three. Fields:

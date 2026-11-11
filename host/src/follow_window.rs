@@ -460,9 +460,6 @@ pub fn selector_for(monitors: &[MonitorInfo], target: &WindowMonitor) -> Option<
 pub fn sample_foreground() -> Sample {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-    use windows::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
-    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, IsIconic, IsWindowVisible,
@@ -528,6 +525,24 @@ pub fn sample_foreground() -> Sample {
             // does not switch either.
             return Sample::Ignored;
         }
+        let Some(monitor) = monitor_of(hwnd) else {
+            return Sample::Ignored;
+        };
+        Sample::Window {
+            window: hwnd.0 as isize,
+            monitor,
+            details,
+        }
+    }
+}
+
+/// The monitor nearest to `hwnd`.
+fn monitor_of(hwnd: windows::Win32::Foundation::HWND) -> Option<WindowMonitor> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    };
+    // SAFETY: plain Win32 queries with valid out-pointers sized by cbSize.
+    unsafe {
         let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFOEXW {
             monitorInfo: MONITORINFO {
@@ -537,23 +552,60 @@ pub fn sample_foreground() -> Sample {
             ..Default::default()
         };
         if !GetMonitorInfoW(hmonitor, (&raw mut info).cast()).as_bool() {
-            return Sample::Ignored;
+            return None;
         }
         let end = info
             .szDevice
             .iter()
             .position(|&c| c == 0)
             .unwrap_or(info.szDevice.len());
-        Sample::Window {
-            window: hwnd.0 as isize,
-            monitor: WindowMonitor {
-                device: String::from_utf16_lossy(&info.szDevice[..end]),
-                origin_x: info.monitorInfo.rcMonitor.left,
-                origin_y: info.monitorInfo.rcMonitor.top,
-            },
-            details,
-        }
+        Some(WindowMonitor {
+            device: String::from_utf16_lossy(&info.szDevice[..end]),
+            origin_x: info.monitorInfo.rcMonitor.left,
+            origin_y: info.monitorInfo.rcMonitor.top,
+        })
     }
+}
+
+/// The monitor of the foreground window when it is an elevation prompt on the
+/// normal desktop (`%SystemRoot%\System32\consent.exe`), else `None`. With the
+/// secure desktop switched off Windows shows the prompt there, in the
+/// foreground. Win32; interactive session only.
+pub fn foreground_consent_monitor() -> Option<WindowMonitor> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    };
+    // SAFETY: plain Win32 queries with valid out-pointers.
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid()
+        || !unsafe { IsWindowVisible(hwnd) }.as_bool()
+        || unsafe { IsIconic(hwnd) }.as_bool()
+    {
+        return None;
+    }
+    // The cached file-name lookup rejects every other window cheaply.
+    if !is_consent_exe(&details_of(hwnd, String::new()).exe) {
+        return None;
+    }
+    let mut pid = 0u32;
+    // SAFETY: plain Win32 query with a valid out-pointer.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+    let image = crate::admin_agent::trust::process_image_path(pid)?;
+    let expected = std::path::PathBuf::from(std::env::var_os("SystemRoot")?)
+        .join("System32")
+        .join("consent.exe");
+    if !image
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected.to_string_lossy())
+    {
+        return None;
+    }
+    monitor_of(hwnd)
+}
+
+/// Whether an executable file name is Windows' consent UI.
+pub fn is_consent_exe(exe: &str) -> bool {
+    exe.eq_ignore_ascii_case("consent.exe")
 }
 
 /// The owning process of `hwnd`, with its executable looked up only when the window or

@@ -17,6 +17,7 @@ pub mod device_key;
 pub mod devices_pipe;
 pub mod devices_ui_api;
 pub mod devices_window;
+pub mod dialog_monitor;
 pub mod dk_host;
 pub mod dk_session;
 pub mod dpapi;
