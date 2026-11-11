@@ -15,6 +15,8 @@ pub const MAX_PAYLOAD_BYTES: usize = 1500;
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 2;
 pub const FRAME_SAMPLES: usize = 480;
+/// Samples per channel in one WSS packet (20 ms). RTP keeps `FRAME_SAMPLES`.
+pub const WSS_FRAME_SAMPLES: usize = 960;
 /// Interleaved samples in one 10 ms stereo frame.
 pub const FRAME_LEN: usize = FRAME_SAMPLES * 2;
 pub const FRAME_PERIOD: Duration = Duration::from_millis(10);
@@ -43,11 +45,20 @@ pub struct Packet {
     pub seq: u32,
     pub capture_ts_us: u64,
     pub discontinuity: bool,
+    /// Samples per channel the payload covers: 480 or 960.
+    pub frame_samples: u16,
     pub payload: Vec<u8>,
+}
+
+fn frame_samples_ok(samples: usize) -> bool {
+    samples == FRAME_SAMPLES || samples == WSS_FRAME_SAMPLES
 }
 
 /// Serialises one packet: 28-byte big-endian header followed by the Opus payload.
 pub fn encode_packet(packet: &Packet) -> Result<Vec<u8>, &'static str> {
+    if !frame_samples_ok(packet.frame_samples as usize) {
+        return Err("unsupported audio frame samples");
+    }
     let len = packet.payload.len();
     if !(1..=MAX_PAYLOAD_BYTES).contains(&len) {
         return Err("audio payload outside 1..=1500 bytes");
@@ -65,7 +76,7 @@ pub fn encode_packet(packet: &Packet) -> Result<Vec<u8>, &'static str> {
     out.extend_from_slice(&SAMPLE_RATE.to_be_bytes());
     out.extend_from_slice(&packet.seq.to_be_bytes());
     out.extend_from_slice(&packet.capture_ts_us.to_be_bytes());
-    out.extend_from_slice(&(FRAME_SAMPLES as u16).to_be_bytes());
+    out.extend_from_slice(&packet.frame_samples.to_be_bytes());
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&packet.payload);
     Ok(out)
@@ -101,7 +112,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<Packet, &'static str> {
     }
     let mut ts = [0u8; 8];
     ts.copy_from_slice(&bytes[16..24]);
-    if be16(24) as usize != FRAME_SAMPLES {
+    if !frame_samples_ok(be16(24) as usize) {
         return Err("unsupported audio frame samples");
     }
     if be16(26) != 0 {
@@ -115,6 +126,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<Packet, &'static str> {
         seq: be32(12),
         capture_ts_us: u64::from_be_bytes(ts),
         discontinuity: flags & FLAG_DISCONTINUITY != 0,
+        frame_samples: be16(24),
         payload: payload.to_vec(),
     })
 }
@@ -129,8 +141,13 @@ pub struct Tone {
 impl Tone {
     /// The next 10 ms of tone, interleaved stereo.
     pub fn next_frame(&mut self) -> Vec<f32> {
-        let mut out = Vec::with_capacity(FRAME_LEN);
-        for _ in 0..FRAME_SAMPLES {
+        self.next_samples(FRAME_SAMPLES)
+    }
+
+    /// The next `samples` samples per channel of tone, interleaved stereo.
+    pub fn next_samples(&mut self, samples: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(samples * 2);
+        for _ in 0..samples {
             let position = (self.next % u64::from(SAMPLE_RATE)) as f64;
             let phase = 2.0 * std::f64::consts::PI * TONE_HZ * position / f64::from(SAMPLE_RATE);
             let value = (phase.sin() * TONE_AMPLITUDE) as f32;
@@ -143,15 +160,20 @@ impl Tone {
 }
 
 /// Opus at the host's settings: Application Audio, 128 kbps VBR, stereo,
-/// no in-band FEC, no DTX. One call encodes one 10 ms frame.
+/// no in-band FEC, no DTX. One call encodes one frame: 10 ms, or 20 ms for WSS.
 pub struct ToneEncoder {
     inner: opus::Encoder,
     scratch: Vec<u8>,
     tone: Tone,
+    frame_samples: usize,
 }
 
 impl ToneEncoder {
     pub fn new() -> Result<Self> {
+        Self::with_frame_samples(FRAME_SAMPLES)
+    }
+
+    pub fn with_frame_samples(frame_samples: usize) -> Result<Self> {
         let mut inner = opus::Encoder::new(
             SAMPLE_RATE,
             opus::Channels::Stereo,
@@ -168,12 +190,13 @@ impl ToneEncoder {
             inner,
             scratch: vec![0; MAX_PAYLOAD_BYTES],
             tone: Tone::default(),
+            frame_samples,
         })
     }
 
-    /// The Opus payload for the next 10 ms of tone.
+    /// The Opus payload for the next frame of tone.
     pub fn next_payload(&mut self) -> Result<Vec<u8>> {
-        let pcm = self.tone.next_frame();
+        let pcm = self.tone.next_samples(self.frame_samples);
         let len = self
             .inner
             .encode_float(&pcm, &mut self.scratch)
@@ -260,12 +283,15 @@ pub enum Delivery {
     Gone,
 }
 
-/// The audio lane for one run. It produces 10 ms packets while active and
+/// The audio lane for one run. It produces packets (10 ms, or 20 ms on WSS) while active and
 /// hands them out in order; the hub decides when a lane is active.
 pub struct AudioLane {
     script: Script,
     run_start: Instant,
     encoder: ToneEncoder,
+    frame_samples: usize,
+    /// Duration of one packet.
+    period: Duration,
     counters: AudioCounters,
     active: bool,
     /// Capture time of the next packet while active.
@@ -282,10 +308,25 @@ pub struct AudioLane {
 
 impl AudioLane {
     pub fn new(script: Script, run_start: Instant) -> Result<Self> {
+        Self::with_frame_samples(script, run_start, FRAME_SAMPLES)
+    }
+
+    /// The WSS lane: 960-sample (20 ms) packets.
+    pub fn new_wss(script: Script, run_start: Instant) -> Result<Self> {
+        Self::with_frame_samples(script, run_start, WSS_FRAME_SAMPLES)
+    }
+
+    fn with_frame_samples(
+        script: Script,
+        run_start: Instant,
+        frame_samples: usize,
+    ) -> Result<Self> {
         Ok(Self {
             script,
             run_start,
-            encoder: ToneEncoder::new()?,
+            encoder: ToneEncoder::with_frame_samples(frame_samples)?,
+            frame_samples,
+            period: Duration::from_micros(frame_samples as u64 * 1_000_000 / SAMPLE_RATE as u64),
             counters: AudioCounters::default(),
             active: false,
             next_due: run_start,
@@ -336,7 +377,7 @@ impl AudioLane {
         if !self.active {
             return;
         }
-        if now.saturating_duration_since(self.next_due) > FRAME_PERIOD * MAX_CATCH_UP {
+        if now.saturating_duration_since(self.next_due) > self.period * MAX_CATCH_UP {
             self.next_due = now;
             self.gap = true;
             self.counters.resyncs += 1;
@@ -346,7 +387,7 @@ impl AudioLane {
                 break;
             }
             let due = self.next_due;
-            self.next_due += FRAME_PERIOD;
+            self.next_due += self.period;
             self.produce_one(due);
         }
     }
@@ -369,6 +410,7 @@ impl AudioLane {
             seq,
             capture_ts_us: due.saturating_duration_since(self.run_start).as_micros() as u64,
             discontinuity: false,
+            frame_samples: self.frame_samples as u16,
             payload,
         };
         if self.script.loses(index) {
@@ -457,6 +499,7 @@ mod tests {
             seq,
             capture_ts_us: 1_000,
             discontinuity,
+            frame_samples: 480,
             payload: vec![0xfc, 0xff, 0xfe],
         }
     }
@@ -483,6 +526,7 @@ mod tests {
             seq: u32::MAX,
             capture_ts_us: u64::MAX,
             discontinuity: true,
+            frame_samples: 960,
             payload: vec![1, 2, 3],
         };
         let bytes = encode_packet(&p).expect("encode");
@@ -555,7 +599,7 @@ mod tests {
                 assert!(decode_packet(&bytes).is_err(), "{name} must be rejected");
             }
         }
-        assert_eq!((accepted, rejected), (2, 11), "fixture changed");
+        assert_eq!((accepted, rejected), (3, 11), "fixture changed");
     }
 
     #[test]
@@ -627,6 +671,28 @@ mod tests {
         assert_eq!(got, vec![(0, true), (1, false), (2, false)]);
         assert_eq!(lane.counters().packets_sent, 3);
         assert_eq!(lane.counters().discontinuities_sent, 1);
+    }
+
+    #[test]
+    fn wss_lane_makes_20_ms_packets_of_960_samples() {
+        let t0 = Instant::now();
+        let mut lane = AudioLane::new_wss(Script::default(), t0).expect("encoder");
+        lane.start(t0);
+        lane.produce(t0 + Duration::from_millis(45));
+        assert_eq!(lane.counters().packets_encoded, 3, "due at 0, 20 and 40 ms");
+        let mut got = Vec::new();
+        lane.deliver(|bytes| {
+            got.push(decode_packet(&bytes).expect("own packet decodes"));
+            Delivery::Sent
+        });
+        assert!(got.iter().all(|p| p.frame_samples == 960));
+        assert_eq!(got[1].capture_ts_us - got[0].capture_ts_us, 20_000);
+        let mut dec = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).expect("decoder");
+        let mut out = vec![0f32; WSS_FRAME_SAMPLES * 2];
+        let n = dec
+            .decode_float(&got[0].payload, &mut out, false)
+            .expect("decode");
+        assert_eq!(n, WSS_FRAME_SAMPLES);
     }
 
     #[test]

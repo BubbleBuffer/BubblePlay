@@ -82,7 +82,7 @@ fn wire(packet: &Packet) -> Vec<u8> {
     bytes.extend_from_slice(&SAMPLE_RATE.to_be_bytes());
     bytes.extend_from_slice(&packet.seq.to_be_bytes());
     bytes.extend_from_slice(&packet.capture_ts_us.to_be_bytes());
-    bytes.extend_from_slice(&(FRAME_SAMPLES as u16).to_be_bytes());
+    bytes.extend_from_slice(&(packet.frame_samples as u16).to_be_bytes());
     bytes.extend_from_slice(&[0, 0]);
     bytes.extend_from_slice(&packet.payload);
     bytes
@@ -111,6 +111,7 @@ fn tones(count: usize, first: u32) -> Vec<Packet> {
                 seq: first.wrapping_add(frame as u32),
                 capture_ts_us: frame as u64 * 10_000,
                 discontinuity: frame == 0,
+                frame_samples: FRAME_SAMPLES,
                 payload: payload[..bytes].to_vec(),
             }
         })
@@ -201,6 +202,10 @@ fn every_shared_fixture_acceptance_and_fields_match() {
             assert_eq!(
                 packet.discontinuity,
                 case["discontinuity"].as_bool().unwrap()
+            );
+            assert_eq!(
+                packet.frame_samples as u64,
+                case["frameSamples"].as_u64().unwrap()
             );
             assert_eq!(packet.payload, unhex(case["payloadHex"].as_str().unwrap()));
         }
@@ -542,6 +547,7 @@ fn twenty_ms_opus_payload_is_refused_by_fixed_duration_decoder() {
         seq: 0,
         capture_ts_us: 0,
         discontinuity: true,
+        frame_samples: FRAME_SAMPLES,
         payload: data[..len].to_vec(),
     };
     let mut engine = Engine::new().unwrap();

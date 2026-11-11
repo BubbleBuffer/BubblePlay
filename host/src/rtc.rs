@@ -568,6 +568,7 @@ mod tests {
                 seq: 1,
                 capture_ts_us: 0,
                 discontinuity: false,
+                samples: crate::audio::FRAME_SAMPLES,
                 payload: vec![1],
             })
             .unwrap());
@@ -837,6 +838,7 @@ mod tests {
             seq: 0,
             capture_ts_us: 0,
             discontinuity: true,
+            samples: crate::audio::FRAME_SAMPLES,
             payload: vec![0xfc, 0xff, 0xfe],
         };
         assert!(!host.write_audio(frame).expect("write before ICE"));

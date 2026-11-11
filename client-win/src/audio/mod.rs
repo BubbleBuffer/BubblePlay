@@ -150,6 +150,7 @@ impl AudioHandle {
                 seq: sequence as u32,
                 capture_ts_us: (u128::from(timestamp) * 1_000_000 / 48_000) as u64,
                 discontinuity,
+                frame_samples: wire::FRAME_SAMPLES,
                 payload: payload.to_vec(),
             }
         });

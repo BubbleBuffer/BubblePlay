@@ -1,11 +1,13 @@
-//! Opus encoding of 10 ms stereo frames for the host audio stream.
+//! Opus encoding of 10 ms or 20 ms stereo frames for the host audio stream.
 
 use anyhow::{ensure, Context, Result};
 
-use super::wire::{FRAME_SAMPLES, MAX_PAYLOAD_BYTES, SAMPLE_RATE};
+use super::wire::{FRAME_SAMPLES, FRAME_SAMPLES_20MS, MAX_PAYLOAD_BYTES, SAMPLE_RATE};
 
 /// Interleaved f32 samples in one 10 ms stereo frame.
 pub const FRAME_LEN: usize = FRAME_SAMPLES as usize * 2;
+/// Interleaved f32 samples in one 20 ms stereo frame.
+const FRAME_LEN_20MS: usize = FRAME_SAMPLES_20MS as usize * 2;
 const BITRATE_BPS: i32 = 128_000;
 
 /// Application Audio, 128 kbps VBR, stereo, no in-band FEC, no DTX.
@@ -34,11 +36,11 @@ impl OpusEncoder {
         })
     }
 
-    /// Encodes exactly one 10 ms frame (480 stereo samples, interleaved).
+    /// Encodes exactly one frame: 10 ms (480 stereo samples) or 20 ms (960), interleaved.
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u8>> {
         ensure!(
-            pcm.len() == FRAME_LEN,
-            "opus frame needs {FRAME_LEN} samples, got {}",
+            pcm.len() == FRAME_LEN || pcm.len() == FRAME_LEN_20MS,
+            "opus frame needs {FRAME_LEN} or {FRAME_LEN_20MS} samples, got {}",
             pcm.len()
         );
         let len = self
@@ -49,13 +51,28 @@ impl OpusEncoder {
     }
 }
 
-/// Collects 48 kHz stereo frames and hands out whole 10 ms frames.
-#[derive(Default)]
+/// Collects 48 kHz stereo frames and hands out whole frames of a fixed length.
 pub struct FrameAssembler {
     pending: Vec<f32>,
+    /// Interleaved samples per frame.
+    frame_len: usize,
+}
+
+impl Default for FrameAssembler {
+    fn default() -> Self {
+        Self::new(FRAME_SAMPLES)
+    }
 }
 
 impl FrameAssembler {
+    /// `frame_samples` is samples per channel: 480 (10 ms) or 960 (20 ms).
+    pub fn new(frame_samples: u16) -> Self {
+        Self {
+            pending: Vec::new(),
+            frame_len: usize::from(frame_samples) * 2,
+        }
+    }
+
     pub fn push(&mut self, frames: &[[f32; 2]]) {
         for frame in frames {
             self.pending.extend_from_slice(frame);
@@ -64,10 +81,10 @@ impl FrameAssembler {
 
     /// Removes and returns the next complete frame, if one is buffered.
     pub fn pop(&mut self) -> Option<Vec<f32>> {
-        if self.pending.len() < FRAME_LEN {
+        if self.pending.len() < self.frame_len {
             return None;
         }
-        Some(self.pending.drain(..FRAME_LEN).collect())
+        Some(self.pending.drain(..self.frame_len).collect())
     }
 
     pub fn clear(&mut self) {

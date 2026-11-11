@@ -1,4 +1,4 @@
-//! Decides which 10 ms frames are sent. Silence is sent for at most 200 ms, then
+//! Decides which frames are sent. Silence is sent for at most 200 ms, then
 //! suppressed until sound returns. The first sent packet after the start or after
 //! any suppressed span is marked as a discontinuity.
 
@@ -13,6 +13,8 @@ pub fn frame_is_active(pcm: &[f32]) -> bool {
 #[derive(Debug)]
 pub struct SilenceGate {
     silent_run: u32,
+    /// Silent frames sent before suppression starts.
+    max_silent: u32,
     suppressing: bool,
     gap: bool,
 }
@@ -20,8 +22,14 @@ pub struct SilenceGate {
 impl SilenceGate {
     /// The stream starts with a discontinuity, so the first sent packet is marked.
     pub fn new() -> Self {
+        Self::with_limit(MAX_SILENT_FRAMES)
+    }
+
+    /// Like `new`, with `max_silent` silent frames sent before suppression (200 ms of frames).
+    pub fn with_limit(max_silent: u32) -> Self {
         Self {
             silent_run: 0,
+            max_silent,
             suppressing: false,
             gap: true,
         }
@@ -45,7 +53,7 @@ impl SilenceGate {
                 return None;
             }
             self.silent_run += 1;
-            if self.silent_run > MAX_SILENT_FRAMES {
+            if self.silent_run > self.max_silent {
                 self.suppressing = true;
                 return None;
             }

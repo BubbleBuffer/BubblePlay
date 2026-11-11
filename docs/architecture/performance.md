@@ -36,7 +36,7 @@ An independent session watchdog reports a stage and `main.rs` line after ten sec
 
 ## WSS relay capacity (Cloudflare Worker)
 
-A stream that falls back to the WSS relay sends about 165 messages per second (about 100 are 10 ms Opus packets, the rest video, ctl and ACKs). Cloudflare bills incoming WebSocket messages (20:1) and CPU time; bandwidth is free. Measured in October 2026: roughly 0.2 ms of relay CPU per message.
+A stream that falls back to the WSS relay sends about 115 messages per second (about 50 are 20 ms Opus packets, the rest video, ctl and ACKs). Cloudflare bills incoming WebSocket messages (20:1) and CPU time; bandwidth is free. Measured in October 2026: roughly 0.2 ms of relay CPU per message.
 
 Each PC has its own session Durable Object (`PcRelay`, named `pc-<device id>`), so streams of different PCs never share an object, its 32-connection cap or its CPU budget. One stream occupies one object with about 6 sockets, so the old limit of about 5 to 6 concurrent streams for the whole relay is now per PC. The front object (`relay-v1`) handles only gate, HTTP, admin and presence traffic; it sees no media. See [`relay-rs/README.md`](../../relay-rs/README.md) for the split.
 
@@ -51,4 +51,4 @@ Measured locally on Windows (2026-11-11), 188-byte frames, host to viewer:
 
 The end-to-end number is dominated by workerd's WebSocket and JS boundary work, which the relay code does not control, and it varies by about 5 percent between runs. Local workerd is not Cloudflare's CPU accounting: use the ratio, not the absolute value. Message count is what the bill follows, so the larger saving is fewer messages (see the 20 ms audio frame note below).
 
-The audio packet rate is still 100 per second on WSS. The BPA1 header carries samples per channel, and the browser (`audio.js`), Android and Windows viewers validate exactly 480 (10 ms), so 20 ms frames need decoder changes in every viewer. That change is not made.
+The host sends 20 ms Opus frames (960 samples per channel) on the WSS path, so audio is 50 packets per second there; WebRTC keeps 10 ms. The BPA1 header carries samples per channel, and the browser (`audio.js`), Android and Windows viewers accept 480 and 960 and reject anything else. The shared fixture `fixtures/audio-contract.json` pins both. The silence gate still works in 10 ms steps, so silence is sent for about 200 ms as before.

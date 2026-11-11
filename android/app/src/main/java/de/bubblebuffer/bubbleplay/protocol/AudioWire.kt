@@ -9,7 +9,7 @@ import org.json.JSONObject
  *
  * Header, big-endian: magic u32 "BPA1" | version u8 = 1 | flags u8 (bit0
  * discontinuity) | codec u8 (1 Opus) | channels u8 (2) | sampleRate u32 (48000) |
- * seq u32 | captureTsUs u64 | frameSamples u16 (480) | reserved u16 (0).
+ * seq u32 | captureTsUs u64 | frameSamples u16 (480 = 10 ms on WebRTC, 960 = 20 ms on WSS) | reserved u16 (0).
  */
 object AudioWire {
     const val MAGIC = 0x42504131L
@@ -20,7 +20,8 @@ object AudioWire {
     const val CODEC_OPUS = 1
     const val CHANNELS = 2
     const val SAMPLE_RATE = 48_000
-    const val FRAME_SAMPLES = 480
+    /** Accepted samples per channel per packet: 10 ms or 20 ms at 48 kHz. */
+    val FRAME_SAMPLES_ACCEPTED = setOf(480, 960)
     /** Opus pre-skip of the decoder's OpusHead, in samples at 48 kHz (6.5 ms). */
     const val PRE_SKIP_SAMPLES = 312
     const val PRE_SKIP_NS = 6_500_000L
@@ -37,12 +38,13 @@ object AudioWire {
         val flags = u8(packet, 5)
         if ((flags and FLAG_DISCONTINUITY.inv()) != 0) return null
         if (u8(packet, 6) != CODEC_OPUS || u8(packet, 7) != CHANNELS) return null
-        if (u32(packet, 8) != SAMPLE_RATE.toLong() || u16(packet, 24) != FRAME_SAMPLES || u16(packet, 26) != 0) return null
+        if (u32(packet, 8) != SAMPLE_RATE.toLong() || u16(packet, 24) !in FRAME_SAMPLES_ACCEPTED || u16(packet, 26) != 0) return null
         return AudioPacket(
             discontinuity = (flags and FLAG_DISCONTINUITY) != 0,
             seq = u32(packet, 12),
             captureTsUs = u64(packet, 16),
             payload = packet.copyOfRange(HEADER_BYTES, packet.size),
+            frameSamples = u16(packet, 24),
         )
     }
 
@@ -82,4 +84,8 @@ class AudioPacket(
     val seq: Long,
     val captureTsUs: Long,
     val payload: ByteArray,
-)
+    val frameSamples: Int = 480,
+) {
+    /** Packet duration in microseconds at 48 kHz. */
+    val durationUs: Long get() = frameSamples * 1_000_000L / AudioWire.SAMPLE_RATE
+}

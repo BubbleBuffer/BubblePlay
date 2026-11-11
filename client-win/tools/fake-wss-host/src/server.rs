@@ -1528,7 +1528,7 @@ pub async fn serve(listener: TcpListener, config: ServerConfig) -> Result<Snapsh
     let run_start = Instant::now();
     let audio = config
         .audio
-        .map(|script| AudioLane::new(script, run_start))
+        .map(|script| AudioLane::new_wss(script, run_start))
         .transpose()
         .context("cannot start the audio encoder")?;
     let rtc_drop_at = config.rtc.and_then(|knobs| knobs.drop_at);

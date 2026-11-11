@@ -1,7 +1,7 @@
 //! Bounded packet jitter and Opus playout, independent of the OS device.
 use super::{
     sink::AudioSink,
-    wire::{Packet, FRAME_SAMPLES, SAMPLE_RATE},
+    wire::{Packet, FRAME_SAMPLES, MAX_FRAME_SAMPLES, SAMPLE_RATE},
     AudioStats,
 };
 use anyhow::{Context, Result};
@@ -43,6 +43,8 @@ pub struct Engine {
     padding_us: u64,
     padding_at_us: u64,
     has_written: bool,
+    /// Samples per channel of the last packet seen; sizes concealment.
+    frame_samples: usize,
 }
 
 impl Engine {
@@ -69,6 +71,7 @@ impl Engine {
             padding_us: 0,
             padding_at_us: 0,
             has_written: false,
+            frame_samples: FRAME_SAMPLES,
         })
     }
 
@@ -152,8 +155,12 @@ impl Engine {
                 return;
             };
             let before = self.pending.len();
+            // Keep the newest 60 ms whatever the packet duration.
+            let recover = self.pending.last().map_or(RECOVER_PACKETS, |p| {
+                (RECOVER_PACKETS * FRAME_SAMPLES / p.packet.frame_samples).max(1)
+            }) as u32;
             self.pending
-                .retain(|p| newest.wrapping_sub(p.packet.seq) < RECOVER_PACKETS as u32);
+                .retain(|p| newest.wrapping_sub(p.packet.seq) < recover);
             self.stats.dropped += (before - self.pending.len()) as u64;
             self.stats.dropped += u64::from(!self.pcm.is_empty() && self.pcm_received_us.is_some());
             self.pcm.clear();
@@ -176,7 +183,10 @@ impl Engine {
             self.starts_us.saturating_sub(now_us)
         };
         let packets = match (self.expected, self.pending.last()) {
-            (Some(seq), Some(last)) => (last.packet.seq.wrapping_sub(seq) as u64 + 1) * 10_000,
+            (Some(seq), Some(last)) => {
+                (last.packet.seq.wrapping_sub(seq) as u64 + 1)
+                    * (last.packet.frame_samples as u64 * 1_000_000 / SAMPLE_RATE as u64)
+            }
             _ => 0,
         };
         let padding = self
@@ -200,12 +210,19 @@ impl Engine {
         let Some(seq) = self.expected else {
             return;
         };
-        let mut decoded = vec![0f32; FRAME_SAMPLES * 2];
+        // Sized for the longest accepted packet (20 ms); trimmed to the
+        // packet's own length before it joins the playout queue.
+        let mut decoded = vec![0f32; MAX_FRAME_SAMPLES * 2];
         let packet = if self.pending.first().is_some_and(|p| p.packet.seq == seq) {
             Some(self.pending.remove(0))
         } else {
             None
         };
+        let frames = packet
+            .as_ref()
+            .map_or(self.frame_samples, |p| p.packet.frame_samples);
+        self.frame_samples = frames;
+        decoded.truncate(frames * 2);
         if let Some(timed) = packet {
             if at_us.saturating_sub(timed.received_us) > MAX_DEPTH_US {
                 self.stats.dropped += 1;
@@ -218,10 +235,10 @@ impl Engine {
             }
             self.pcm_received_us = Some(timed.received_us);
             self.missing = 0;
-            // A valid BPA1 header must not allow a 20/60 ms Opus packet to
-            // change the fixed 10 ms timeline or overrun the decode scratch.
+            // The Opus payload must last exactly what its BPA1 header says, so
+            // a header cannot shift the timeline or overrun the decode scratch.
             let duration_ok = opus::packet::get_nb_samples(&timed.packet.payload, SAMPLE_RATE)
-                .is_ok_and(|n| n == FRAME_SAMPLES);
+                .is_ok_and(|n| n == frames);
             let result = if duration_ok {
                 self.decoder
                     .decode_float(&timed.packet.payload, &mut decoded, false)
@@ -229,7 +246,7 @@ impl Engine {
             } else {
                 None
             };
-            if result == Some(FRAME_SAMPLES) {
+            if result == Some(frames) {
                 self.stats.decoded += 1;
             } else {
                 self.stats.decode_errors += 1;
@@ -241,7 +258,8 @@ impl Engine {
             self.pcm_received_us = None;
             self.stats.underruns += 1;
             self.missing += 1;
-            if self.missing <= MAX_PLC {
+            // At most 30 ms of concealment, whatever the packet duration.
+            if usize::from(self.missing) * frames <= usize::from(MAX_PLC) * FRAME_SAMPLES {
                 self.conceal(&mut decoded);
             } else {
                 // Host deliberately stops sending during silence. Do not
@@ -262,7 +280,7 @@ impl Engine {
     fn conceal(&mut self, pcm: &mut [f32]) {
         // Host has in-band FEC disabled. Empty decode requests libopus PLC;
         // never pass the subsequent packet with decode_fec=true.
-        if self.decoder.decode_float(&[], pcm, false).ok() != Some(FRAME_SAMPLES) {
+        if self.decoder.decode_float(&[], pcm, false).ok() != Some(pcm.len() / 2) {
             pcm.fill(0.0);
         }
         self.stats.concealed += 1;

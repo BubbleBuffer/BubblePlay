@@ -6,7 +6,7 @@ The Windows host streams sound from the default playback device to an opted-in v
 
 WASAPI loopback runs in shared mode on its own standard thread. The host requests 48 kHz stereo float with automatic PCM conversion and the default sample-rate conversion quality. If initialization rejects that format, the host uses the endpoint mix format, converts PCM or float samples, mixes channels to stereo and linearly resamples to 48 kHz. The default endpoint is checked about once per second; endpoint changes and invalidation reopen capture.
 
-The Opus encoder uses the Audio application, 128 kbps VBR, stereo, 480 samples per channel per packet (10 ms), without in-band FEC or DTX. Digital silence or an absence of loopback data produces at most 200 ms of packets, then suppresses packets until sound returns. The first packet after start or a gap marks a discontinuity. Capture and encoder failures leave video running, log once, and retry at the next device check.
+The Opus encoder uses the Audio application, 128 kbps VBR, stereo, without in-band FEC or DTX. A packet holds 480 samples per channel (10 ms) on WebRTC and 960 (20 ms) on the WSS relay path, which halves that path's message count; the host restarts capture with the right size when the transport changes. Digital silence or an absence of loopback data produces at most 200 ms of packets, then suppresses packets until sound returns. The first packet after start or a gap marks a discontinuity. Capture and encoder failures leave video running, log once, and retry at the next device check.
 
 ## Transports
 
@@ -24,7 +24,7 @@ WSS uses the protocol-4 media socket. Each binary message contains one Opus pack
 | 8 | 4 | Sample rate 48000 |
 | 12 | 4 | Packet sequence, wrapping u32 |
 | 16 | 8 | Capture time in microseconds, using the video capture clock origin |
-| 24 | 2 | Samples per channel, 480 |
+| 24 | 2 | Samples per channel, 480 (10 ms) or 960 (20 ms); other values are rejected |
 | 26 | 2 | Reserved, zero |
 | 28 | 1–1500 | Opus payload |
 
