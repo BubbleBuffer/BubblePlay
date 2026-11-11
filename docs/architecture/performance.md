@@ -33,3 +33,22 @@ Duplication, shared-device copies and NVENC operations take one retained lock pe
 An independent session watchdog reports a stage and `main.rs` line after ten seconds without progress, once per stall. Progress publication uses one atomic snapshot, including during parked housekeeping; it never acquires a logging or worker lock. NVENC call boundaries additionally report the exact native API and `encode.rs` line, including bitrate/profile reconfiguration and cleanup. This is diagnostic only: a driver call already stuck inside NVENC cannot be safely cancelled or its live device resources destroyed by the watchdog. See [the 2026-10-09 hang investigation](host-hang-2026-10-09.md).
 
 `host/scripts/probe-host-performance.mjs` runs an isolated localhost WSS relay and records producer counters, process CPU and reconnect timing. It discards media payloads and uses no production credentials. It verifies host production and queue admission, not client decoding, image quality or protected desktop behavior. UAC, lock-screen, Admin mode, monitor changes and follow-active-window require live manual qualification, including `host/scripts/test-secure-desktop.ps1`.
+
+## WSS relay capacity (Cloudflare Worker)
+
+A stream that falls back to the WSS relay sends about 165 messages per second (about 100 are 10 ms Opus packets, the rest video, ctl and ACKs). Cloudflare bills incoming WebSocket messages (20:1) and CPU time; bandwidth is free. Measured in October 2026: roughly 0.2 ms of relay CPU per message.
+
+Each PC has its own session Durable Object (`PcRelay`, named `pc-<device id>`), so streams of different PCs never share an object, its 32-connection cap or its CPU budget. One stream occupies one object with about 6 sockets, so the old limit of about 5 to 6 concurrent streams for the whole relay is now per PC. The front object (`relay-v1`) handles only gate, HTTP, admin and presence traffic; it sees no media. See [`relay-rs/README.md`](../../relay-rs/README.md) for the split.
+
+Hot-path costs removed in the core (`relay-rs/core/src/relay/forward.rs`, `mod.rs`) and the adapter (`relay-rs/worker/src/pc.rs`): two `Conn` clones (four strings each) per binary frame, the action queue built for a batch of plain sends, and an alarm re-arm after every forwarded frame (activity only moves idle deadlines later, so a plain-send batch needs none).
+
+Measured locally on Windows (2026-11-11), 188-byte frames, host to viewer:
+
+| Measurement | Before | After |
+| --- | --- | --- |
+| Core `on_binary` per frame, native release (`cargo test --release -p bp-relay-core --test forward_bench -- --ignored --nocapture`) | 359 ns | 189 ns |
+| workerd CPU per forwarded frame, whole pipeline (`node relay-rs/worker/scripts/bench-forward.mjs`) | 0.618 ms (single object, before the split) | 0.50 to 0.53 ms |
+
+The end-to-end number is dominated by workerd's WebSocket and JS boundary work, which the relay code does not control, and it varies by about 5 percent between runs. Local workerd is not Cloudflare's CPU accounting: use the ratio, not the absolute value. Message count is what the bill follows, so the larger saving is fewer messages (see the 20 ms audio frame note below).
+
+The audio packet rate is still 100 per second on WSS. The BPA1 header carries samples per channel, and the browser (`audio.js`), Android and Windows viewers validate exactly 480 (10 ms), so 20 ms frames need decoder changes in every viewer. That change is not made.
