@@ -1,6 +1,7 @@
 //! Binary-owned capture boundary; preserves existing streaming policy.
 use super::{
-    capture, pick_monitor, warn, Args, Capture, Context, DesktopRegion, Duration, Instant, Result,
+    capture, info, pick_monitor, warn, Args, Capture, Context, DesktopRegion, Duration, Instant,
+    Result,
 };
 use bubbleplay_host::secure_helper::client::{SecureHelperLink, SecureState};
 use std::sync::{Arc, Mutex};
@@ -120,6 +121,32 @@ pub(super) struct LocalCaptureSource {
     capture_demand: bool,
     snapshot_wake: SnapshotDeadlineWake,
     join_recovery: JoinRecoveryWindow,
+    /// The user's monitor, while a UAC prompt temporarily shows another one.
+    dialog_view: Option<MonitorView>,
+    /// The current secure desktop has been checked for a UAC prompt.
+    dialog_checked: bool,
+    /// The streamed monitor changed; the session announces it and re-reads geometry.
+    monitor_changed: bool,
+}
+
+/// A capture monitor: selector and geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MonitorView {
+    pub(super) selector: String,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) region: DesktopRegion,
+}
+
+/// The primary monitor, where Windows shows the UAC prompt on the secure desktop.
+fn primary_monitor_view() -> Option<MonitorView> {
+    let monitor = pick_monitor(None).ok()?;
+    Some(MonitorView {
+        selector: monitor.device_name().ok()?,
+        width: monitor.width().ok()?,
+        height: monitor.height().ok()?,
+        region: capture::monitor_region(monitor).ok()?,
+    })
 }
 
 impl LocalCaptureSource {
@@ -166,18 +193,27 @@ impl LocalCaptureSource {
             capture_demand: false,
             snapshot_wake: SnapshotDeadlineWake::default(),
             join_recovery: JoinRecoveryWindow::default(),
+            dialog_view: None,
+            dialog_checked: false,
+            monitor_changed: false,
         })
     }
 
     pub(super) fn ensure_capture(&mut self) -> Result<&mut Capture> {
         if self.capture.is_none() {
-            let mut capture = Capture::new(Some(&self.selector)).context("capture init")?;
+            let selector = self
+                .dialog_view
+                .as_ref()
+                .map_or(&self.selector, |v| &v.selector);
+            let mut capture = Capture::new(Some(selector)).context("capture init")?;
             if let Some(activity) = self.event_activity.as_ref() {
                 capture.enable_event_capture(activity.clone());
             }
-            self.width = capture.width();
-            self.height = capture.height();
-            self.region = capture.region();
+            if self.dialog_view.is_none() {
+                self.width = capture.width();
+                self.height = capture.height();
+                self.region = capture.region();
+            }
             if self.idle_snapshot_requested {
                 capture.request_idle_snapshot();
                 self.idle_snapshot_requested = false;
@@ -309,6 +345,56 @@ impl LocalCaptureSource {
             self.next_secure_kind_probe = now + capture::CAPTURE_RECOVERY_INTERVAL;
         }
         self.observe_desktop(next, desktop_default, fallback_kind);
+        self.follow_uac_prompt(primary_monitor_view);
+    }
+
+    /// A UAC prompt on the secure desktop shows on the primary monitor, but the
+    /// helper captures the viewed one. While the prompt is up the stream shows
+    /// the primary monitor; when the secure desktop ends the viewed monitor
+    /// comes back. Only the helper's `uac` kind counts (a lock screen or an
+    /// unidentified secure desktop keeps the viewed monitor). Monitor picks are
+    /// refused on the secure desktop, so the user's choice cannot change meanwhile.
+    fn follow_uac_prompt(&mut self, primary: impl FnOnce() -> Option<MonitorView>) {
+        let state = self.secure_state.as_ref().filter(|state| state.secure);
+        let Some(state) = state else {
+            self.dialog_checked = false;
+            if let Some(view) = self.dialog_view.take() {
+                info!(
+                    monitor = %view.selector,
+                    "dialog follow: secure desktop ended, restoring monitor"
+                );
+                self.selector = view.selector;
+                self.width = view.width;
+                self.height = view.height;
+                self.region = view.region;
+                self.monitor_changed = true;
+            }
+            return;
+        };
+        if state.kind != "uac" || self.dialog_checked {
+            return;
+        }
+        self.dialog_checked = true;
+        let Some(target) = primary() else {
+            warn!("dialog follow: primary monitor unavailable, keeping the viewed monitor");
+            return;
+        };
+        if target.selector.eq_ignore_ascii_case(&self.selector) {
+            return;
+        }
+        info!(
+            monitor = %target.selector,
+            restore = %self.selector,
+            "dialog follow: UAC prompt on the secure desktop, showing its monitor"
+        );
+        let user = MonitorView {
+            selector: std::mem::replace(&mut self.selector, target.selector),
+            width: std::mem::replace(&mut self.width, target.width),
+            height: std::mem::replace(&mut self.height, target.height),
+            region: std::mem::replace(&mut self.region, target.region),
+        };
+        self.dialog_view = Some(user);
+        self.monitor_changed = true;
     }
 
     fn observe_desktop(
@@ -711,6 +797,13 @@ impl CaptureSource {
         source.tick_secure(viewer, now);
     }
 
+    /// True once after the streamed monitor changed without a monitor switch
+    /// (a UAC prompt temporarily showing another monitor, or its end).
+    pub(super) fn take_monitor_change(&mut self) -> bool {
+        let Self::Local(source) = self;
+        std::mem::take(&mut source.monitor_changed)
+    }
+
     pub(super) fn desktop_state(&self) -> DesktopState {
         match self {
             Self::Local(source) => {
@@ -889,6 +982,9 @@ mod tests {
             capture_demand: false,
             snapshot_wake: SnapshotDeadlineWake::default(),
             join_recovery: JoinRecoveryWindow::default(),
+            dialog_view: None,
+            dialog_checked: false,
+            monitor_changed: false,
         };
         assert!(source.switch_monitor("DISPLAY1").is_err());
         assert_eq!(source.selector, "DISPLAY2");
@@ -958,6 +1054,9 @@ mod tests {
                 capture_demand: false,
                 snapshot_wake: SnapshotDeadlineWake::default(),
                 join_recovery: JoinRecoveryWindow::default(),
+                dialog_view: None,
+                dialog_checked: false,
+                monitor_changed: false,
             };
             source.observe_desktop(helper, false, "uac");
             assert_eq!(
@@ -984,5 +1083,93 @@ mod tests {
                 "Default alone is not a recovered DDA frame"
             );
         }
+    }
+
+    fn uac_state() -> SecureState {
+        SecureState {
+            secure: true,
+            kind: "uac",
+            caps: vec!["view", "deny"],
+            available: true,
+            desktop_epoch: 1,
+        }
+    }
+
+    /// Public entry: the secure state the helper reports, then the dialog rule.
+    fn secure_tick(
+        source: &mut LocalCaptureSource,
+        state: Option<SecureState>,
+        primary: &MonitorView,
+    ) {
+        let secure = state.as_ref().is_some_and(|s| s.secure);
+        source.observe_desktop(state, !secure, "uac");
+        source.follow_uac_prompt(|| Some(primary.clone()));
+    }
+
+    #[test]
+    fn uac_prompt_shows_the_primary_monitor_and_the_viewed_one_comes_back() {
+        let mut source = LocalCaptureSource {
+            capture: None,
+            selector: "DISPLAY2".into(),
+            width: 1280,
+            height: 1024,
+            region: DesktopRegion::new(-1280, 0, 1280, 1024),
+            idle_snapshot_requested: false,
+            secure_helper: Arc::new(Mutex::new(SecureHelperLink::new())),
+            secure_state: None,
+            secure_streaming: false,
+            secure_upload: None,
+            normal_recovery_pending: false,
+            secure_loss_pending: false,
+            next_secure_kind_probe: Instant::now(),
+            next_desktop_check: Instant::now(),
+            desktop_default: false,
+            helper_secure: false,
+            event_activity: None,
+            capture_demand: false,
+            snapshot_wake: SnapshotDeadlineWake::default(),
+            join_recovery: JoinRecoveryWindow::default(),
+            dialog_view: None,
+            dialog_checked: false,
+            monitor_changed: false,
+        };
+        let primary = MonitorView {
+            selector: "DISPLAY1".into(),
+            width: 1920,
+            height: 1080,
+            region: DesktopRegion::new(0, 0, 1920, 1080),
+        };
+        let other = (source.selector.clone(), source.width, source.region);
+
+        // A secure desktop that is not (yet) a UAC prompt keeps the viewed monitor.
+        let mut lock = uac_state();
+        lock.kind = "lock";
+        secure_tick(&mut source, Some(lock), &primary);
+        assert_eq!(source.selector, "DISPLAY2");
+        assert!(!source.monitor_changed);
+
+        // The helper identifies the UAC prompt: its monitor is shown, once.
+        secure_tick(&mut source, Some(uac_state()), &primary);
+        assert_eq!(source.selector, "DISPLAY1");
+        assert_eq!((source.width, source.height), (1920, 1080));
+        assert_eq!(source.region, primary.region);
+        assert!(std::mem::take(&mut source.monitor_changed));
+        secure_tick(&mut source, Some(uac_state()), &primary);
+        assert!(!source.monitor_changed, "no repeat while the prompt is up");
+
+        // The prompt is gone: back on the monitor the user was viewing.
+        secure_tick(&mut source, None, &primary);
+        assert_eq!(
+            (source.selector.clone(), source.width, source.region),
+            other
+        );
+        assert!(std::mem::take(&mut source.monitor_changed));
+
+        // A prompt on the monitor already viewed changes nothing.
+        source.selector = "DISPLAY1".into();
+        secure_tick(&mut source, Some(uac_state()), &primary);
+        secure_tick(&mut source, None, &primary);
+        assert_eq!(source.selector, "DISPLAY1");
+        assert!(!source.monitor_changed);
     }
 }
