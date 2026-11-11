@@ -218,15 +218,17 @@ fn redact_value(value: Value) -> Value {
 /// Rules 3 to 6 on free text, in an order that keeps later rules from re-reading
 /// earlier replacements.
 pub fn redact_text(text: &str) -> String {
-    let mut out = text.to_owned();
+    // The patterns run first, on the original text. A registered secret that happens to equal
+    // a key name ("token") would otherwise be replaced inside `token=abc` and leave its value.
+    let mut out = redact_authorization(text);
+    out = redact_pairs(&out);
+    out = redact_blobs(&out);
     if let Ok(list) = SECRETS.lock() {
         for secret in list.iter() {
             out = out.replace(secret.as_str(), REDACTED);
         }
     }
-    out = redact_authorization(&out);
-    out = redact_pairs(&out);
-    redact_blobs(&out)
+    out
 }
 
 /// Rule 3: `Bearer <x>` and whole `Authorization: ...` lines.
