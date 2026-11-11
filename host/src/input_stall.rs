@@ -132,6 +132,21 @@ pub fn step_done(area: StepArea) {
     }
 }
 
+/// Marks `area`'s current step finished when dropped. A step sequence holds one for its whole
+/// run, so every exit (early return, error, normal end) ends the last step it recorded and a
+/// finished native drop never reads as "running" long after it returned.
+pub struct StepsEnd(StepArea);
+
+impl Drop for StepsEnd {
+    fn drop(&mut self) {
+        step_done(self.0);
+    }
+}
+
+pub fn steps_end_on_exit(area: StepArea) -> StepsEnd {
+    StepsEnd(area)
+}
+
 pub fn last_step(area: StepArea) -> Option<Step> {
     STEPS.lock().ok().and_then(|steps| steps[area as usize])
 }
@@ -395,6 +410,42 @@ mod tests {
         clock.idle();
         assert_eq!(clock.busy_ms(Instant::now()), 0);
         assert!(clock.last_event_ms(Instant::now()).is_some());
+    }
+
+    #[test]
+    fn a_step_sequence_that_returned_reads_done() {
+        fn sequence() -> Option<()> {
+            let _end = steps_end_on_exit(StepArea::FileDrop);
+            step(StepArea::FileDrop, "test sequence step");
+            let cancelled: Option<()> = None;
+            cancelled?; // Early exit, as a cancelled or failed drop takes.
+            Some(())
+        }
+        sequence();
+        let last = last_step(StepArea::FileDrop).expect("step recorded");
+        // Another test may record a newer step meanwhile; ours must not still read running.
+        assert!(last.name != "test sequence step" || last.done, "{last:?}");
+    }
+
+    #[test]
+    fn a_hook_stuck_mid_callback_reads_busy_from_another_thread() {
+        // The stall report samples hook clocks on the session thread while the hook thread
+        // may be inside a callback that has not returned. In-progress time must show.
+        static CLOCK: PumpClock = PumpClock::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hook = std::thread::spawn(move || {
+            let _run = CLOCK.running(); // As the hook callbacks do on entry.
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv(); // Stuck mid-callback.
+        });
+        entered_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let stuck = CLOCK.busy_ms(Instant::now());
+        release_tx.send(()).unwrap();
+        hook.join().unwrap();
+        assert!(stuck >= 300, "stuck callback reported {stuck} ms busy");
+        assert_eq!(CLOCK.busy_ms(Instant::now()), 0);
     }
 
     #[test]
