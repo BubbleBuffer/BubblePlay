@@ -87,6 +87,12 @@ impl PendingDrop {
         })
     }
 
+    /// A refused release is retried each tick; give up this long after the deadline (release-all
+    /// still sends it, because the sink keeps left in its release plan).
+    pub fn expired(&self, now: Instant) -> bool {
+        now >= self.deadline + Duration::from_secs(2)
+    }
+
     /// One later tick: `window` is the window's rectangle now, `None` when the move loop or the
     /// window is gone. `Some` means release the left button now; it is owed until this answers.
     /// Never answers on the warp tick, because `start` does not call it.

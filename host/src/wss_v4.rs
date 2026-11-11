@@ -1833,10 +1833,14 @@ fn handle_inbound(text: &str, shared: &Mutex<Shared>) {
     let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
     match message {
         V4Inbound::Ack {
-            generation, seq, ..
+            generation,
+            seq,
+            recv_ts_ms,
+            ..
         } => {
             state.accepted = true;
             state.stats.acks += 1;
+            state.capacity.note_recv_ts(recv_ts_ms);
             state.capacity.on_ack(now, generation, seq);
             apply_capacity(&mut state, now);
             if let Some(outcome) = retire_video(&mut state, now, generation, seq) {

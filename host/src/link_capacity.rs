@@ -15,8 +15,13 @@
 //! slower than the sending, arriving in at least two separate ACK bursts
 //! spread over at least `EVIDENCE_MIN_SPAN` (a receiver that stalls and then
 //! ACKs its backlog is one short flush, not a slow link; in the lab a 570 ms
-//! stall on an unthrottled link flushed in more than one 8 ms burst). An unconstrained link has no estimate and so no budget (no
-//! behaviour change).
+//! stall on an unthrottled link flushed in more than one 8 ms burst). The
+//! queue must also be growing: the RTT inflation of the last evidence sample
+//! exceeds the first's by `QUEUE_GROWTH_MIN`. A sender that outruns the link
+//! adds a queue that deepens for as long as it does, whereas a stalled or
+//! jittery path shows a flat or draining inflation, and its deliveries
+//! (diluted by the stall) say nothing about the link. An unconstrained link
+//! has no estimate and so no budget (no behaviour change).
 //!
 //! As in BBR, a frame sent while less than one BDP (estimate x min RTT) was
 //! in flight marks the samples up to its delivery as app-limited: the pipe
@@ -49,6 +54,12 @@ pub const CONSTRAINED_HOLD: Duration = Duration::from_secs(2);
 pub const CONSTRAINED_MIN_SAMPLES: usize = 3;
 /// ...spread over at least this many ACK bursts.
 pub const CONSTRAINED_MIN_BURSTS: usize = 2;
+/// The queue must deepen by this much, first to last evidence sample.
+pub const QUEUE_GROWTH_MIN: Duration = Duration::from_millis(20);
+/// Samples kept for the `link constrained` log line.
+const TRACE_SAMPLES: usize = 48;
+/// Samples written to the log line.
+const TRACE_LOGGED: usize = 16;
 /// ACKs closer than this belong to one burst.
 pub const ACK_BURST_GAP: Duration = Duration::from_millis(8);
 /// ...and persist at least this long, first to last sample.
@@ -116,6 +127,19 @@ impl Capacity {
     }
 }
 
+/// One delivery sample with the context the `link constrained` log carries.
+#[derive(Debug, Clone, Copy)]
+struct TraceSample {
+    at: Instant,
+    bps: u64,
+    rtt: Duration,
+    app_limited: bool,
+    /// Host-side time since the previous ACK.
+    ack_gap_ms: u64,
+    /// The viewer's receive-time difference to the previous ACK, if reported.
+    recv_gap_ms: Option<i64>,
+}
+
 #[derive(Debug)]
 pub struct CapacityEstimator {
     sent: VecDeque<SentFrame>,
@@ -125,8 +149,12 @@ pub struct CapacityEstimator {
     min_rtt: VecDeque<(Instant, Duration)>,
     /// (time, bps, app-limited)
     samples: VecDeque<(Instant, u64, bool)>,
-    /// (time, ACK burst) of link-limited samples.
-    queue_evidence: VecDeque<(Instant, u64)>,
+    /// (time, ACK burst, RTT above the minimum) of link-limited samples.
+    queue_evidence: VecDeque<(Instant, u64, Duration)>,
+    trace: VecDeque<TraceSample>,
+    /// The viewer's receive time of the ACK about to be applied.
+    pending_recv_ms: Option<f64>,
+    last_recv_ms: Option<f64>,
     /// The estimate: binding while `constrained`, a probing cap otherwise.
     capacity_bps: Option<u64>,
     constrained: bool,
@@ -151,6 +179,9 @@ impl CapacityEstimator {
             min_rtt: VecDeque::new(),
             samples: VecDeque::new(),
             queue_evidence: VecDeque::new(),
+            trace: VecDeque::new(),
+            pending_recv_ms: None,
+            last_recv_ms: None,
             capacity_bps: None,
             constrained: false,
             last_evidence: now,
@@ -165,6 +196,12 @@ impl CapacityEstimator {
     /// flight will never be ACKed. Measurements of the path are kept.
     pub fn forget_inflight(&mut self) {
         self.sent.clear();
+    }
+
+    /// The viewer's receive timestamp (ms, its own clock) of the ACK that is
+    /// applied next; only its differences are used, for the log line.
+    pub fn note_recv_ts(&mut self, recv_ts_ms: f64) {
+        self.pending_recv_ms = Some(recv_ts_ms);
     }
 
     pub fn on_sent(&mut self, now: Instant, generation: u32, seq: u32, bytes: u64) {
@@ -209,6 +246,16 @@ impl CapacityEstimator {
     pub fn on_ack(&mut self, now: Instant, generation: u32, seq: u32) -> Option<RateSample> {
         if !self.sent.iter().any(|frame| frame.generation == generation) {
             return None;
+        }
+        let ack_gap_ms = self.last_ack.map_or(0, |last| {
+            now.saturating_duration_since(last).as_millis() as u64
+        });
+        let recv_ms = self.pending_recv_ms.take();
+        let recv_gap_ms = recv_ms
+            .zip(self.last_recv_ms)
+            .map(|(now_ms, last_ms)| (now_ms - last_ms).round() as i64);
+        if recv_ms.is_some() {
+            self.last_recv_ms = recv_ms;
         }
         if self
             .last_ack
@@ -262,8 +309,20 @@ impl CapacityEstimator {
             && rtt >= min_rtt + QUEUE_EVIDENCE
             && ack_elapsed > send_elapsed;
         self.samples.push_back((now, bps, app_limited));
+        if self.trace.len() >= TRACE_SAMPLES {
+            self.trace.pop_front();
+        }
+        self.trace.push_back(TraceSample {
+            at: now,
+            bps,
+            rtt,
+            app_limited,
+            ack_gap_ms,
+            recv_gap_ms,
+        });
         if link_limited {
-            self.queue_evidence.push_back((now, self.burst));
+            self.queue_evidence
+                .push_back((now, self.burst, rtt.saturating_sub(min_rtt)));
         }
         self.expire(now);
         self.update_capacity(now, bps, link_limited);
@@ -281,17 +340,53 @@ impl CapacityEstimator {
         let mut bursts = self
             .queue_evidence
             .iter()
-            .map(|(_, burst)| *burst)
+            .map(|(_, burst, _)| *burst)
             .collect::<Vec<_>>();
         bursts.dedup();
         self.queue_evidence.len() >= CONSTRAINED_MIN_SAMPLES
             && bursts.len() >= CONSTRAINED_MIN_BURSTS
             && self.evidence_span() >= EVIDENCE_MIN_SPAN
+            && self.queue_growth() >= QUEUE_GROWTH_MIN
+    }
+
+    /// How much deeper the queue is at the last evidence sample than at the
+    /// first (zero when it is shallower).
+    fn queue_growth(&self) -> Duration {
+        match (self.queue_evidence.front(), self.queue_evidence.back()) {
+            (Some((_, _, first)), Some((_, _, last))) => last.saturating_sub(*first),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// The newest delivery samples, compactly, for the `link constrained`
+    /// line: `age_ms/kbps/rtt_ms/A|L/ack_gap_ms/recv_gap_ms` (A app-limited,
+    /// L pipe-full; recv gap `-` when the viewer sent none).
+    fn trace_summary(&self, now: Instant) -> String {
+        let skip = self.trace.len().saturating_sub(TRACE_LOGGED);
+        self.trace
+            .iter()
+            .skip(skip)
+            .map(|sample| {
+                let recv = sample
+                    .recv_gap_ms
+                    .map_or_else(|| "-".to_owned(), |gap| gap.to_string());
+                format!(
+                    "{}/{}/{}/{}/{}/{}",
+                    now.saturating_duration_since(sample.at).as_millis(),
+                    sample.bps / 1_000,
+                    sample.rtt.as_millis(),
+                    if sample.app_limited { 'A' } else { 'L' },
+                    sample.ack_gap_ms,
+                    recv
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn evidence_span(&self) -> Duration {
         match (self.queue_evidence.front(), self.queue_evidence.back()) {
-            (Some((first, _)), Some((last, _))) => last.saturating_duration_since(*first),
+            (Some((first, _, _)), Some((last, _, _))) => last.saturating_duration_since(*first),
             _ => Duration::ZERO,
         }
     }
@@ -315,7 +410,7 @@ impl CapacityEstimator {
                 let mut bursts = self
                     .queue_evidence
                     .iter()
-                    .map(|(_, burst)| *burst)
+                    .map(|(_, burst, _)| *burst)
                     .collect::<Vec<_>>();
                 bursts.dedup();
                 tracing::info!(
@@ -323,6 +418,8 @@ impl CapacityEstimator {
                     evidence = self.queue_evidence.len(),
                     bursts = bursts.len(),
                     span_ms = self.evidence_span().as_millis() as u64,
+                    growth_ms = self.queue_growth().as_millis() as u64,
+                    samples = %self.trace_summary(now),
                     "WSS v4 link constrained"
                 );
             }
@@ -389,7 +486,7 @@ impl CapacityEstimator {
         while self
             .queue_evidence
             .front()
-            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > CONSTRAINED_HOLD)
+            .is_some_and(|(at, _, _)| now.saturating_duration_since(*at) > CONSTRAINED_HOLD)
         {
             self.queue_evidence.pop_front();
         }
@@ -456,6 +553,17 @@ mod tests {
     /// Send `frames` frames of `bytes` every frame interval over `link` and
     /// ACK them in order; returns the estimator and the end time.
     fn run(link: &mut Link, frames: u32, bytes: u64) -> (CapacityEstimator, Instant) {
+        run_with(link, frames, bytes, true)
+    }
+
+    /// As `run`; without `drain` it stops with the last frame sent, while the
+    /// queue is still deep.
+    fn run_with(
+        link: &mut Link,
+        frames: u32,
+        bytes: u64,
+        drain: bool,
+    ) -> (CapacityEstimator, Instant) {
         let start = Instant::now();
         link.busy_until = start;
         let mut estimator = CapacityEstimator::new(start);
@@ -472,6 +580,9 @@ mod tests {
             acks.push_back((link.deliver(sent_at, bytes), seq));
         }
         for (at, acked) in acks {
+            if !drain {
+                break;
+            }
             estimator.on_ack(at, 1, acked);
             now = at;
         }
@@ -495,20 +606,24 @@ mod tests {
 
     #[test]
     fn queue_limited_stream_measures_the_bottleneck() {
-        // 6 Mbps of frames into a 2 Mbps bottleneck: the queue grows and the
-        // back-to-back ACKs measure the link.
-        let mut link = Link {
-            bps: 2_000_000,
-            prop: Duration::from_millis(20),
-            busy_until: Instant::now(),
-        };
-        let (estimator, _) = run(&mut link, 60, 25_000);
-        let capacity = estimator.capacity().expect("constrained");
-        assert!(
-            (1_800_000..=2_200_000).contains(&capacity.bps),
-            "{capacity:?}"
-        );
-        assert_eq!(capacity.target_bps(), capacity.bps * 8 / 10);
+        // 6 Mbps of frames into a slower bottleneck: the queue deepens with
+        // every frame and the back-to-back ACKs measure the link. The second
+        // case is the owner's relay path at 6 Mbps: a 700 kbps bottleneck must
+        // still be found, with the rate cut to its capacity.
+        for (bottleneck_bps, prop_ms, frames) in [(2_000_000, 20, 60), (700_000, 24, 60)] {
+            let mut link = Link {
+                bps: bottleneck_bps,
+                prop: Duration::from_millis(prop_ms),
+                busy_until: Instant::now(),
+            };
+            let (estimator, _) = run_with(&mut link, frames, 25_000, false);
+            let capacity = estimator.capacity().expect("constrained");
+            assert!(
+                (bottleneck_bps * 9 / 10..=bottleneck_bps * 11 / 10).contains(&capacity.bps),
+                "{bottleneck_bps}: {capacity:?}"
+            );
+            assert_eq!(capacity.target_bps(), capacity.bps * 8 / 10);
+        }
     }
 
     #[test]
@@ -670,6 +785,45 @@ mod tests {
         }
         assert!(!estimator.is_constrained());
         assert_eq!(estimator.capacity(), None);
+    }
+
+    #[test]
+    fn a_stall_flushed_over_300_ms_does_not_collapse_the_rate() {
+        // Replayed from the owner's host log of 2026-11-11 13:15:10Z: 6 Mbps
+        // (25 KB frames at 30 fps) over a path with a 48 ms minimum RTT, a
+        // ~500 ms hiccup, and the backlog ACKed in four bursts over ~300 ms.
+        // The log read "bursts 4, span 294 ms" and a capacity of 498 kbps, and
+        // the rate fell from 5.5 Mbps to the 500 kbps floor. The backlog's
+        // RTTs shrink burst by burst (the queue drains); a link slower than
+        // the sender would show a queue that deepens.
+        let start = Instant::now();
+        let mut estimator = CapacityEstimator::new(start);
+        let mut seq = 0u32;
+        for n in 0..90u32 {
+            let at = start + FRAME * n;
+            estimator.on_sent(at, 1, seq, 25_000);
+            estimator.on_ack(at + Duration::from_millis(48), 1, seq);
+            seq += 1;
+        }
+        let stall = start + FRAME * 90;
+        let mut backlog = Vec::new();
+        for n in 0..15u32 {
+            estimator.on_sent(stall + FRAME * n, 1, seq, 25_000);
+            backlog.push(seq);
+            seq += 1;
+        }
+        let release = stall + Duration::from_millis(520);
+        for (n, acked) in backlog.into_iter().enumerate() {
+            let burst = Duration::from_millis(90 * (n as u64 / 4));
+            estimator.on_ack(
+                release + burst + Duration::from_micros(300 * n as u64),
+                1,
+                acked,
+            );
+        }
+        assert!(!estimator.is_constrained());
+        assert_eq!(estimator.capacity(), None);
+        assert_eq!(estimator.rate_cap(), None);
     }
 
     #[test]

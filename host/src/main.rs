@@ -1495,6 +1495,8 @@ fn run_serve(
     // Follow active window: per signaling session, off until the client asks.
     let mut follow_state: Option<FollowWindow> = None;
     let mut next_follow_sample = Instant::now();
+    // An elevation prompt on the normal desktop temporarily shows its monitor.
+    let mut dialog_follow = bubbleplay_host::dialog_monitor::DialogFollow::default();
     // Edge hold: sampled every 50 ms only while a move loop is active; the
     // monitor list is read once per loop.
     let mut edge_monitors: Option<Vec<capture::MonitorInfo>> = None;
@@ -2061,6 +2063,20 @@ fn run_serve(
             viewer_attached && (ice_connected || wss_peer_live),
             loop_now,
         );
+        if capture.take_monitor_change() {
+            // A UAC prompt on the secure desktop shows its monitor, or the
+            // viewed one is back; viewers follow the monitor list.
+            refresh_input_geometry(
+                &mut input_sink,
+                &mut cursor_tracker,
+                capture.region(),
+                Instant::now(),
+            );
+            match capture.monitors() {
+                Ok(monitors) => signaling.send_monitor_list(monitors),
+                Err(error) => warn!(?error, "monitor enumeration failed"),
+            }
+        }
         capture.maintain_parked(viewer_attached, loop_now)?;
         let secure_helper_ready = capture.secure_helper_ready();
         if secure_helper_ready != last_secure_helper_ready {
@@ -2562,6 +2578,7 @@ fn run_serve(
             capture.desktop_state().desktop,
             ice_connected || wss_peer_live,
         );
+        let mut dialog_sample: Option<Option<follow_window::WindowMonitor>> = None;
         let foreground_sample = if foreground_live && foreground_sample_now >= next_follow_sample {
             next_follow_sample = foreground_sample_now + follow_window::SAMPLE_INTERVAL;
             input_sink.refresh_foreground_status();
@@ -2573,6 +2590,7 @@ fn run_serve(
             ) {
                 bubbleplay_host::input_stall::report(&episode);
             }
+            dialog_sample = Some(follow_window::foreground_consent_monitor());
             follow_state
                 .as_ref()
                 .map(|_| follow_window::sample_foreground())
@@ -2590,13 +2608,23 @@ fn run_serve(
             if now >= *next {
                 let window = follow_window::sample_move()
                     .and_then(|moving| edge_drop::window_rect(moving.window));
+                let mut done = false;
                 if let Some(by) = drop.step(now, window) {
-                    input_sink.release_left_for_drop();
-                    info!(
-                        monitor = %monitor,
-                        released_by = by.as_str(),
-                        "follow active window: edge drop released the left button"
-                    );
+                    if input_sink.release_left_for_drop().succeeded() {
+                        info!(
+                            monitor = %monitor,
+                            released_by = by.as_str(),
+                            "follow active window: edge drop released the left button"
+                        );
+                        done = true;
+                    } else if drop.expired(now) {
+                        warn!(
+                            "follow active window: edge drop release refused; release-all keeps it"
+                        );
+                        done = true;
+                    }
+                }
+                if done {
                     pending_drop = None;
                 } else if let Some(pending) = pending_drop.as_mut() {
                     pending.1 = now + follow_window::EDGE_SAMPLE_INTERVAL;
@@ -2639,6 +2667,7 @@ fn run_serve(
                     input_sink.clear_drag_offset();
                 }
                 if let Some((_, to, selector, cursor)) = carry {
+                    dialog_follow.changed_elsewhere();
                     follow.switched(now);
                     info!(
                         monitor = %selector,
@@ -2693,6 +2722,7 @@ fn run_serve(
                             Some(selector)
                                 if !capture.monitor_selector().eq_ignore_ascii_case(&selector) =>
                             {
+                                dialog_follow.changed_elsewhere();
                                 follow.switched(now);
                                 let details = follow.confirmed_details();
                                 info!(
@@ -2715,6 +2745,34 @@ fn run_serve(
                         }
                     }
                 }
+            }
+        }
+        if let Some(consent) = dialog_sample {
+            // Elevation prompt on the normal desktop (docs/architecture/follow-active-window.md).
+            let target = consent.and_then(|window| {
+                let monitors = capture.monitors().ok()?;
+                follow_window::selector_for(&monitors, &window)
+            });
+            let current = capture.monitor_selector();
+            match dialog_follow.observe(target.as_deref(), &current) {
+                Some(bubbleplay_host::dialog_monitor::Move::Show { monitor, restore }) => {
+                    info!(
+                        monitor = %monitor,
+                        restore = %restore,
+                        "dialog follow: elevation prompt, showing its monitor"
+                    );
+                    switch_capture_monitor!(&monitor);
+                    // Only the user's own pick is remembered across sessions.
+                    selection.remember(restore);
+                }
+                Some(bubbleplay_host::dialog_monitor::Move::Restore(monitor)) => {
+                    info!(
+                        monitor = %monitor,
+                        "dialog follow: elevation prompt gone, restoring monitor"
+                    );
+                    switch_capture_monitor!(&monitor);
+                }
+                None => {}
             }
         }
         session_stage!(Files);
@@ -3522,6 +3580,7 @@ fn run_serve(
                             warn!("monitor control missing bounded selector");
                             continue;
                         };
+                        dialog_follow.changed_elsewhere();
                         switch_capture_monitor!(selector);
                         continue;
                     }

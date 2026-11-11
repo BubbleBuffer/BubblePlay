@@ -56,6 +56,10 @@ The relay logs structured JSON to the console (Workers observability); `pc` and 
 
 Expected events log at info: media closed by the relay with "viewer departed" or a stale epoch, mDNS `.local` remote candidates, input paused for a native file drag, capture unavailable because the display is off, and the tray's agent probe finding no pipe within 20 s of starting the agent. Anything else in those places stays at warn. Serve failures log the time since the last relay registration; the serve retry delay restarts at 1 s after a run that was registered for over 60 s. The WSS v4 media link pings every 15 s on its own clock, and a silent-link close reports the inbound age and ping count. The tray logs why it stops the admin agent (`reason`).
 
+## Link capacity verdicts
+
+`WSS v4 link constrained` (target `link_capacity`, info) is logged when the WSS v4 rate controller finds the link slower than the sender. Fields: `capacity_bps`, `evidence` (queue-evidence samples), `bursts` (ACK bursts), `span_ms` (first to last evidence), `growth_ms` (how much deeper the queue is at the last evidence sample than at the first) and `samples`, the newest 16 delivery samples, space-separated, each `age_ms/kbps/rtt_ms/A|L/ack_gap_ms/recv_gap_ms`. `A` is an app-limited sample (the pipe had room), `L` a pipe-full one. `ack_gap_ms` is the host-side time since the previous ACK and `recv_gap_ms` the viewer's own receive-time difference to it (`-` if none). A stall in the viewer shows large `recv_gap_ms`; a stall on the way back (relay or WAN) shows a large `ack_gap_ms` with an even `recv_gap_ms`.
+
 ## Finding what happened around a feedback timestamp
 
 ```
@@ -94,6 +98,10 @@ The browser's `bootstrap-inline` trace (target `trace`, written once when the pa
 ## Android background lines (2026-11-09)
 
 The phone app's Kotlin core (`app-android-core`, target `Session`) logs one info line when the app goes to the background and media stops (`backgrounded: media stopped`, field `graceMs`), one when it returns within the 5 minute grace and the first live frame is shown (`resumed within grace: first frame after N ms`, fields `firstFrameMs`, `backgroundMs`) and one when the grace runs out and the session is disconnected (`grace expired: disconnected`, fields `backgroundMs`, `graceMs`). The field names avoid the redacted words; `RedactTest` checks they pass. See [reconnect](architecture/reconnect.md).
+
+## Dialog follow lines (2026-11-11)
+
+When an elevation prompt is on another monitor than the streamed one, the host logs one info line when it shows that monitor and one when it goes back, both with target `bubbleplay_host` and field `monitor` (and `restore` on the first): `dialog follow: elevation prompt, showing its monitor` / `dialog follow: elevation prompt gone, restoring monitor` for a prompt on the normal desktop, `dialog follow: UAC prompt on the secure desktop, showing its monitor` / `dialog follow: secure desktop ended, restoring monitor` for the secure desktop. A warn line says the primary monitor was unavailable. See [follow-active-window.md](architecture/follow-active-window.md#elevation-prompt-on-another-monitor).
 
 ## Frozen foreground app (2026-11-09)
 

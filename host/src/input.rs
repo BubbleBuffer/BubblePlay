@@ -1478,6 +1478,9 @@ pub struct InputSink {
     development_agent: bool,
     #[cfg(test)]
     test_injections: Option<Vec<Record>>,
+    /// Test seam: every injection is refused, as when the admin agent times out.
+    #[cfg(test)]
+    test_refuse: bool,
 }
 
 /// Clipboard state exists only where the sink runs as the interactive user
@@ -3319,8 +3322,16 @@ mod tests {
                 )
                 .count()
         };
-        sink.release_left_for_drop();
-        sink.release_left_for_drop(); // already released: nothing more
+        // A release Windows refuses leaves left held: no drop bookkeeping, and the retry works.
+        sink.test_refuse = true;
+        assert!(!sink.release_left_for_drop().succeeded());
+        sink.test_refuse = false;
+        sink.clear_drag_offset();
+        assert_eq!(sink.drag_offset, None);
+        assert_eq!(left_ups(&sink), 0);
+        sink.begin_drag_offset(Some((u16::MAX, 20_000)), (3200, 720));
+        assert!(sink.release_left_for_drop().succeeded());
+        assert_eq!(sink.release_left_for_drop(), InputApplication::default()); // already released
         assert_eq!(left_ups(&sink), 1);
         // The move loop ends right after the release: the offset stays.
         sink.clear_drag_offset();
@@ -3381,6 +3392,8 @@ impl InputSink {
             development_agent: false,
             #[cfg(test)]
             test_injections: None,
+            #[cfg(test)]
+            test_refuse: false,
         }
     }
 
@@ -3540,16 +3553,22 @@ impl InputSink {
         }
     }
 
-    /// End an edge-switch drag: release the left button on the host if it is held (once), but
+    /// End an edge-switch drag: release the left button on the host if it is held (once; the
+    /// result says whether Windows took it), but
     /// keep the drag offset until the client's next button packet, so the cursor stays where the
     /// drop put it while the user still holds the real button.
     pub fn release_left_for_drop(&mut self) -> InputApplication {
         if self.state.buttons & 1 == 0 {
             return InputApplication::default();
         }
-        self.state.buttons &= !1;
-        self.left_released_by_drop = true;
-        self.send_button_releases(1)
+        let released = self.send_button_releases(1);
+        if released.succeeded() {
+            self.state.buttons &= !1;
+            self.left_released_by_drop = true;
+        }
+        // A release Windows did not receive leaves left held: it stays in the release plan, so
+        // the caller can retry and release-all still sends it.
+        released
     }
 
     pub fn absolute_region(&self) -> DesktopRegion {
@@ -3750,12 +3769,14 @@ impl InputSink {
         match command {
             Command::Key(vk, up) => {
                 if self.state.key(HeldKey::Vk(vk), up) {
-                    outcome.application.merge(self.key(HeldKey::Vk(vk), up));
+                    outcome
+                        .application
+                        .merge(self.tracked_key(HeldKey::Vk(vk), up));
                 }
             }
             Command::ScanKey(key, up) => {
                 if self.state.key(key, up) {
-                    outcome.application.merge(self.key(key, up));
+                    outcome.application.merge(self.tracked_key(key, up));
                 }
             }
             Command::Clipboard(chunk) => outcome.application.merge(self.clipboard_chunk(chunk)),
@@ -3895,6 +3916,15 @@ impl InputSink {
             return InputApplication::default();
         }
         #[cfg(test)]
+        if self.test_refuse {
+            let expected = inputs.len() as u32;
+            self.diagnostics
+                .receipt(expected, 0, crate::admin_agent::client::ERROR_AGENT_LOST);
+            let mut application = InputApplication::default();
+            application.observe(expected, 0, crate::admin_agent::client::ERROR_AGENT_LOST);
+            return application;
+        }
+        #[cfg(test)]
         if let Some(records) = self.test_injections.as_mut() {
             records.extend(inputs.iter().map(|input| input_record(input).unwrap()));
             let expected = inputs.len() as u32;
@@ -4012,6 +4042,18 @@ impl InputSink {
         }
         let mut application = InputApplication::default();
         application.observe(expected, sent, error_code);
+        application
+    }
+
+    /// Inject a key transition already recorded in `state`. A release Windows did not
+    /// receive (for example an admin agent timeout) leaves the key down in Windows, so it
+    /// stays in the release plan: the next release-all (blur, viewer leave, input gate)
+    /// sends it again instead of leaving a modifier stuck.
+    fn tracked_key(&mut self, key: HeldKey, up: bool) -> InputApplication {
+        let application = self.key(key, up);
+        if up && !application.succeeded() {
+            self.state.pressed_keys.insert(key);
+        }
         application
     }
 
@@ -4196,7 +4238,8 @@ impl InputSink {
                 mask &= !1; // still held on the client: stays released on the host
             }
         }
-        let changed = mask ^ self.state.buttons;
+        let previous = self.state.buttons;
+        let changed = mask ^ previous;
         self.state.buttons = mask;
         if changed & 1 != 0 && mask & 1 == 0 {
             // The drag ended: the next absolute move lands at the client's true pointer.
@@ -4236,7 +4279,13 @@ impl InputSink {
                 });
             }
         }
-        self.send_inputs("mouse-buttons", &inputs)
+        let application = self.send_inputs("mouse-buttons", &inputs);
+        if !application.succeeded() {
+            // A release Windows did not receive leaves the button down; keep it in the
+            // release plan so release-all sends it again.
+            self.state.buttons |= previous & !mask;
+        }
+        application
     }
 
     fn wheel(&mut self, delta: i16) -> InputApplication {
@@ -4303,10 +4352,15 @@ impl InputSink {
         let (keys, buttons) = self.state.take_release_plan();
         let mut application = InputApplication::default();
         for key in keys {
-            application.merge(self.key(key, true));
+            application.merge(self.tracked_key(key, true));
         }
         if buttons != 0 {
-            application.merge(self.send_button_releases(buttons));
+            let released = self.send_button_releases(buttons);
+            if !released.succeeded() {
+                // Windows still holds them; the next release-all tries again.
+                self.state.buttons |= buttons;
+            }
+            application.merge(released);
         }
         application
     }
@@ -4354,6 +4408,69 @@ impl Drop for InputSink {
             .add(std::time::Instant::now(), &rest);
         if let Some(total) = self.diagnostics_rollup.take() {
             self.write_diagnostics(&total, true);
+        }
+    }
+}
+
+#[cfg(test)]
+mod refused_release_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_release_is_sent_again_by_release_all() {
+        // (press, release, expected up record) for a modifier key and the left button.
+        let cases: [(&[u8], &[u8], Record); 2] = [
+            (
+                &[TYPE_KEY_DOWN, VK_CONTROL as u8, 0],
+                &[TYPE_KEY_UP, VK_CONTROL as u8, 0],
+                Record::Key {
+                    vk: VK_CONTROL,
+                    scan: 0,
+                    flags: KEYEVENTF_KEYUP.0,
+                },
+            ),
+            (
+                &[TYPE_BUTTONS, 1],
+                &[TYPE_BUTTONS, 0],
+                Record::Mouse {
+                    dx: 0,
+                    dy: 0,
+                    data: 0,
+                    flags: MOUSEEVENTF_LEFTUP.0,
+                },
+            ),
+        ];
+        for (press, release, up) in cases {
+            let mut sink = InputSink::new();
+            sink.test_injections = Some(Vec::new());
+            assert!(sink.handle(press).application.succeeded());
+            // The release times out (admin agent lost): Windows still holds it down.
+            sink.test_refuse = true;
+            assert!(!sink.handle(release).application.succeeded());
+            sink.test_refuse = false;
+            sink.test_injections.as_mut().unwrap().clear();
+            sink.release_all();
+            let records = sink.test_injections.as_ref().unwrap();
+            assert!(
+                records.iter().any(|record| record_matches(record, &up)),
+                "release-all resends the refused release {up:?}, got {records:?}"
+            );
+            // Once delivered, it is not sent a third time.
+            sink.test_injections.as_mut().unwrap().clear();
+            sink.release_all();
+            assert!(sink.test_injections.as_ref().unwrap().is_empty());
+        }
+    }
+
+    fn record_matches(record: &Record, up: &Record) -> bool {
+        match (record, up) {
+            (
+                Record::Key { vk, flags, .. },
+                Record::Key {
+                    vk: v, flags: f, ..
+                },
+            ) => vk == v && flags & f == *f,
+            _ => record == up,
         }
     }
 }

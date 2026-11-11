@@ -1396,6 +1396,7 @@ fn run_drop(batch: &DropBatch, point: POINT, target: Option<NativeDropTarget>) -
             }
         }
         let _ole = OleGuard;
+        let _steps = crate::input_stall::steps_end_on_exit(crate::input_stall::StepArea::FileDrop);
         if !crate::clipboard::input_desktop_is_default() {
             batch.cancel("drop-unavailable");
             return Ok(());
