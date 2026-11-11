@@ -246,7 +246,9 @@ impl Relay {
     pub fn on_binary(&mut self, id: ConnId, bytes: &[u8], now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
         self.clock_ms = self.clock_ms.max(now_ms);
-        let Some(conn) = self.open_conn(id) else {
+        // Read through a reference: this runs for every media frame, and a Conn clone copies four
+        // strings.
+        let Some(conn) = self.conns.get(&id).filter(|conn| !conn.closing) else {
             return out;
         };
         if conn.phase != Phase::Live {

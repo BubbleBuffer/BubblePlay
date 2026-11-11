@@ -187,13 +187,22 @@ impl crate::PcRelay {
                 WebSocketIncomingMessage::Binary(bytes) => live.core.on_binary(id, &bytes, now),
             }
         };
+        // A batch of plain sends (every forwarded media frame) changes no deadline that is not
+        // later than the armed alarm: activity only moves an idle deadline forward. So it needs no
+        // re-arm, and an alarm that fires early only re-arms itself.
+        let sends_only = actions
+            .iter()
+            .all(|action| matches!(action, Action::SendText(..) | Action::SendBinary(..)));
         // apply closes the origin itself when a write fails, so the result needs no handling.
         let _ = self.apply(Some(id), actions).await;
         if text {
             // Only text can change the record or the host's presence.
             self.sync_directory().await;
         }
-        self.rearm().await
+        if text || !sends_only {
+            self.rearm().await?;
+        }
+        Ok(())
     }
 
     /// A socket closed or errored. Removes it from the relay and tells its peer.
@@ -336,6 +345,20 @@ impl crate::PcRelay {
         origin: Option<ConnId>,
         actions: Vec<Action>,
     ) -> std::result::Result<(), StoreFailed> {
+        // The common batch is one forwarded frame: send it without building a queue.
+        if actions
+            .iter()
+            .all(|action| matches!(action, Action::SendText(..) | Action::SendBinary(..)))
+        {
+            for action in actions {
+                match action {
+                    Action::SendText(id, text) => self.send(id, |ws| ws.send_with_str(&text)),
+                    Action::SendBinary(id, bytes) => self.send(id, |ws| ws.send_with_bytes(&bytes)),
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
         let mut queue: VecDeque<Action> = actions.into();
         while let Some(action) = queue.pop_front() {
             match action {
