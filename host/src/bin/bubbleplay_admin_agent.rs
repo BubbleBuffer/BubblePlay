@@ -71,6 +71,8 @@ const MAX_INSTANCES: u32 = 4;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Hello steps slower than this (measured from the client's connect) are logged.
 const SLOW_HELLO_STEP: Duration = Duration::from_millis(500);
+/// A `SendInput` call slower than this is logged.
+const SLOW_SEND_INPUT: Duration = Duration::from_millis(250);
 const TRAY_MISSING_LIMIT: u32 = 3;
 const RATE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -309,7 +311,17 @@ fn send_input(records: &[Record]) -> (u32, i32) {
         return (0, 0);
     }
     // SAFETY: inputs is a valid slice of fully initialized INPUTs.
+    let started = Instant::now();
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    // The host abandons a connection whose receipt takes over 500 ms, so a slow call here is
+    // the stall behind its "admin agent unavailable" bursts.
+    if started.elapsed() >= SLOW_SEND_INPUT {
+        tracing::warn!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            records = inputs.len(),
+            "SendInput slow"
+        );
+    }
     let error = if sent as usize == inputs.len() {
         0
     } else {

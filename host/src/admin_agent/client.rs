@@ -128,6 +128,13 @@ fn open_pipe(pipe: &str) -> Result<BoundedPipe, LinkError> {
                 // SAFETY: NUL-terminated name.
                 let _ = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), 1_000) };
             }
+            // Still no free instance after the wait: every instance is held by a client the
+            // agent has not finished with. The agent is stalled, not missing or out of date.
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY.0 as i32) => {
+                return Err(LinkError::TimedOut(format!(
+                    "all agent pipe instances are busy: {error}"
+                )))
+            }
             Err(error) => return Err(LinkError::Unavailable(error.to_string())),
         }
     }
@@ -786,6 +793,22 @@ mod tests {
         // Within the retry delay no further connection is attempted.
         assert_eq!(link.inject(&[move_one]), None);
         assert_eq!(link.attempts(), 1);
+    }
+
+    #[test]
+    fn probe_of_an_agent_with_every_pipe_instance_busy_is_not_responding() {
+        // A stalled agent holds all its pipe instances; the tray must not call that "needs update".
+        let _guard = test_server::pipe_lock();
+        let name = format!(
+            r"\\.\pipe\BubblePlay.AdminAgent.unit-busy-{}",
+            std::process::id()
+        );
+        let _server = test_server::listen(&name);
+        let _held = open_pipe(&name).unwrap();
+        assert!(
+            matches!(probe(&name, true), ProbeResult::NotResponding(_)),
+            "a busy pipe must not be reported as unavailable"
+        );
     }
 
     #[test]
