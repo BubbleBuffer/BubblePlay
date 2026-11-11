@@ -21,6 +21,7 @@ pub struct SilenceGate {
 
 impl SilenceGate {
     /// The stream starts with a discontinuity, so the first sent packet is marked.
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::with_limit(MAX_SILENT_FRAMES)
     }
