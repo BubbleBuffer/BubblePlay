@@ -14,6 +14,22 @@ export function signalingUnanswered({ pingSentMs, inboundMs, nowMs, limitMs = SI
   return pingSentMs !== null && inboundMs < pingSentMs && nowMs - pingSentMs >= limitMs;
 }
 
+// The WSS v4 media socket gets the same rule. The viewer pings it every heartbeat whatever else it
+// sends (its acks used to postpone the ping, leaving a static desktop with no inbound traffic but
+// the host's rare frames: healthy sockets were closed as silent), and the relay answers each ping.
+// The socket is dead only when a ping stays unanswered this long, counted from the oldest
+// unanswered ping. Hidden-tab timer throttling only spaces the pings out, so it never trips it.
+// 25 s after a ping that follows 15 s of quiet is the old 40 s of silence.
+export const MEDIA_ANSWER_LIMIT_MS = 25_000;
+/** One heartbeat tick on `state` ({ pingSentMs, lastPingAt, lastInboundAt }): "ping", "dead" or "none". */
+export function mediaHeartbeatStep(state, nowMs, { heartbeatMs, limitMs = MEDIA_ANSWER_LIMIT_MS }) {
+  if (signalingUnanswered({ pingSentMs: state.pingSentMs, inboundMs: state.lastInboundAt, nowMs, limitMs })) return "dead";
+  if (nowMs - state.lastPingAt < heartbeatMs) return "none";
+  state.lastPingAt = nowMs;
+  if (state.pingSentMs === null || state.lastInboundAt >= state.pingSentMs) state.pingSentMs = nowMs;
+  return "ping";
+}
+
 // A failed WebRTC transport can leave the host's old RTC epoch alive long
 // enough to consume and ignore a replacement offer. Recycling signaling makes
 // the relay notify the host first, so both sides converge on a fresh epoch.

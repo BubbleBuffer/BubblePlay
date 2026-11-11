@@ -127,3 +127,25 @@ class SignalLivenessTest {
         assertEquals(Action.NONE, live.check(8_000)) // input marker was consumed; no stale probe later
     }
 }
+
+class MediaLivenessTest {
+    // The media socket's rule: the viewer's acks never postpone the ping, and only an unanswered ping is dead.
+    private val live = SignalLiveness(heartbeatMs = 15_000, pongTimeoutMs = 25_000)
+
+    @Test
+    fun answeredPingsKeepAStaticDesktopAlive() {
+        live.opened(0)
+        for (t in 15_000L..300_000L step 15_000L) {
+            assertEquals(Action.PING, live.check(t))
+            live.inbound(t + 80) // pong; the host itself sends a frame a minute
+        }
+    }
+
+    @Test
+    fun unansweredPingMeansDeadAfterTheLimit() {
+        live.opened(0)
+        assertEquals(Action.PING, live.check(15_000))
+        assertEquals(Action.NONE, live.check(40_000))
+        assertEquals(Action.DEAD, live.check(40_001))
+    }
+}

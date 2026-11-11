@@ -29,6 +29,10 @@ A session that has authenticated once is "recycled" after a loss. For it, a miss
 | Windows client | `Timing::recycled_auth`, `recycled_auth_max`, `recycled_budget` in [`client-win/src/net/session.rs`](../../client-win/src/net/session.rs) |
 | Android | `RecycledRetry` in `net/SessionWire.kt`, used by `net/Session.kt` |
 
+**A reconnect never fails on the old session's messages (2026-11-11).** When a viewer reconnects signaling, the PC may still hold the previous session and send its last `ctl` messages before it has seen the new `auth-hello`; the relay forwards them to the new socket. No `ctl` key exists before `auth-host`, so the browser (`dk-session.js`) and Android (`SessionWire`) drop a `ctl` that arrives before `auth-host` is handled instead of ending the new session as `unexpected ctl`. The handshake still has its own deadline. The Windows client already skips everything but `auth-host` while it waits for it.
+
+**Dead-socket detection on the WSS media socket.** The browser and Android ping the media socket every 15 s whatever else they send (acks and keyframe requests do not postpone the ping), and the relay answers each ping. The socket is closed and reconnected only when a ping stays unanswered for 25 s, counted from the oldest unanswered ping (`mediaHeartbeatStep` in `recovery.js`, `SignalLiveness` on Android): the same 40 s of silence as before for a genuinely dead socket. Before, only quiet-send time postponed the ping, so a static desktop (host sends about one frame a minute, viewer acks every few seconds) got no pong and healthy sockets were cut as `wss-v4-silent-socket`; and a hidden tab, whose timers run once a minute, always looked silent. The warning now also carries `unansweredMs`.
+
 When the first frame is shown again each client logs one info line with the total recovery time and the attempt count ([logging](../logging.md)). The signaling close code is logged as `closeCode`.
 
 ## Browser: stuck socket and lost timer (2026-11-06)

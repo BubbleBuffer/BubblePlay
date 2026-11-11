@@ -136,7 +136,11 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
       await checkBind();
       return;
     }
-    if (message?.type !== "ctl" || !ctl) return fail("unexpected-message", undefined, new Error(`unexpected ${String(message?.type).slice(0, 40)}`));
+    if (message?.type !== "ctl") return fail("unexpected-message", undefined, new Error(`unexpected ${String(message?.type).slice(0, 40)}`));
+    // No ctl key exists before auth-host, so this ctl was sealed for an earlier session of the
+    // same pair: the PC had not yet noticed the viewer's reconnect and the relay forwarded its
+    // last messages to the new socket. It cannot be opened and must not end the new handshake.
+    if (!ctl) { blog("debug", "ctl before auth-host dropped"); return; }
     try {
       if (BINARY_KINDS.has(message.kind)) {
         const bytes = await ctl.open(message);

@@ -205,8 +205,9 @@ class Session(
     private var surfaceWatchdog: Runnable? = null
     /** Report the next presented frame (first one of this session or on a new surface). */
     private var reportLiveFrame = true
-    private var mediaLastSend = 0L
-    private var mediaLastInbound = 0L
+    // Media socket liveness: a ping every heartbeat whatever else is sent (the viewer's acks used to
+    // postpone it, and a static desktop sends little), dead when one stays unanswered for 25 s.
+    private val mediaLiveness = SignalLiveness(V4.HEARTBEAT_MS, pongTimeoutMs = 25_000)
     private val gate = V4ReceiveGate()
     private var lastKeyframeRequestAt = -1_000L
     private var framesReceived = 0L
@@ -985,12 +986,12 @@ class Session(
             override fun onOpen(webSocket: WebSocket, response: Response) = mediaPost(id) {
                 // Signaling closed or replaced the grant while this socket connected: its ticket is stale, so it never sends it.
                 if (grant !== current) { webSocket.cancel(); return@mediaPost }
-                mediaLastSend = now(); mediaLastInbound = now()
+                mediaLiveness.opened(now())
                 webSocket.send(current.hello("media-viewer"))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) = mediaPost(id) {
-                mediaLastInbound = now()
+                mediaLiveness.inbound(now())
                 handleMediaText(text)
             }
 
@@ -998,7 +999,7 @@ class Session(
                 val receivedAt = SystemClock.elapsedRealtimeNanos()
                 val packet = bytes.toByteArray()
                 mediaPost(id) {
-                    mediaLastInbound = now()
+                    mediaLiveness.inbound(now())
                     // BPA1 audio shares the socket: no ACK, and it never reaches the v4 gate.
                     if (AudioWire.isAudio(packet)) onAudioPacket(packet)
                     else onPacket(packet, (receivedAt - startedAt) / 1_000_000.0)
@@ -1024,7 +1025,6 @@ class Session(
     private fun sendMedia(text: String): Boolean {
         val socket = media ?: return false
         if (!mediaOpen) return false
-        mediaLastSend = now()
         return socket.send(text)
     }
 
@@ -1229,8 +1229,11 @@ class Session(
             }
         }
         if (mediaOpen) {
-            if (now - mediaLastSend >= V4.HEARTBEAT_MS) sendMedia(V4.PING)
-            if (now - mediaLastInbound > V4.HEARTBEAT_MS * 2 + 10_000) media?.cancel()
+            when (mediaLiveness.check(now)) {
+                SignalLiveness.Action.PING -> sendMedia(V4.PING)
+                SignalLiveness.Action.DEAD -> { Log.w(TAG, "media socket unanswered: reconnecting"); media?.cancel() }
+                SignalLiveness.Action.NONE -> {}
+            }
         }
     }
 
