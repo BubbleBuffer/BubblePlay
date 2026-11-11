@@ -88,6 +88,7 @@ impl crate::PcRelay {
             return http::status(404);
         };
         let (pc, epoch) = query_values(&url);
+        self.claim_legacy(pc.as_deref()).await;
         let upgrade = UpgradeRequest {
             route,
             pc,
@@ -479,6 +480,80 @@ impl crate::PcRelay {
         })
     }
 
+    /// Once per object start: when this object holds no PC and the upgrade names a device id, asks
+    /// the front object for that PC record from the single-object relay table, adopts it and
+    /// saves it. The directory report that follows makes the front object drop it from the old
+    /// table, so an existing PC keeps working after the split without registering again. The
+    /// record is saved here before the old copy goes.
+    async fn claim_legacy(&self, pc: Option<&str>) {
+        let name = bp_relay_core::directory::session_object_name(pc);
+        let Some(id) = name.strip_prefix("pc-") else {
+            return;
+        };
+        let wanted = {
+            let mut guard = self.live.borrow_mut();
+            let Some(live) = guard.as_mut() else {
+                return;
+            };
+            let wanted = !live.legacy_checked && live.core.pcs().is_empty();
+            live.legacy_checked = true;
+            wanted
+        };
+        if !wanted {
+            return;
+        }
+        let Some(text) = self.fetch_legacy(id).await else {
+            return;
+        };
+        let Ok(table) = store::decode_pcs(Some(&text)) else {
+            worker::console_error!("a legacy PC record could not be read");
+            return;
+        };
+        let saved = {
+            let mut guard = self.live.borrow_mut();
+            let Some(live) = guard.as_mut() else {
+                return;
+            };
+            live.core.adopt_pcs(table);
+            store::encode_pcs(live.core.pcs())
+        };
+        let written = match saved {
+            Ok(text) => self.write_pcs(text).await.is_ok(),
+            Err(_) => false,
+        };
+        if written {
+            self.sync_directory().await;
+        } else {
+            self.set_store_health(false);
+        }
+    }
+
+    /// The old record of one PC from the front object: its table text, or None (not there, or the
+    /// front object did not answer 200).
+    async fn fetch_legacy(&self, id: &str) -> Option<String> {
+        let stub = self
+            .env
+            .durable_object(RELAY_BINDING)
+            .ok()?
+            .id_from_name(RELAY_NAME)
+            .ok()?
+            .get_stub()
+            .ok()?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_body(Some(JsValue::from_str(id)));
+        let request = Request::new_with_init(
+            &format!("https://relay.internal{INTERNAL_PREFIX}dir/claim"),
+            &init,
+        )
+        .ok()?;
+        let mut response = stub.fetch_with_request(request).await.ok()?;
+        if response.status_code() != 200 {
+            return None;
+        }
+        response.text().await.ok()
+    }
+
     /// Posts a report to the front object. The status is the answer's: 204 stored, 409 the
     /// directory is full, 400 or 5xx otherwise.
     async fn post_report(&self, report: &PcReport) -> Result<u16> {
@@ -640,6 +715,7 @@ async fn wake_state(
             pcs_healthy: true,
             reported: None,
             report_pending: false,
+            legacy_checked: false,
             armed: None,
         },
         actions,

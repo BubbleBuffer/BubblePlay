@@ -19,7 +19,7 @@ use bp_relay_core::gate::{
     Gate, GateEffect, GateSnapshot, Hold, HoldCheck, Request as GateRequest, Verdict,
 };
 use bp_relay_core::presence::{self, PRESENCE_PATH, PresenceLimiter};
-use bp_relay_core::relay::reasons;
+use bp_relay_core::relay::{PcTable, reasons};
 use serde_json::{Value, json};
 use worker::js_sys;
 use worker::wasm_bindgen::JsValue;
@@ -45,6 +45,10 @@ const DIR_PREFIX: &str = "pc:";
 /// How often a held navigation looks at the gate's in-memory state.
 const HOLD_CHECK_MS: u64 = 250;
 const REPORT_PATH: &str = "/__internal/dir/report";
+const CLAIM_PATH: &str = "/__internal/dir/claim";
+/// The single-object relay PC table: this object still holds it until each PC own object has
+/// taken its record (`claim`).
+const LEGACY_KEY: &str = "pcs";
 
 /// The in-memory state: the gate, the presence limiter and the directory.
 pub struct FrontLive {
@@ -52,6 +56,8 @@ pub struct FrontLive {
     /// Per-prefix counter for `GET /presence`. Memory only: eviction resets it.
     presence: PresenceLimiter,
     directory: Directory,
+    /// PC records from before the per-PC split that no PC object has taken yet.
+    legacy: PcTable,
     /// The canonical public origin, for the browser-socket check.
     origin: String,
     /// The admin bearer, for the admin API and healthz.
@@ -93,6 +99,9 @@ impl crate::Relay {
         let method = req.method();
         if path == REPORT_PATH {
             return self.directory_report(req, &method).await;
+        }
+        if path == CLAIM_PATH {
+            return self.claim(req, &method).await;
         }
         let method_text = method.to_string();
         let headers = req.headers();
@@ -260,8 +269,66 @@ impl crate::Relay {
             .put(&format!("{DIR_PREFIX}{}", report.id), text)
             .await
         {
-            Ok(()) => http::status(204),
+            Ok(()) => {
+                self.drop_legacy(&report.id).await;
+                http::status(204)
+            }
             Err(_) => http::status(503),
+        }
+    }
+
+    /// A PC object asks for its record from the single-object relay table (a POST whose body is
+    /// the canonical device id; the answer is that one record in the table format). The record
+    /// stays here until the object reports it (`drop_legacy`), so a crash in between loses nothing.
+    async fn claim(&self, req: Request, method: &Method) -> Result<Response> {
+        if *method != Method::Post {
+            return not_found();
+        }
+        let Some(body) = http::read_body(&req).await? else {
+            return http::status(413);
+        };
+        let id = String::from_utf8_lossy(&body).into_owned();
+        let text = {
+            let guard = self.live.borrow();
+            let Some(live) = guard.as_ref() else {
+                return server_error();
+            };
+            live.legacy.records.get(&id).and_then(|record| {
+                let mut one = PcTable::new();
+                one.records.insert(id.clone(), record.clone());
+                store::encode_pcs(&one).ok()
+            })
+        };
+        match text {
+            Some(text) => Response::ok(text),
+            None => not_found(),
+        }
+    }
+
+    /// Forgets the old-table record of a PC whose own object has saved it, and deletes the old
+    /// table key when it is empty.
+    async fn drop_legacy(&self, id: &str) {
+        let text = {
+            let mut guard = self.live.borrow_mut();
+            let Some(live) = guard.as_mut() else {
+                return;
+            };
+            if live.legacy.records.remove(id).is_none() {
+                return;
+            }
+            if live.legacy.is_empty() {
+                None
+            } else {
+                store::encode_pcs(&live.legacy).ok()
+            }
+        };
+        let storage = self.state.storage();
+        let result = match text {
+            Some(text) => storage.put(LEGACY_KEY, text).await,
+            None => storage.delete(LEGACY_KEY).await.map(|_| ()),
+        };
+        if result.is_err() {
+            worker::console_error!("the old PC table could not be updated");
         }
     }
 
@@ -519,6 +586,11 @@ async fn wake_state(
         .await
         .map_err(|_| "the gate store could not be read".to_owned())?;
     let gate_snapshot = store::decode_gate(gate_text.as_deref())?;
+    let legacy_text = storage
+        .get::<String>(LEGACY_KEY)
+        .await
+        .map_err(|_| "the old PC table could not be read".to_owned())?;
+    let legacy = store::decode_pcs(legacy_text.as_deref())?;
     let rows = storage
         .list_with_options(ListOptions::new().prefix(DIR_PREFIX))
         .await
@@ -557,6 +629,7 @@ async fn wake_state(
         gate,
         presence: PresenceLimiter::new(),
         directory: Directory::new(entries),
+        legacy,
         origin,
         admin_token: settings.admin_token,
         public_host,

@@ -29,6 +29,9 @@ pub struct PcLive {
     pub reported: Option<Reported>,
     /// True when the directory has not yet been told the current state (a report failed).
     pub report_pending: bool,
+    /// True once this object has asked the front object for a record left by the single-object
+    /// relay (memory only: a new start asks again, and the answer is then 404).
+    pub legacy_checked: bool,
     /// The alarm time last set, if known. The outer None means unknown, so the next call sets
     /// it. Some(None) means no alarm is set.
     pub armed: Option<Option<u64>>,

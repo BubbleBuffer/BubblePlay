@@ -129,6 +129,15 @@ impl Relay {
         &self.pcs
     }
 
+    /// Takes the PC records of an older store when this relay holds none. An adapter that keeps one
+    /// PC per object uses it once, when a PC's object starts empty and the old table has its PC.
+    /// The caller persists the table afterwards.
+    pub fn adopt_pcs(&mut self, table: PcTable) {
+        if self.pcs.records.is_empty() {
+            self.pcs = table;
+        }
+    }
+
     /// Records whether the PC store can be written. While false, registration
     /// is refused and the admin calls return `AdminError::Unavailable`. The
     /// adapter calls this with false when a `PersistPcs` fails.
