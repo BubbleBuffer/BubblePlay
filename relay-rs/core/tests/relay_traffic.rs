@@ -5,7 +5,9 @@
 
 mod relay_harness;
 
-use bp_relay_core::{HELLO_LIMIT, Route, SIGNAL_LIMIT};
+use bp_relay_core::{
+    FILE_LIMIT, HELLO_LIMIT, MEDIA_LIMIT, PREAUTH_READ_LIMIT, Route, SIGNAL_LIMIT,
+};
 use relay_harness::*;
 use serde_json::json;
 
@@ -65,6 +67,52 @@ fn pre_auth_binary_closes_invalid_hello() {
     let id = h.upgrade(req(Route::HostWs, Some(&a.id().to_string()), None, false));
     let out = h.binary(id, &[1, 2, 3]);
     assert_eq!(closed(&out, id), Some((1008, "invalid hello".to_owned())));
+}
+
+#[test]
+fn transport_read_limit_expands_only_after_authentication_on_every_route() {
+    let mut h = Harness::new();
+    let a = identity(1);
+    let (id, challenge) = h.host_hello(&a, Some(TOKEN));
+    assert_eq!(h.relay.read_limit(id), Some(PREAUTH_READ_LIMIT));
+    let nonce = challenge_nonce(&challenge, id).unwrap();
+    let out = h.text(id, &proof_msg(&a, ORIGIN, &nonce));
+    let host = hello_ok(&out, id);
+    assert_eq!(h.relay.read_limit(id), Some(SIGNAL_LIMIT));
+    h.text(id, &json!({"type":"admit","viewers":[viewer_identity().id().to_string()],"remotePairing":false}));
+    let viewer = h.open_viewer(&a.id().to_string());
+    for (route, role, ticket, limit) in [
+        (
+            Route::HostMediaWs,
+            "media-host",
+            host["ticket"].as_str().unwrap(),
+            MEDIA_LIMIT,
+        ),
+        (
+            Route::MediaWs,
+            "media-viewer",
+            viewer.ticket.as_str(),
+            MEDIA_LIMIT,
+        ),
+        (
+            Route::HostFileWs,
+            "file-host",
+            host["ticket"].as_str().unwrap(),
+            FILE_LIMIT,
+        ),
+        (
+            Route::FileWs,
+            "file-viewer",
+            viewer.ticket.as_str(),
+            FILE_LIMIT,
+        ),
+    ] {
+        let data = h.upgrade(req(route, Some(&viewer.pc), Some(&viewer.epoch), true));
+        assert_eq!(h.relay.read_limit(data), Some(PREAUTH_READ_LIMIT));
+        let out = h.text(data, &json!({"type":"hello","role":role,"ticket":ticket}));
+        assert!(closed(&out, data).is_none());
+        assert_eq!(h.relay.read_limit(data), Some(limit));
+    }
 }
 
 #[test]

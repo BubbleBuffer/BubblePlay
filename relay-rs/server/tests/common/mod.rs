@@ -117,6 +117,7 @@ async fn record(State(store): State<Recorder>, body: Bytes) -> StatusCode {
 pub struct Server {
     pub addr: SocketAddr,
     task: JoinHandle<()>,
+    wait_cookie: Mutex<Option<String>>,
 }
 
 impl Drop for Server {
@@ -142,6 +143,14 @@ impl Server {
             token: Secret::new(TOKEN),
             admin_token: Secret::new(ADMIN),
             max_connections: 32,
+            max_unauthenticated_connections: 16,
+            max_unauthenticated_per_prefix: 4,
+            upgrade_rate_per_prefix: 30,
+            ntfy_publish_limit: 10,
+            ntfy_publish_window_s: 600,
+            auth_failure_limit: 5,
+            auth_failure_window_s: 600,
+
             turn,
             ntfy: Some(Ntfy {
                 url: env.ntfy_url.clone(),
@@ -155,7 +164,11 @@ impl Server {
         let task = tokio::spawn(async move {
             run(&cfg, listener).await.expect("server run");
         });
-        Server { addr, task }
+        Server {
+            addr,
+            task,
+            wait_cookie: Mutex::new(None),
+        }
     }
 }
 
@@ -452,13 +465,39 @@ pub async fn data_socket(
     (ws, ok)
 }
 
-/// A top-level navigation to `path` without a cookie, as a browser sends it.
+/// A top-level navigation to `path`, retaining this browser's waiting cookie.
 pub fn navigate(server: &Server, path: &str) -> reqwest::RequestBuilder {
-    http()
+    let request = http()
         .get(format!("{}{path}", base(server.addr)))
         .header("Accept", "text/html")
         .header("Sec-Fetch-Dest", "document")
-        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Mode", "navigate");
+    match server.wait_cookie.lock().unwrap().as_ref() {
+        Some(cookie) => request.header("Cookie", cookie),
+        None => request,
+    }
+}
+
+/// The initial response sets the pending browser secret before any request
+/// can enter the silent hold. Keep it for this test browser's later reloads.
+pub async fn bootstrap_navigation(server: &Server, path: &str) {
+    let response = navigate(server, path).send().await.unwrap();
+    assert_eq!(response.status(), 302);
+    let set = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(set.starts_with("__Host-bp_wait="));
+    for attribute in ["Secure", "HttpOnly", "SameSite=Strict", "Path=/"] {
+        assert!(set.contains(attribute), "{attribute}");
+    }
+    *server.wait_cookie.lock().unwrap() = Some(set.split(';').next().unwrap().to_string());
+}
+
+pub fn waiting_cookie(server: &Server) -> Option<String> {
+    server.wait_cookie.lock().unwrap().clone()
 }
 
 /// The approve (index 0) or deny (index 1) bearer of an ntfy publish.
@@ -494,10 +533,10 @@ pub fn gate_cookie_of(response: &reqwest::Response) -> Option<String> {
         .map(|value| value.split(';').next().unwrap().to_string())
 }
 
-/// Runs a browser through the gate: a navigation without a cookie is held open, the ntfy approve
-/// bearer is posted, and the held navigation is answered with a 302 to the same URL that sets the
-/// cookie. Returns the Cookie header value, `__Host-gate=<value>`.
+/// Runs a browser through the bootstrap redirect and cookie-bearing hold,
+/// approves it through ntfy, and returns the `__Host-gate=<value>` cookie pair.
 pub async fn browser_cookie(server: &Server, env: &Env) -> String {
+    bootstrap_navigation(server, "/").await;
     let held = tokio::spawn(navigate(server, "/").send());
     let ntfy = env.wait_for_ntfy().await;
     decide(server, &ntfy_bearer(&ntfy, 0), "approve").await;
@@ -514,15 +553,22 @@ pub async fn browser_cookie(server: &Server, env: &Env) -> String {
     gate_cookie_of(&admitted).expect("the admitted navigation sets the gate cookie")
 }
 
-/// Sends a raw HTTP/1.1 navigation without a cookie and reads until the server closes the
+/// Sends a raw HTTP/1.1 navigation with the supplied waiting cookie and reads until the server closes the
 /// connection. Returns every byte the server wrote, and how long it took.
-pub async fn raw_navigation(addr: SocketAddr, path: &str) -> (Vec<u8>, Duration) {
+pub async fn raw_navigation(
+    addr: SocketAddr,
+    path: &str,
+    cookie: Option<String>,
+) -> (Vec<u8>, Duration) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let started = std::time::Instant::now();
     let mut stream = TcpStream::connect(addr).await.unwrap();
+    let cookie = cookie
+        .map(|value| format!("Cookie: {value}\r\n"))
+        .unwrap_or_default();
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/html\r\n\
-         Sec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n\r\n"
+         Sec-Fetch-Dest: document\r\nSec-Fetch-Mode: navigate\r\n{cookie}\r\n"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut received = Vec::new();

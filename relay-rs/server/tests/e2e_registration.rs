@@ -270,3 +270,61 @@ async fn e2e_restart_keeps_pcs_and_gate_cookie() {
     assert_eq!(page.status(), 200);
     assert_eq!(page.text().await.unwrap(), "home");
 }
+
+#[tokio::test]
+async fn e2e_preauth_large_declared_frame_is_closed_before_payload_arrives() {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let path = format!("/host-ws?pc={}", pc_id(&identity(91)));
+    let mut ws = connect(server.addr, &path, None, None).await.unwrap();
+    // A valid masked binary frame declares 1 MiB but sends no payload. A
+    // receiver that waits to buffer the frame cannot finish this test.
+    let mut header = vec![0x82, 0xff];
+    header.extend_from_slice(&(1024_u64 * 1024).to_be_bytes());
+    header.extend_from_slice(&[1, 2, 3, 4]);
+    ws.get_mut().write_all(&header).await.unwrap();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(1), ws.next())
+        .await
+        .expect("pre-auth frame limit must reject the header before reading the payload");
+    assert!(
+        matches!(closed, None | Some(Err(_)) | Some(Ok(Message::Close(_)))),
+        "got {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_http_header_and_body_reads_have_ten_second_deadlines() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    let mut headers = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let mut body = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    headers
+        .write_all(b"GET / HTTP/1.1\r\nHost: relay.test\r\n")
+        .await
+        .unwrap();
+    body.write_all(
+        b"POST /__gate/decision HTTP/1.1\r\nHost: relay.test\r\nContent-Length: 10\r\n\r\nx",
+    )
+    .await
+    .unwrap();
+    let (header_response, body_response) =
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            let mut first = Vec::new();
+            let _ = headers.read_to_end(&mut first).await;
+            let mut second = [0u8; 4096];
+            let count = body.read(&mut second).await.unwrap();
+            (first, second[..count].to_vec())
+        })
+        .await
+        .expect("incomplete headers and bodies must expire at10s");
+    assert!(
+        header_response.is_empty()
+            || String::from_utf8_lossy(&header_response).starts_with("HTTP/1.1 408")
+    );
+    assert!(String::from_utf8_lossy(&body_response).starts_with("HTTP/1.1 408"));
+}

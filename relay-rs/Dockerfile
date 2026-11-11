@@ -6,7 +6,8 @@
 # The ignore rules for this build live in relay-rs/Dockerfile.dockerignore (BuildKit reads a
 # Dockerfile-specific ignore file that sits next to the Dockerfile).
 
-FROM rust:1-alpine AS build
+# rust:1-alpine (manifest index pinned 2026-11-10)
+FROM rust:1-alpine@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 RUN apk add --no-cache musl-dev ca-certificates \
  && mkdir -p /out/data \
  && chown 10001:10001 /out/data

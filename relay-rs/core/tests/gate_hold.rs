@@ -15,7 +15,7 @@ fn gate_hold_then_approve_admits_the_same_request_with_a_302_and_the_cookie() {
     let mut rng = TestRng::new(901);
     let mut request = req("GET", "/pair", CLIENT, T0);
     request.query = Some("a=1&b=2");
-    let (hold, effects) = hold_parts(gate.handle(&mut rng, &request));
+    let (hold, effects) = hold_parts(navigate_request(&mut gate, &mut rng, &request));
     assert_eq!(hold.until_ms(), T0 + HOLD_MS);
     assert_eq!(effects.len(), 1);
     let (approve, _) = bearer_tokens(&effects[0]);
@@ -56,7 +56,7 @@ fn gate_hold_location_stays_on_the_public_origin() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(902);
     let request = req("GET", "//elsewhere.example/x", CLIENT, T0);
-    let (hold, effects) = hold_parts(gate.handle(&mut rng, &request));
+    let (hold, effects) = hold_parts(navigate_request(&mut gate, &mut rng, &request));
     let (approve, _) = bearer_tokens(&effects[0]);
     decide(
         &mut gate,
@@ -78,7 +78,8 @@ fn gate_second_navigation_from_the_prefix_joins_the_waiting_approval() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(903);
     let (first, approve, _) = open_hold(&mut gate, &mut rng, CLIENT, T0);
-    // Same /24, a few seconds later: held too, and nothing is published.
+    rng.copy_wait_cookie(CLIENT, "203.0.113.99");
+    // The same browser in this /24, a few seconds later: held too, and nothing is published.
     let (second, effects) = hold_parts(get(&mut gate, &mut rng, "203.0.113.99", T0 + 5_000));
     assert!(effects.is_empty(), "no second ntfy publish");
     assert_eq!(second.until_ms(), T0 + 5_000 + HOLD_MS);
@@ -137,10 +138,11 @@ fn gate_approval_after_the_hold_is_claimed_once_by_the_next_navigation() {
         T0 + 60_000,
     );
 
-    // The reload, from another address in the prefix, claims it at once.
+    // The same browser moves to another address in the prefix and claims it.
+    rng.copy_wait_cookie(CLIENT, "203.0.113.8");
     let mut reload = req("GET", "/", "203.0.113.8", T0 + 70_000);
     reload.query = Some("r=1");
-    let (response, effects) = handled_parts(gate.handle(&mut rng, &reload));
+    let (response, effects) = handled_parts(navigate_request(&mut gate, &mut rng, &reload));
     assert_eq!(response.status, 302);
     assert_eq!(
         header(&response, "Location"),
@@ -243,7 +245,10 @@ fn gate_head_without_cookie_is_dropped_and_opens_nothing() {
     let mut rng = TestRng::new(911);
     let mut request = req("HEAD", "/", CLIENT, T0);
     request.sec_fetch_dest = Some("document");
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Drop);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Drop
+    );
     assert!(gate.pending_ids(T0).is_empty());
 }
 
@@ -267,7 +272,10 @@ fn gate_the_poll_endpoint_is_gone() {
     let mut request = req("POST", "/__gate/poll", CLIENT, T0 + 1_000);
     request.origin = Some(ORIGIN);
     request.body = &br#"{"pending":"x"}"#[..];
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -297,7 +305,7 @@ fn gate_forget_response_has_the_security_headers() {
     let mut request = req("POST", "/__gate/forget", CLIENT, T0 + 10_000);
     request.origin = Some(ORIGIN);
     request.cookie = Some(&cookie);
-    let (response, effects) = handled_parts(gate.handle(&mut rng, &request));
+    let (response, effects) = handled_parts(navigate_request(&mut gate, &mut rng, &request));
     assert_eq!(header(&response, "Cache-Control"), Some("no-store"));
     assert_eq!(header(&response, "Referrer-Policy"), Some("no-referrer"));
     assert!(

@@ -169,12 +169,12 @@ fn hello_times_out_after_ten_seconds() {
 }
 
 #[test]
-fn challenge_must_be_answered_within_thirty_seconds() {
+fn challenge_must_be_answered_within_ten_seconds() {
     let mut h = Harness::new();
     let a = identity(1);
     let (id, actions) = h.host_hello(&a, Some(TOKEN));
     assert!(challenge_nonce(&actions, id).is_some());
-    assert!(h.advance(29_999).is_empty());
+    assert!(h.advance(9_999).is_empty());
     assert_eq!(closed(&h.advance(1), id), refused());
 }
 
@@ -307,20 +307,201 @@ fn upgrade_refuses_bad_pc_epoch_and_unauthorised_viewers() {
 }
 
 #[test]
-fn max_connections_refuses_extra_upgrades() {
-    let mut h = Harness::with(|c| c.max_connections = 2);
-    assert!(
-        h.try_upgrade(req(Route::HostVersionWs, None, None, false))
-            .is_ok()
+fn unauthenticated_caps_preserve_live_hosts_and_pending_valid_proofs() {
+    for distributed in [false, true] {
+        let mut h = Harness::with(|c| c.max_connections = 1);
+        let a = identity(1);
+        let (host, _) = h.register_host(&a, Some(TOKEN));
+        let (replacement, challenge) = h.host_hello(&a, None);
+        let nonce = challenge_nonce(&challenge, replacement).expect("challenge");
+        let attacks = if distributed { 15 } else { 3 };
+        for n in 0..attacks {
+            if distributed {
+                h.client = format!("203.0.{n}.1").parse().unwrap();
+            }
+            h.upgrade(req(Route::HostVersionWs, None, None, false));
+        }
+        if distributed {
+            h.client = "192.0.2.1".parse().unwrap();
+        }
+        assert!(
+            h.try_upgrade(req(Route::HostVersionWs, None, None, false))
+                .is_err()
+        );
+        assert_eq!(
+            sent_types(&h.text(host.id, &json!({"type":"ping"})), host.id),
+            vec!["pong"]
+        );
+        let out = h.text(replacement, &proof_msg(&a, ORIGIN, &nonce));
+        assert!(closed(&out, replacement).is_none());
+        hello_ok(&out, replacement);
+        assert_eq!(
+            sent_types(&h.text(replacement, &json!({"type":"ping"})), replacement),
+            vec!["pong"]
+        );
+    }
+}
+
+#[test]
+fn authenticated_capacity_is_checked_after_proof_without_displacing_a_host() {
+    let mut h = Harness::with(|c| c.max_connections = 1);
+    let (host, _) = h.register_host(&identity(1), Some(TOKEN));
+    let b = identity(2);
+    let (id, challenge) = h.host_hello(&b, Some(TOKEN));
+    let nonce = challenge_nonce(&challenge, id).expect("pre-auth capacity remains available");
+    let out = h.text(id, &proof_msg(&b, ORIGIN, &nonce));
+    assert_eq!(closed(&out, id), refused());
+    assert!(!h.relay.pcs().records.contains_key(&b.id().to_string()));
+    assert_eq!(
+        sent_types(&h.text(host.id, &json!({"type":"ping"})), host.id),
+        vec!["pong"]
     );
-    assert!(
-        h.try_upgrade(req(Route::HostVersionWs, None, None, false))
-            .is_ok()
-    );
+}
+
+#[test]
+fn unauthenticated_prefix_cap_uses_ipv4_24_and_ipv6_56() {
+    for clients in [
+        [
+            "198.51.100.1",
+            "198.51.100.2",
+            "198.51.100.3",
+            "198.51.100.4",
+            "198.51.100.255",
+        ],
+        [
+            "2001:db8:1234:5600::1",
+            "2001:db8:1234:5601::1",
+            "2001:db8:1234:567f::1",
+            "2001:db8:1234:56aa::1",
+            "2001:db8:1234:56ff::1",
+        ],
+    ] {
+        let mut h = Harness::new();
+        for client in &clients[..4] {
+            h.client = client.parse().unwrap();
+            h.upgrade(req(Route::HostVersionWs, None, None, false));
+        }
+        h.client = clients[4].parse().unwrap();
+        assert!(
+            h.try_upgrade(req(Route::HostVersionWs, None, None, false))
+                .is_err()
+        );
+        h.advance(10_000);
+        assert!(
+            h.try_upgrade(req(Route::HostVersionWs, None, None, false))
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn upgrades_are_limited_to_thirty_per_minute_before_acceptance() {
+    let mut h = Harness::new();
+    for _ in 0..30 {
+        let id = h.upgrade(req(Route::HostVersionWs, None, None, false));
+        h.close(id);
+    }
     assert!(
         h.try_upgrade(req(Route::HostVersionWs, None, None, false))
             .is_err()
     );
+    h.advance(59_999);
+    assert!(
+        h.try_upgrade(req(Route::HostVersionWs, None, None, false))
+            .is_err()
+    );
+    h.advance(1);
+    assert!(
+        h.try_upgrade(req(Route::HostVersionWs, None, None, false))
+            .is_ok()
+    );
+}
+
+#[test]
+fn proof_deadline_is_enforced_even_before_tick() {
+    let mut h = Harness::new();
+    let a = identity(1);
+    let (id, challenge) = h.host_hello(&a, Some(TOKEN));
+    let nonce = challenge_nonce(&challenge, id).unwrap();
+    h.now += 10_000;
+    let out = h.text(id, &proof_msg(&a, ORIGIN, &nonce));
+    assert_eq!(closed(&out, id), refused());
+    assert!(h.relay.pcs().records.is_empty());
+}
+
+#[test]
+fn standalone_token_failures_are_limited_without_blocking_registered_host_proofs() {
+    let mut h = Harness::new();
+    let a = identity(1);
+    h.register_host(&a, Some(TOKEN));
+    for _ in 0..5 {
+        let (id, out) = h.host_hello(&a, Some("wrong"));
+        assert_eq!(closed(&out, id), refused());
+        h.close(id);
+    }
+    let (id, out) = h.host_hello(&a, Some(TOKEN));
+    assert_eq!(closed(&out, id), refused());
+    let (_, out) = h.register_host(&a, None);
+    assert!(
+        out.iter()
+            .any(|a| matches!(a, Action::SendText(_, text) if text.contains("hello-ok")))
+    );
+    h.advance(600_000);
+    let (id, out) = h.host_hello(&a, Some(TOKEN));
+    assert!(challenge_nonce(&out, id).is_some());
+}
+
+#[test]
+fn hello_bad_token_consumes_the_same_gate_budget_as_http_failures() {
+    use bp_relay_core::gate::{
+        DEFAULT_AUTH_FAILURE_RATE, DEFAULT_NTFY_RATE, Gate, GateConfig, GateSnapshot,
+    };
+    let mut h = Harness::new();
+    let mut gate = Gate::new(
+        GateConfig {
+            public_origin: ORIGIN.to_owned(),
+            approval_ttl_secs: 90,
+            ntfy: None,
+            ntfy_rate: DEFAULT_NTFY_RATE,
+            auth_failure_rate: DEFAULT_AUTH_FAILURE_RATE,
+        },
+        GateSnapshot::default(),
+        h.now,
+    )
+    .unwrap();
+    // Four HTTP authentication failures leave exactly one WebSocket failure.
+    for _ in 0..4 {
+        gate.record_auth_failure(h.client, h.now);
+    }
+    let id = h.upgrade(req(Route::HostVersionWs, None, None, false));
+    let out = h.relay.on_text_with_gate(
+        id,
+        r#"{"type":"hello","role":"version-probe","token":"wrong"}"#,
+        h.now,
+        &mut h.rng,
+        &mut gate,
+    );
+    assert_eq!(closed(&out, id), refused());
+    assert!(!gate.auth_allowed(h.client, h.now));
+    let id = h.upgrade(req(Route::HostVersionWs, None, None, false));
+    let out = h.relay.on_text_with_gate(
+        id,
+        &json!({"type":"hello","role":"version-probe","token":TOKEN}).to_string(),
+        h.now,
+        &mut h.rng,
+        &mut gate,
+    );
+    assert_eq!(closed(&out, id), refused());
+    h.client = "203.0.113.1".parse().unwrap();
+    let id = h.upgrade(req(Route::HostVersionWs, None, None, false));
+    let out = h.relay.on_text_with_gate(
+        id,
+        &json!({"type":"hello","role":"version-probe","token":TOKEN}).to_string(),
+        h.now,
+        &mut h.rng,
+        &mut gate,
+    );
+    hello_ok(&out, id);
 }
 
 #[test]

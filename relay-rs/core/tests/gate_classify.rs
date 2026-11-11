@@ -23,7 +23,10 @@ fn gate_origin_mismatch_http_is_refused() {
     let mut rng = TestRng::new(1);
     let mut request = req("GET", "/", CLIENT, T0);
     request.origin = Some("https://evil.example");
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -34,7 +37,10 @@ fn gate_origin_mismatch_with_valid_cookie_is_refused() {
     let mut request = req("GET", "/", CLIENT, T0 + 10_000);
     request.origin = Some("https://evil.example");
     request.cookie = Some(&cookie);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -45,7 +51,10 @@ fn gate_origin_match_with_valid_cookie_is_allowed() {
     let mut request = req("GET", "/", CLIENT, T0 + 10_000);
     request.origin = Some(ORIGIN);
     request.cookie = Some(&cookie);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Allow);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Allow
+    );
 }
 
 #[test]
@@ -63,7 +72,7 @@ fn gate_origin_match_page_without_cookie_is_held() {
     let mut rng = TestRng::new(5);
     let mut request = req("GET", "/", CLIENT, T0);
     request.origin = Some(ORIGIN);
-    let (_, effects) = hold_parts(gate.handle(&mut rng, &request));
+    let (_, effects) = hold_parts(navigate_request(&mut gate, &mut rng, &request));
     assert_eq!(effects.len(), 1);
 }
 
@@ -71,7 +80,11 @@ fn gate_origin_match_page_without_cookie_is_held() {
 fn gate_asset_path_without_cookie_is_held_like_a_page() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(6);
-    let (_, effects) = hold_parts(gate.handle(&mut rng, &req("GET", "/app.js", CLIENT, T0)));
+    let (_, effects) = hold_parts(navigate_request(
+        &mut gate,
+        &mut rng,
+        &req("GET", "/app.js", CLIENT, T0),
+    ));
     assert_eq!(effects.len(), 1);
 }
 
@@ -101,7 +114,10 @@ fn gate_valid_cookie_is_found_among_other_cookies() {
     let combined = format!("theme=dark; {cookie}; lang=en");
     let mut request = req("GET", "/", CLIENT, T0 + 10_000);
     request.cookie = Some(&combined);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Allow);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Allow
+    );
 }
 
 #[test]
@@ -127,7 +143,7 @@ fn gate_post_without_cookie_is_403_and_opens_nothing() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(12);
     let request = req("POST", "/pair", CLIENT, T0);
-    let (page, effects) = handled_parts(gate.handle(&mut rng, &request));
+    let (page, effects) = handled_parts(navigate_request(&mut gate, &mut rng, &request));
     assert_eq!(page.status, 403);
     assert!(effects.is_empty());
     assert!(gate.snapshot().records.is_empty());
@@ -139,7 +155,7 @@ fn gate_head_without_cookie_is_dropped_and_opens_nothing() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(13);
     assert_eq!(
-        gate.handle(&mut rng, &req("HEAD", "/", CLIENT, T0)),
+        navigate_request(&mut gate, &mut rng, &req("HEAD", "/", CLIENT, T0)),
         Verdict::Drop
     );
     assert_eq!(gate.pending_ids(T0).len(), 0);
@@ -150,7 +166,10 @@ fn gate_unknown_gate_path_is_refused() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(14);
     let request = req("GET", "/__gate/check", CLIENT, T0);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -158,7 +177,10 @@ fn gate_decision_with_get_is_refused() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(15);
     let request = req("GET", "/__gate/decision", CLIENT, T0);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -166,7 +188,10 @@ fn gate_manage_path_is_allowed_without_cookie_or_origin() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(17);
     let request = req("GET", "/__gate/manage/pcs", CLIENT, T0);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Allow);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Allow
+    );
 }
 
 #[test]
@@ -175,7 +200,10 @@ fn gate_manage_path_with_origin_mismatch_is_refused() {
     let mut rng = TestRng::new(18);
     let mut request = req("GET", "/__gate/manage/pcs", CLIENT, T0);
     request.origin = Some("https://evil.example");
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -185,7 +213,10 @@ fn gate_forget_without_origin_is_refused_even_with_cookie() {
     let cookie = approve_client(&mut gate, &mut rng, CLIENT, T0);
     let mut request = req("POST", "/__gate/forget", CLIENT, T0 + 10_000);
     request.cookie = Some(&cookie);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -195,7 +226,10 @@ fn gate_forget_with_unknown_cookie_is_refused() {
     let mut request = req("POST", "/__gate/forget", CLIENT, T0);
     request.origin = Some(ORIGIN);
     request.cookie = Some(BOGUS_COOKIE);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -203,7 +237,10 @@ fn gate_websocket_with_origin_mismatch_is_refused() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(21);
     let request = ws_request("/ws", Some("https://evil.example"), None);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -211,7 +248,10 @@ fn gate_websocket_with_origin_and_no_cookie_is_refused() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(22);
     let request = ws_request("/ws", Some(ORIGIN), None);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -223,7 +263,10 @@ fn gate_websocket_with_origin_and_valid_cookie_is_allowed() {
         now_ms: T0 + 10_000,
         ..ws_request("/media-ws", Some(ORIGIN), Some(&cookie))
     };
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Allow);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Allow
+    );
 }
 
 #[test]
@@ -235,7 +278,10 @@ fn gate_websocket_with_origin_and_expired_cookie_is_refused() {
         now_ms: T0 + 2_000 + COOKIE_MS,
         ..ws_request("/file-ws", Some(ORIGIN), Some(&cookie))
     };
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]
@@ -243,7 +289,10 @@ fn gate_websocket_without_origin_is_allowed_without_cookie() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(25);
     let request = ws_request("/ws", None, None);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Allow);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Allow
+    );
 }
 
 #[test]
@@ -251,7 +300,10 @@ fn gate_websocket_under_gate_path_is_refused() {
     let mut gate = new_gate();
     let mut rng = TestRng::new(26);
     let request = ws_request("/__gate/decision", None, None);
-    assert_eq!(gate.handle(&mut rng, &request), Verdict::Refuse);
+    assert_eq!(
+        navigate_request(&mut gate, &mut rng, &request),
+        Verdict::Refuse
+    );
 }
 
 #[test]

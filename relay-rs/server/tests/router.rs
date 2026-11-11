@@ -51,6 +51,10 @@ fn site() -> Site {
 /// The router over `assets`, with state files in a sibling `state/` directory and a gate cookie
 /// that every request carries.
 fn app(assets: &Path) -> Router {
+    app_with_proxies(assets, Vec::new())
+}
+
+fn app_with_proxies(assets: &Path, trusted_proxy_cidrs: Vec<ipnet::IpNet>) -> Router {
     let state_dir = assets.parent().unwrap().join("state");
     fs::create_dir_all(&state_dir).unwrap();
     let cookie = URL_SAFE_NO_PAD.encode(cookie_hash("testcookie"));
@@ -67,10 +71,18 @@ fn app(assets: &Path) -> Router {
         token: Secret::new("tok-test"),
         admin_token: Secret::new(ADMIN),
         max_connections: 32,
+        max_unauthenticated_connections: 16,
+        max_unauthenticated_per_prefix: 4,
+        upgrade_rate_per_prefix: 30,
+        ntfy_publish_limit: 10,
+        ntfy_publish_window_s: 600,
+        auth_failure_limit: 5,
+        auth_failure_window_s: 600,
+
         turn: None,
         ntfy: None,
         approval_ttl_s: 90,
-        trusted_proxy_cidrs: Vec::new(),
+        trusted_proxy_cidrs,
         gate_hold_ms: GATE_HOLD_MS,
     };
     router(Arc::new(Shared::new(&cfg).unwrap()))
@@ -468,4 +480,83 @@ async fn presence_foreign_origin_and_other_methods_keep_gate_answers() {
     assert_eq!(send(router.clone(), req).await.status(), StatusCode::OK);
     let response = send(router.clone(), cookieless("POST", &uri, "203.0.113.9:5000")).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn healthz_trusted_loopback_proxy_requires_bearer() {
+    let site = site();
+    let app = app_with_proxies(&site.assets, vec!["127.0.0.0/8".parse().unwrap()]);
+    let req = request("GET", "/healthz", "127.0.0.1:5000");
+    assert_eq!(send(app.clone(), req).await.status(), StatusCode::NOT_FOUND);
+    let req = with_header(
+        request("GET", "/healthz", "127.0.0.1:5000"),
+        "authorization",
+        &format!("Bearer {ADMIN}"),
+    );
+    assert_eq!(send(app, req).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_and_healthz_share_five_failure_prefix_lockout() {
+    let site = site();
+    let app = app(&site.assets);
+    for i in 0..5 {
+        let path = if i % 2 == 0 {
+            "/__gate/manage/pcs"
+        } else {
+            "/healthz"
+        };
+        let req = with_header(
+            request("GET", path, "203.0.113.9:5000"),
+            "authorization",
+            "Bearer wrong",
+        );
+        assert_eq!(send(app.clone(), req).await.status(), StatusCode::NOT_FOUND);
+    }
+    for path in ["/healthz", "/__gate/manage/pcs"] {
+        let req = with_header(
+            request("GET", path, "203.0.113.250:5000"),
+            "authorization",
+            &format!("Bearer {ADMIN}"),
+        );
+        assert_eq!(send(app.clone(), req).await.status(), StatusCode::NOT_FOUND);
+        let req = with_header(
+            request("GET", path, "198.51.100.9:5000"),
+            "authorization",
+            &format!("Bearer {ADMIN}"),
+        );
+        assert_eq!(send(app.clone(), req).await.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn assets_carry_csp_with_inline_hash_and_frame_denial() {
+    let site = site();
+    let inline = "console.log('bootstrap')";
+    fs::write(
+        site.assets.join("index.html"),
+        format!("<script>{inline}</script>"),
+    )
+    .unwrap();
+    let response = get(&site, "/").await;
+    let policy = response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap();
+    use sha2::{Digest, Sha256};
+    let hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(inline.as_bytes()));
+    assert!(policy.contains(&format!("'sha256-{hash}'")));
+    for directive in [
+        "default-src 'self'",
+        "frame-ancestors 'none'",
+        "worker-src 'self' blob:",
+        "'wasm-unsafe-eval'",
+    ] {
+        assert!(policy.contains(directive), "{policy}");
+    }
+    assert_eq!(response.headers()["x-frame-options"], "DENY");
+    let head = send(app(&site.assets), request("HEAD", "/", "127.0.0.1:5000")).await;
+    assert_eq!(
+        head.headers()["content-security-policy"],
+        response.headers()["content-security-policy"]
+    );
 }

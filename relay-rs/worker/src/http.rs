@@ -3,6 +3,8 @@
 //! bearer check, the gate's response mapping, the JSON admin responses and the security headers.
 
 use bp_relay_core::gate::Response as GateResponse;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use worker::js_sys::{Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
@@ -73,15 +75,7 @@ pub fn bearer_matches(authorization: Option<&str>, expected: &str) -> bool {
     let Some(presented) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
         return false;
     };
-    let (presented, expected) = (presented.as_bytes(), expected.as_bytes());
-    if presented.len() != expected.len() {
-        return false;
-    }
-    presented
-        .iter()
-        .zip(expected)
-        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
+    bool::from(Sha256::digest(presented.as_bytes()).ct_eq(&Sha256::digest(expected.as_bytes())))
 }
 
 /// `200 ok` for healthz. HEAD gets the same headers and no body.
@@ -150,6 +144,9 @@ pub fn status(code: u16) -> Result<Response> {
 /// none: native does add them there, which is a known difference.
 pub fn finish(mut response: Response) -> Result<Response> {
     if response.status_code() != 101 {
+        if response.headers().get("Content-Security-Policy")?.is_none() {
+            crate::assets::security_headers(&mut response, None)?;
+        }
         let headers = response.headers_mut();
         headers.set("X-Content-Type-Options", "nosniff")?;
         headers.set("Referrer-Policy", "no-referrer")?;

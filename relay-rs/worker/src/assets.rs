@@ -10,7 +10,33 @@
 //! - `/index.html`, when the file exists, is a 301 to `./` (keeping the query), as native does;
 //! - `Cache-Control: no-store` on every served file.
 
+use base64::{Engine, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
 use worker::{Env, Method, RequestInit, Response, Result, Url};
+
+/// The viewer needs inline styles, same-origin module workers and WebAssembly for Argon2.
+/// Inline scripts are admitted only by their response-specific content hashes.
+pub fn security_headers(response: &mut Response, html: Option<&str>) -> Result<()> {
+    let mut script = "script-src 'self' 'wasm-unsafe-eval'".to_owned();
+    if let Some(html) = html {
+        // HTML parsers normalize line endings before checking script hashes. The public page
+        // uses plain <script> for its inline bootstrap and src attributes for external scripts.
+        let normalized = html.replace("\r\n", "\n").replace('\r', "\n");
+        for tail in normalized.split("<script>").skip(1) {
+            if let Some((source, _)) = tail.split_once("</script>") {
+                let hash = STANDARD.encode(Sha256::digest(source.as_bytes()));
+                script.push_str(&format!(" 'sha256-{hash}'"));
+            }
+        }
+    }
+    let policy = format!(
+        "default-src 'self'; {script}; connect-src 'self' wss: https:; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    );
+    let headers = response.headers_mut();
+    headers.set("Content-Security-Policy", &policy)?;
+    headers.set("X-Frame-Options", "DENY")?;
+    Ok(())
+}
 
 /// What to ask the binding for.
 pub enum Plan {
@@ -65,7 +91,8 @@ pub async fn serve(env: &Env, url: &Url, head: bool, path: &str, index: bool) ->
     let mut target = url.clone();
     target.set_path(path);
     let mut init = RequestInit::new();
-    init.with_method(if head { Method::Head } else { Method::Get });
+    // Read the same representation for HEAD so its CSP hashes equal GET's hashes.
+    init.with_method(Method::Get);
     let mut asset = assets.fetch(target.as_str(), Some(init)).await?;
     let status = asset.status_code();
     if status != 200 {
@@ -73,18 +100,20 @@ pub async fn serve(env: &Env, url: &Url, head: bool, path: &str, index: bool) ->
         if let Some(location) = asset.headers().get("Location")? {
             out.headers_mut().set("Location", &location)?;
         }
+        security_headers(&mut out, None)?;
         return Ok(out);
     }
     if index {
         return redirect_to_dot_slash(url.query());
     }
-    let body = if head {
-        Vec::new()
-    } else {
-        asset.bytes().await?
-    };
+    let body = asset.bytes().await?;
     let content_type = asset.headers().get("Content-Type")?;
-    let mut out = if body.is_empty() {
+    let html = content_type
+        .as_deref()
+        .filter(|value| value.starts_with("text/html"))
+        .and_then(|_| std::str::from_utf8(&body).ok())
+        .map(str::to_owned);
+    let mut out = if head || body.is_empty() {
         Response::empty()?
     } else {
         Response::from_bytes(body)?
@@ -94,6 +123,7 @@ pub async fn serve(env: &Env, url: &Url, head: bool, path: &str, index: bool) ->
         headers.set("Content-Type", &content_type)?;
     }
     headers.set("Cache-Control", "no-store")?;
+    security_headers(&mut out, html.as_deref())?;
     Ok(out)
 }
 
@@ -104,6 +134,7 @@ fn redirect_to_dot_slash(query: Option<&str>) -> Result<Response> {
     };
     let mut out = Response::empty()?.with_status(301);
     out.headers_mut().set("Location", &location)?;
+    security_headers(&mut out, None)?;
     Ok(out)
 }
 

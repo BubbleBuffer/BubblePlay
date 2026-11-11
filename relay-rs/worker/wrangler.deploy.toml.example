@@ -9,6 +9,7 @@
 #   npx wrangler@4.148.0 delete -c wrangler.deploy.toml
 #
 # Secrets are not in this file. Set each with wrangler, which then prompts for the value:
+# RELAY_TOKEN and ADMIN_TOKEN require at least 32 characters; generate each with openssl rand -hex 32.
 #   npx wrangler@4.148.0 secret put RELAY_TOKEN -c wrangler.deploy.toml    # registration token, required
 #   npx wrangler@4.148.0 secret put ADMIN_TOKEN -c wrangler.deploy.toml    # admin bearer token, required
 #   npx wrangler@4.148.0 secret put TURN_SECRET -c wrangler.deploy.toml    # needed when TURN_HOST is set, 32 bytes or more
@@ -81,8 +82,18 @@ NTFY_URL = "https://ntfy.example.com"
 NTFY_TOPIC = "replace-with-your-topic"
 # Approval window in seconds, 30 to 120.
 APPROVAL_TTL_S = "90"
-# At least 1.
+# Authenticated socket cap. Every cap, rate limit and window below must be positive.
 MAX_CONNECTIONS = "32"
+MAX_UNAUTHENTICATED_CONNECTIONS = "16"
+MAX_UNAUTHENTICATED_PER_PREFIX = "4"
+# Upgrade attempts per client prefix per minute.
+UPGRADE_RATE_PER_PREFIX = "30"
+# Relay-wide approval prompt budget; exhausted navigations are dropped without publishing.
+NTFY_PUBLISH_LIMIT = "10"
+NTFY_PUBLISH_WINDOW_S = "600"
+# Shared per-prefix allowance for invalid health/admin/decision/registration/probe bearers.
+AUTH_FAILURE_LIMIT = "5"
+AUTH_FAILURE_WINDOW_S = "600"
 
 # Static files from the JS Worker's public directory, the same block as wrangler.toml. Relative to this file.
 [assets]

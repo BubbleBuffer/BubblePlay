@@ -73,6 +73,7 @@ async fn presence_never_pushes_ntfy_holds_or_sets_cookies() {
     assert!(env.ntfy.lock().unwrap().is_empty(), "presence pushed ntfy");
     // A real navigation from the same client still opens an approval: no cooldown or pending
     // was created by the presence queries.
+    bootstrap_navigation(&server, "/").await;
     let navigation = tokio::spawn(navigate(&server, "/").send());
     let published = env.wait_for_ntfy().await;
     assert!(published["actions"].is_array());

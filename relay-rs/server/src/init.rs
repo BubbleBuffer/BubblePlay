@@ -64,10 +64,16 @@ mod tests {
 
     #[test]
     fn example_text_is_a_valid_relay_config() {
-        let text = example_config_text("tok-example", "adm-example");
+        let text = example_config_text(
+            "tok-example-padding-to-32-characters",
+            "adm-example-padding-to-32-characters",
+        );
         let cfg = parse_config(&text, &|_: &str| None).expect("example parses");
-        assert_eq!(cfg.token.expose(), "tok-example");
-        assert_eq!(cfg.admin_token.expose(), "adm-example");
+        assert_eq!(cfg.token.expose(), "tok-example-padding-to-32-characters");
+        assert_eq!(
+            cfg.admin_token.expose(),
+            "adm-example-padding-to-32-characters"
+        );
     }
 
     #[test]

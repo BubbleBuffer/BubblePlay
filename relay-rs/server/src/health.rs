@@ -27,13 +27,22 @@ pub fn healthz_address(listen: SocketAddr) -> SocketAddr {
 
 /// Requests `/healthz` and accepts only `200` with the body `ok`.
 pub fn probe(address: SocketAddr) -> Result<(), String> {
+    probe_with_token(address, None)
+}
+
+fn probe_with_token(address: SocketAddr, token: Option<&str>) -> Result<(), String> {
     let mut stream = TcpStream::connect_timeout(&address, PROBE_TIMEOUT)
         .map_err(|_| format!("cannot connect to {address}"))?;
     stream
         .set_read_timeout(Some(PROBE_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(PROBE_TIMEOUT)))
         .map_err(|_| "cannot set probe timeouts".to_string())?;
-    let request = format!("GET /healthz HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    let authorization = token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET /healthz HTTP/1.1\r\nHost: {address}\r\n{authorization}Connection: close\r\n\r\n"
+    );
     stream
         .write_all(request.as_bytes())
         .map_err(|_| "cannot send the probe request".to_string())?;
@@ -58,7 +67,7 @@ pub fn probe(address: SocketAddr) -> Result<(), String> {
 /// Loads the config and probes its listen address.
 pub fn healthcheck(config_path: &Path) -> Result<(), String> {
     let cfg = load_config(config_path).map_err(|e| e.to_string())?;
-    probe(healthz_address(cfg.listen))
+    probe_with_token(healthz_address(cfg.listen), Some(cfg.admin_token.expose()))
 }
 
 #[cfg(test)]

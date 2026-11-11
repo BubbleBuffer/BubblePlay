@@ -57,12 +57,13 @@ async fn session(server: &Server, env: &Env, seed: u8) -> Session {
     }
 }
 
-/// A navigation without a cookie gets nothing while it waits: ntfy gets the prefix only, and the
+/// After the bootstrap redirect sets a waiting cookie, the browser is held: ntfy gets the prefix, and the
 /// approval answers the same held request with a 302 to the URL it asked for (query included).
 #[tokio::test]
 async fn e2e_held_navigation_is_admitted_by_an_approval_within_the_hold() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
+    bootstrap_navigation(&server, "/pair?x=1").await;
     let held = tokio::spawn(navigate(&server, "/pair?x=1").send());
 
     let ntfy = env.wait_for_ntfy().await;
@@ -104,7 +105,8 @@ async fn e2e_held_navigation_is_admitted_by_an_approval_within_the_hold() {
 async fn e2e_held_navigation_is_dropped_without_content_when_the_hold_ends() {
     let env = Env::new().await;
     let server = Server::start_with_hold(&env, None, 700).await;
-    let (received, took) = raw_navigation(server.addr, "/").await;
+    bootstrap_navigation(&server, "/").await;
+    let (received, took) = raw_navigation(server.addr, "/", waiting_cookie(&server)).await;
     assert!(
         received.is_empty(),
         "a dropped navigation gets no bytes, got {:?}",
@@ -123,8 +125,10 @@ async fn e2e_held_navigation_is_dropped_without_content_when_the_hold_ends() {
 async fn e2e_denied_navigation_is_dropped_without_content() {
     let env = Env::new().await;
     let server = Server::start(&env, None).await;
+    bootstrap_navigation(&server, "/").await;
     let addr = server.addr;
-    let held = tokio::spawn(async move { raw_navigation(addr, "/").await });
+    let wait = waiting_cookie(&server);
+    let held = tokio::spawn(async move { raw_navigation(addr, "/", wait).await });
     let ntfy = env.wait_for_ntfy().await;
     decide(&server, &ntfy_bearer(&ntfy, 1), "deny").await;
     let (received, took) = tokio::time::timeout(WAIT, held)
@@ -134,7 +138,7 @@ async fn e2e_denied_navigation_is_dropped_without_content() {
     assert!(received.is_empty(), "a denied navigation gets no bytes");
     assert!(took < std::time::Duration::from_secs(10));
 
-    let (again, _) = raw_navigation(server.addr, "/").await;
+    let (again, _) = raw_navigation(server.addr, "/", waiting_cookie(&server)).await;
     assert!(again.is_empty(), "a cooling prefix is dropped");
     assert_eq!(
         env.ntfy.lock().unwrap().len(),
@@ -143,17 +147,38 @@ async fn e2e_denied_navigation_is_dropped_without_content() {
     );
 }
 
-/// An approval that lands after the hold ended is claimed by the next navigation from the prefix,
+/// An approval that lands after the hold ended is claimed by the same browser cookie and prefix,
 /// once: the reload gets the 302 with the cookie, and the one after it is dropped again.
 #[tokio::test]
 async fn e2e_approval_after_the_hold_is_claimed_once_by_the_next_navigation() {
     let env = Env::new().await;
     let server = Server::start_with_hold(&env, None, 300).await;
-    let (received, _) = raw_navigation(server.addr, "/").await;
+    bootstrap_navigation(&server, "/").await;
+    let (received, _) = raw_navigation(server.addr, "/", waiting_cookie(&server)).await;
     assert!(received.is_empty());
     let ntfy = env.wait_for_ntfy().await;
     decide(&server, &ntfy_bearer(&ntfy, 0), "approve").await;
 
+    // Another browser in the same client prefix cannot steal this approval.
+    for cookie in [
+        None,
+        Some("__Host-bp_wait=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    ] {
+        let mut thief = http()
+            .get(format!("{}/", base(server.addr)))
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Dest", "document");
+        if let Some(cookie) = cookie {
+            thief = thief.header("Cookie", cookie);
+        }
+        assert!(
+            tokio::time::timeout(WAIT, thief.send())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(env.ntfy.lock().unwrap().len(), 1);
     let reload = navigate(&server, "/").send().await.unwrap();
     assert_eq!(reload.status(), 302);
     assert!(
@@ -161,7 +186,7 @@ async fn e2e_approval_after_the_hold_is_claimed_once_by_the_next_navigation() {
         "the reload claims the cookie"
     );
 
-    let (again, _) = raw_navigation(server.addr, "/").await;
+    let (again, _) = raw_navigation(server.addr, "/", waiting_cookie(&server)).await;
     assert!(again.is_empty(), "the approval is claimed only once");
 }
 
@@ -182,9 +207,7 @@ async fn e2e_approval_grants_cookie_and_asset_access() {
     assert_eq!(with_cookie.status(), 200);
     assert_eq!(with_cookie.text().await.unwrap(), "home");
 
-    // A non-navigation request without the cookie gets the plain 403, and is not held. The
-    // gate treats a request with no Sec-Fetch-Dest as a navigation, so this one states that it is
-    // a subresource fetch.
+    // A subresource request without the gate cookie is answered 403 at once.
     let bare = client
         .get(format!("{}/", base(server.addr)))
         .header("Sec-Fetch-Dest", "empty")
@@ -724,4 +747,28 @@ async fn e2e_signal_viewer_takes_ws_and_the_old_name_is_refused() {
     .unwrap();
     let ok = viewer_join_as(&mut ws, "viewer", &viewer_identity(), false, None).await;
     assert!(ok["mediaEpoch"].is_string(), "viewer takes /ws");
+}
+
+#[tokio::test]
+async fn e2e_missing_navigation_fetch_metadata_is_403_without_ntfy() {
+    let env = Env::new().await;
+    let server = Server::start(&env, None).await;
+    for (mode, dest) in [
+        (None, None),
+        (Some("navigate"), None),
+        (None, Some("document")),
+    ] {
+        let mut request = http().get(format!("{}/", base(server.addr)));
+        if let Some(mode) = mode {
+            request = request.header("Sec-Fetch-Mode", mode);
+        }
+        if let Some(dest) = dest {
+            request = request.header("Sec-Fetch-Dest", dest);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 403);
+        assert!(response.headers().get("set-cookie").is_none());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(env.ntfy.lock().unwrap().is_empty());
 }

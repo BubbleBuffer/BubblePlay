@@ -73,12 +73,26 @@ impl crate::Relay {
 
         if path == "/healthz" && (method == Method::Get || method == Method::Head) {
             let allowed = {
-                let guard = self.live.borrow();
-                let Some(live) = guard.as_ref() else {
+                let mut guard = self.live.borrow_mut();
+                let Some(live) = guard.as_mut() else {
                     return server_error();
                 };
-                http::host_allowed(host.as_deref(), &live.public_host)
-                    && http::bearer_matches(authorization.as_deref(), &live.admin_token)
+                // Platform requests carry a client address. Local health probes may omit it;
+                // they still require the admin bearer, and never create an auth-limit entry.
+                let client = client_ip(&req);
+                let now = now_ms();
+                if !http::host_allowed(host.as_deref(), &live.public_host)
+                    || !client.is_none_or(|client| live.gate.auth_allowed(client, now))
+                {
+                    false
+                } else if http::bearer_matches(authorization.as_deref(), &live.admin_token) {
+                    true
+                } else {
+                    if let Some(client) = client {
+                        live.gate.record_auth_failure(client, now);
+                    }
+                    false
+                }
             };
             return if allowed {
                 http::healthz(method == Method::Head)
@@ -96,6 +110,7 @@ impl crate::Relay {
         let origin = headers.get("Origin")?;
         let cookie = headers.get("Cookie")?;
         let sec_fetch_dest = headers.get("Sec-Fetch-Dest")?;
+        let sec_fetch_mode = headers.get("Sec-Fetch-Mode")?;
         let websocket = headers
             .get("Upgrade")?
             .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
@@ -108,6 +123,7 @@ impl crate::Relay {
             cookie: cookie.as_deref(),
             authorization: authorization.as_deref(),
             sec_fetch_dest: sec_fetch_dest.as_deref(),
+            sec_fetch_mode: sec_fetch_mode.as_deref(),
             body: &body,
             client_ip: client,
             now_ms: now_ms(),
@@ -130,7 +146,7 @@ impl crate::Relay {
                     && origin.as_deref() == Some(public_origin.as_str())
                     && route_for_path(&path).is_some();
                 return if browser_socket {
-                    refused_socket(&self.state)
+                    self.refuse_socket(&path, &url, client).await
                 } else {
                     not_found()
                 };
@@ -167,7 +183,9 @@ impl crate::Relay {
             return http::gate_response(response);
         }
         if path.starts_with("/__gate/manage/") {
-            return self.admin(&method, &path, authorization.as_deref()).await;
+            return self
+                .admin(&method, &path, authorization.as_deref(), client)
+                .await;
         }
         if websocket {
             return self.accept_socket(&path, &url, client).await;
@@ -259,19 +277,64 @@ impl crate::Relay {
         Response::from_websocket(pair.client)
     }
 
+    /// Even a socket immediately closed by the site gate must reserve its preauth slot and
+    /// consume an upgrade attempt before the platform accepts it.
+    async fn refuse_socket(&self, path: &str, url: &Url, client: IpAddr) -> Result<Response> {
+        let Some(route) = route_for_path(path) else {
+            return not_found();
+        };
+        let (pc, epoch) = query_values(url);
+        let accepted = {
+            let mut guard = self.live.borrow_mut();
+            let Some(live) = guard.as_mut() else {
+                return server_error();
+            };
+            live.core.upgrade(
+                UpgradeRequest {
+                    route,
+                    pc,
+                    epoch,
+                    // This reservation never receives a hello: the gate refusal below closes
+                    // it immediately. It grants no viewer admission or session capability.
+                    viewer_authorized: true,
+                },
+                client,
+                now_ms(),
+            )
+        };
+        let Ok(id) = accepted else {
+            return not_found();
+        };
+        let response = refused_socket(&self.state);
+        // Release even when WebSocket creation or close failed. No socket/snapshot is retained.
+        let actions = self.forget(id);
+        self.run_sync(actions);
+        self.rearm().await?;
+        response
+    }
+
     /// The admin API, behind the admin bearer. A wrong bearer, route or id is 404, as native.
     async fn admin(
         &self,
         method: &Method,
         path: &str,
         authorization: Option<&str>,
+        client: IpAddr,
     ) -> Result<Response> {
         let allowed = {
-            let guard = self.live.borrow();
-            let Some(live) = guard.as_ref() else {
+            let mut guard = self.live.borrow_mut();
+            let Some(live) = guard.as_mut() else {
                 return server_error();
             };
-            http::bearer_matches(authorization, &live.admin_token)
+            let now = now_ms();
+            if !live.gate.auth_allowed(client, now) {
+                false
+            } else if http::bearer_matches(authorization, &live.admin_token) {
+                true
+            } else {
+                live.gate.record_auth_failure(client, now);
+                false
+            }
         };
         if !allowed {
             return not_found();
@@ -357,11 +420,30 @@ impl crate::Relay {
                 return Ok(());
             }
             let now = now_ms();
-            match message {
-                WebSocketIncomingMessage::String(text) => {
-                    live.core.on_text(id, &text, now, &mut WebCrypto)
+            // Cloudflare materializes the full event before this callback; its hibernation API
+            // has no configurable receive cap. Reject before the core parses or forwards it.
+            let size = match &message {
+                WebSocketIncomingMessage::String(text) => text.len(),
+                WebSocketIncomingMessage::Binary(bytes) => bytes.len(),
+            };
+            if live.core.read_limit(id).is_some_and(|limit| size > limit) {
+                bp_relay_core::log::emit(
+                    bp_relay_core::log::Level::Warn,
+                    now,
+                    "relay",
+                    "socket closed",
+                    None,
+                    json!({"class": "packet.too-large", "status": 1009, "reason": "message too large"}),
+                );
+                vec![Action::Close(id, 1009, "message too large".to_owned())]
+            } else {
+                match message {
+                    WebSocketIncomingMessage::String(text) => {
+                        live.core
+                            .on_text_with_gate(id, &text, now, &mut WebCrypto, &mut live.gate)
+                    }
+                    WebSocketIncomingMessage::Binary(bytes) => live.core.on_binary(id, &bytes, now),
                 }
-                WebSocketIncomingMessage::Binary(bytes) => live.core.on_binary(id, &bytes, now),
             }
         };
         // apply closes the origin itself when a write fails, so the result needs no handling.

@@ -3,13 +3,14 @@
 //! The gate sits in front of every browser-facing HTTP path and every WebSocket
 //! upgrade that carries an `Origin`. Every gated HTTP path needs a valid
 //! `__Host-gate` cookie. Without one, only a top-level navigation (a GET with
-//! `Sec-Fetch-Dest: document`, or with no `Sec-Fetch-Dest`) may open an
-//! approval. It gets no page: a pending approval is published to ntfy with
+//! `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`) may open an
+//! approval. A same-URL redirect sets a browser-bound waiting cookie, then a
+//! pending approval is published to ntfy with
 //! Approve and Deny actions and the adapter holds the request open for up to
 //! [`GATE_HOLD_MS`] ([`Verdict::Hold`]), asking [`Gate::check_hold`] whether it
 //! may go on. An approval inside the hold answers the held request with a 302
 //! to the same URL and the gate cookie. An approval that lands after the hold
-//! ended is claimed by the next navigation from the same client prefix, once.
+//! ended is claimed once by a navigation with the waiting cookie and prefix.
 //! Every other outcome (timeout, deny, cooldown, capacity, no approval path)
 //! is [`Verdict::Drop`]: the adapter ends the connection with no content. Any
 //! other gated request without a cookie gets a plain 403 and opens nothing;
@@ -38,6 +39,8 @@ use crate::rng::RelayRng;
 /// Name of the gate cookie. The `__Host-` prefix forces Secure and Path=/.
 pub const COOKIE_NAME: &str = "__Host-gate";
 const COOKIE_PREFIX: &str = "__Host-gate=";
+pub const WAIT_COOKIE_NAME: &str = "__Host-bp_wait";
+const WAIT_COOKIE_PREFIX: &str = "__Host-bp_wait=";
 /// Lifetime of the cookie and of its server record, fixed at approval.
 pub const COOKIE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const COOKIE_LIFETIME_MS: u64 = COOKIE_MAX_AGE_SECS * 1000;
@@ -59,6 +62,21 @@ pub const DECISION_WINDOW_MS: u64 = 60_000;
 /// pending list. A new prefix arriving at a full map is answered 429 after
 /// expired entries are pruned.
 pub const MAX_TRACKED_PREFIXES: usize = 4096;
+/// An in-memory fixed window. Both values must be positive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RateLimit {
+    pub limit: u32,
+    pub window_ms: u64,
+}
+
+pub const DEFAULT_NTFY_RATE: RateLimit = RateLimit {
+    limit: 10,
+    window_ms: 600_000,
+};
+pub const DEFAULT_AUTH_FAILURE_RATE: RateLimit = RateLimit {
+    limit: 5,
+    window_ms: 600_000,
+};
 const DECISION_PATH: &str = "/__gate/decision";
 const FORGET_PATH: &str = "/__gate/forget";
 const GATE_PREFIX: &str = "/__gate/";
@@ -93,6 +111,8 @@ pub struct GateConfig {
     pub public_origin: String,
     pub approval_ttl_secs: u64,
     pub ntfy: Option<NtfyConfig>,
+    pub ntfy_rate: RateLimit,
+    pub auth_failure_rate: RateLimit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +121,7 @@ pub enum ConfigError {
     /// `public_origin` is not a canonical bare origin.
     NonCanonicalPublicOrigin,
     ApprovalTtlOutOfRange(u64),
+    InvalidRateLimit(&'static str),
 }
 
 /// One persisted cookie record. Only the SHA-256 of the cookie value is kept.
@@ -182,8 +203,9 @@ pub struct Request<'a> {
     pub cookie: Option<&'a str>,
     /// The raw `Authorization` header.
     pub authorization: Option<&'a str>,
-    /// The raw `Sec-Fetch-Dest` header. Only `document` (or no header at all)
-    /// on a GET is a top-level navigation that may open an approval.
+    /// The raw Fetch Metadata headers. A GET needs both `navigate` mode and
+    /// `document` destination to open or claim an approval.
+    pub sec_fetch_mode: Option<&'a str>,
     pub sec_fetch_dest: Option<&'a str>,
     pub body: &'a [u8],
     /// The client address, already resolved by the adapter.
@@ -202,6 +224,7 @@ impl fmt::Debug for Request<'_> {
             .field("origin", &self.origin)
             .field("cookie", &self.cookie.map(|_| "<redacted>"))
             .field("authorization", &self.authorization.map(|_| "<redacted>"))
+            .field("sec_fetch_mode", &self.sec_fetch_mode)
             .field("sec_fetch_dest", &self.sec_fetch_dest)
             .field("body", &format_args!("<{} bytes>", self.body.len()))
             .field("client_ip", &self.client_ip)
@@ -234,6 +257,8 @@ pub enum Verdict {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hold {
     pending: String,
+    prefix: Prefix,
+    wait_hash: [u8; 32],
     location: String,
     until_ms: u64,
 }
@@ -316,6 +341,7 @@ enum State {
 struct Pending {
     id: String,
     prefix: Prefix,
+    wait_hash: [u8; 32],
     approve_hash: Option<[u8; 32]>,
     deny_hash: Option<[u8; 32]>,
     expires_ms: u64,
@@ -333,6 +359,8 @@ pub struct Gate {
     pending: Vec<Pending>,
     cooldowns: BTreeMap<Prefix, u64>,
     decision_rates: BTreeMap<Prefix, (u64, u32)>,
+    auth_failures: BTreeMap<Prefix, (u64, u32)>,
+    ntfy_rate: Option<(u64, u32)>,
 }
 
 impl Gate {
@@ -343,6 +371,14 @@ impl Gate {
         persisted: GateSnapshot,
         now_ms: u64,
     ) -> Result<Self, ConfigError> {
+        for (name, rate) in [
+            ("ntfy_rate", config.ntfy_rate),
+            ("auth_failure_rate", config.auth_failure_rate),
+        ] {
+            if rate.limit == 0 || rate.window_ms == 0 {
+                return Err(ConfigError::InvalidRateLimit(name));
+            }
+        }
         if !(MIN_APPROVAL_TTL_SECS..=MAX_APPROVAL_TTL_SECS).contains(&config.approval_ttl_secs) {
             return Err(ConfigError::ApprovalTtlOutOfRange(config.approval_ttl_secs));
         }
@@ -381,6 +417,8 @@ impl Gate {
             pending: Vec::new(),
             cooldowns: BTreeMap::new(),
             decision_rates: BTreeMap::new(),
+            auth_failures: BTreeMap::new(),
+            ntfy_rate: None,
         })
     }
 
@@ -388,6 +426,37 @@ impl Gate {
     /// `1..=GATE_HOLD_MS`, so the hold can never be made longer.
     pub fn set_hold_ms(&mut self, hold_ms: u64) {
         self.hold_ms = hold_ms.clamp(1, GATE_HOLD_MS);
+    }
+
+    /// Check the shared failure budget before checking a registration, admin
+    /// or health bearer. Successful authentication never resets this budget.
+    pub fn auth_allowed(&mut self, client_ip: IpAddr, now_ms: u64) -> bool {
+        self.auth_prefix_allowed(Prefix::of(client_ip), now_ms)
+    }
+
+    pub fn auth_prefix_allowed(&mut self, prefix: Prefix, now_ms: u64) -> bool {
+        self.sweep(now_ms);
+        match self.auth_failures.get(&prefix) {
+            Some((_, count)) => *count < self.config.auth_failure_rate.limit,
+            None => self.auth_failures.len() < MAX_TRACKED_PREFIXES,
+        }
+    }
+
+    /// Record only an actual failed credential check, sharing the same prefix
+    /// budget across every authentication surface on this relay.
+    pub fn record_auth_failure(&mut self, client_ip: IpAddr, now_ms: u64) {
+        self.record_auth_prefix_failure(Prefix::of(client_ip), now_ms);
+    }
+
+    pub fn record_auth_prefix_failure(&mut self, prefix: Prefix, now_ms: u64) {
+        self.sweep(now_ms);
+        if !self.auth_failures.contains_key(&prefix)
+            && self.auth_failures.len() >= MAX_TRACKED_PREFIXES
+        {
+            return;
+        }
+        let entry = self.auth_failures.entry(prefix).or_insert((now_ms, 0));
+        entry.1 = entry.1.saturating_add(1);
     }
 
     /// The cookie records to persist. Pending approvals are not included.
@@ -432,7 +501,20 @@ impl Gate {
             .decision_rates
             .values()
             .map(|(start, _)| start.saturating_add(DECISION_WINDOW_MS));
-        pending.chain(cookies).chain(cooldowns).chain(rates).min()
+        let failures = self
+            .auth_failures
+            .values()
+            .map(|(start, _)| start.saturating_add(self.config.auth_failure_rate.window_ms));
+        let publishes = self
+            .ntfy_rate
+            .map(|(start, _)| start.saturating_add(self.config.ntfy_rate.window_ms));
+        pending
+            .chain(cookies)
+            .chain(cooldowns)
+            .chain(rates)
+            .chain(failures)
+            .chain(publishes)
+            .min()
     }
 
     /// The ids of the approvals still waiting for a decision.
@@ -487,7 +569,7 @@ impl Gate {
         if req.method == "HEAD" {
             return Verdict::Drop;
         }
-        if req.method == "GET" && is_navigation(req.sec_fetch_dest) {
+        if req.method == "GET" && is_navigation(req.sec_fetch_mode, req.sec_fetch_dest) {
             self.navigate(rng, req)
         } else {
             Verdict::Handled(forbidden(), Vec::new())
@@ -500,11 +582,11 @@ impl Gate {
     /// see it gets the cookie, and the entry is removed.
     pub fn check_hold(&mut self, rng: &mut dyn RelayRng, hold: &Hold, now_ms: u64) -> HoldCheck {
         self.sweep(now_ms);
-        let Some(index) = self
-            .pending
-            .iter()
-            .position(|pending| pending.id == hold.pending)
-        else {
+        let Some(index) = self.pending.iter().position(|pending| {
+            pending.id == hold.pending
+                && pending.prefix == hold.prefix
+                && hashes_equal(&pending.wait_hash, &hold.wait_hash)
+        }) else {
             return HoldCheck::Drop;
         };
         match self.pending[index].state {
@@ -631,34 +713,42 @@ impl Gate {
         )
     }
 
-    /// A top-level navigation without a cookie. It claims an approval its
-    /// prefix already has, joins its prefix's waiting approval, or opens and
-    /// publishes a new one. Anything else is dropped.
+    /// A navigation must present the pending browser secret as well as its
+    /// prefix to join or claim an approval. The first response sets that
+    /// secret in a same-URL redirect, before a follow-up request can be held.
     fn navigate(&mut self, rng: &mut dyn RelayRng, req: &Request<'_>) -> Verdict {
         let Some(ntfy) = self.config.ntfy.clone() else {
             return Verdict::Drop;
         };
         let prefix = Prefix::of(req.client_ip);
         let location = self.location(req);
+        let wait_hash = wait_cookie_hash(req.cookie);
         // An approval that landed after its hold ended. `sweep` already
         // removed any past its claim window.
-        if let Some(index) = self
-            .pending
-            .iter()
-            .position(|pending| pending.state == State::Approved && pending.prefix == prefix)
-        {
+        if let Some(index) = self.pending.iter().position(|pending| {
+            pending.state == State::Approved
+                && pending.prefix == prefix
+                && wait_hash
+                    .as_ref()
+                    .is_some_and(|hash| hashes_equal(hash, &pending.wait_hash))
+        }) {
             self.pending.remove(index);
             let (response, effects) = self.admit(rng, &location, req.now_ms);
             return Verdict::Handled(response, effects);
         }
         let until_ms = req.now_ms.saturating_add(self.hold_ms);
-        if let Some(pending) = self
-            .pending
-            .iter()
-            .find(|pending| pending.state == State::Waiting && pending.prefix == prefix)
-        {
+        if let Some(pending) = self.pending.iter().find(|pending| pending.prefix == prefix) {
+            if pending.state != State::Waiting
+                || !wait_hash
+                    .as_ref()
+                    .is_some_and(|hash| hashes_equal(hash, &pending.wait_hash))
+            {
+                return Verdict::Drop;
+            }
             let hold = Hold {
                 pending: pending.id.clone(),
+                prefix,
+                wait_hash: pending.wait_hash,
                 location,
                 until_ms,
             };
@@ -681,25 +771,44 @@ impl Gate {
         if waiting >= MAX_PENDING || cooling || cooldowns_full || pending_full {
             return Verdict::Drop;
         }
+        if self
+            .ntfy_rate
+            .is_some_and(|(_, count)| count >= self.config.ntfy_rate.limit)
+        {
+            return Verdict::Drop;
+        }
         let id = random_string(rng, 16);
         let approve = random_token(rng);
         let deny = random_token(rng);
+        let wait = random_token(rng);
         self.pending.push(Pending {
             id: id.clone(),
             prefix,
+            wait_hash: sha256(&wait),
             approve_hash: Some(sha256(&approve)),
             deny_hash: Some(sha256(&deny)),
             expires_ms: req.now_ms.saturating_add(self.ttl_ms),
             decided_ms: req.now_ms,
             state: State::Waiting,
         });
+        let entry = self.ntfy_rate.get_or_insert((req.now_ms, 0));
+        entry.1 = entry.1.saturating_add(1);
         let effect = ntfy_publish(&ntfy, &self.config.public_origin, prefix, &approve, &deny);
-        let hold = Hold {
-            pending: id,
-            location,
-            until_ms,
+        let mut headers = common_headers();
+        headers.push(("Location".into(), location));
+        headers.push((
+            "Set-Cookie".into(),
+            format!(
+                "{WAIT_COOKIE_NAME}={wait}; Max-Age={}; Path=/; Secure; HttpOnly; SameSite=Strict",
+                self.config.approval_ttl_secs.saturating_mul(2)
+            ),
+        ));
+        let response = Response {
+            status: 302,
+            headers,
+            body: Vec::new(),
         };
-        Verdict::Hold(hold, vec![effect])
+        Verdict::Handled(response, vec![effect])
     }
 
     /// The absolute URL a navigation asked for, on the public origin. It is
@@ -772,6 +881,14 @@ impl Gate {
         self.cooldowns.retain(|_, until| *until > now_ms);
         self.decision_rates
             .retain(|_, (start, _)| now_ms.saturating_sub(*start) < DECISION_WINDOW_MS);
+        self.auth_failures.retain(|_, (start, _)| {
+            now_ms.saturating_sub(*start) < self.config.auth_failure_rate.window_ms
+        });
+        if self.ntfy_rate.is_some_and(|(start, _)| {
+            now_ms.saturating_sub(start) >= self.config.ntfy_rate.window_ms
+        }) {
+            self.ntfy_rate = None;
+        }
     }
 }
 
@@ -828,6 +945,25 @@ fn cookie_hashes(cookie: Option<&str>) -> impl Iterator<Item = [u8; 32]> + '_ {
         .map(sha256)
 }
 
+fn wait_cookie_hash(cookie: Option<&str>) -> Option<[u8; 32]> {
+    let mut values = cookie
+        .unwrap_or("")
+        .split(';')
+        .filter_map(|part| part.trim().strip_prefix(WAIT_COOKIE_PREFIX));
+    let value = values.next()?;
+    // Reject ambiguous duplicate cookies and require the canonical 256-bit token.
+    if values.next().is_some() || URL_SAFE_NO_PAD.decode(value).ok()?.len() != 32 {
+        return None;
+    }
+    Some(sha256(value))
+}
+
+fn hashes_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    // CtOutput's equality uses the digest crate's constant-time comparison.
+    hmac::digest::CtOutput::<Sha256>::new((*left).into())
+        == hmac::digest::CtOutput::<Sha256>::new((*right).into())
+}
+
 fn set_cookie(value: &str) -> String {
     format!(
         "{COOKIE_NAME}={value}; Max-Age={COOKIE_MAX_AGE_SECS}; Path=/; Secure; HttpOnly; SameSite=Lax"
@@ -862,10 +998,8 @@ fn plain(status: u16, text: &str) -> Response {
     }
 }
 
-/// `Sec-Fetch-Dest` is `document` for a top-level navigation. A request with no
-/// such header is treated as one, for clients that do not send it.
-fn is_navigation(dest: Option<&str>) -> bool {
-    dest.is_none_or(|value| value.trim().eq_ignore_ascii_case("document"))
+fn is_navigation(mode: Option<&str>, dest: Option<&str>) -> bool {
+    mode == Some("navigate") && dest == Some("document")
 }
 
 /// True for `scheme://host[:port]` with a lowercase `http` or `https` scheme, a

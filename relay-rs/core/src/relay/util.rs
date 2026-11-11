@@ -4,6 +4,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use bp_device_key::DeviceId;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::RelayRng;
 
@@ -23,13 +25,12 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Constant-time equality for secrets. Lengths are compared first, as
-/// crypto/subtle does.
+/// Compare fixed-size SHA-256 digests, without a branch on secret length.
+/// Hashing work depends on the input lengths; comparison work is always 32 bytes.
 pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let a = Sha256::digest(a);
+    let b = Sha256::digest(b);
+    bool::from(a.ct_eq(&b))
 }
 
 /// `len` random bytes from the adapter's source.
