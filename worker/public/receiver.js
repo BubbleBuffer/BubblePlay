@@ -11,6 +11,8 @@ import {
   shouldRetryAuthTimeout,
   signalingUnanswered,
   mediaHeartbeatStep,
+  createSuspendTracker,
+  splitRecovery,
   rtcPeerEndAction,
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
@@ -773,6 +775,12 @@ let terminalSignalingFailure = false;
 // authentication. recoveryAttempts: signaling connections opened since the loss.
 let everAuthenticated = false;
 let recoveryLossMs = null;
+let recoverySuspendedAtLossMs = 0;
+const suspendTracker = createSuspendTracker();
+try {
+  document.addEventListener("freeze", () => suspendTracker.freeze(performance.now()));
+  document.addEventListener("resume", () => suspendTracker.resume(performance.now()));
+} catch {}
 let recoveryBudgetStartMs = null;
 let recoveryAttempts = 0;
 // Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
@@ -927,7 +935,7 @@ function viewerLog(level, event, detail = {}) {
 function noteConnectionLoss() {
   if (!everAuthenticated) return;
   const now = performance.now();
-  if (recoveryLossMs === null) { recoveryLossMs = now; recoveryAttempts = 0; }
+  if (recoveryLossMs === null) { recoveryLossMs = now; recoveryAttempts = 0; recoverySuspendedAtLossMs = suspendTracker.totalMs(now); }
   if (recoveryBudgetStartMs === null) recoveryBudgetStartMs = now;
 }
 
@@ -943,11 +951,13 @@ function sessionAuthTimeoutMs() {
 
 function noteRecovered() {
   if (recoveryLossMs === null) return;
-  const recoveryMs = Math.round(performance.now() - recoveryLossMs);
+  const now = performance.now();
+  // Frozen or suspended time is reported apart: activeMs is what the recovery target measures.
+  const { recoveryMs, suspendedMs, activeMs } = splitRecovery(now - recoveryLossMs, suspendTracker.totalMs(now) - recoverySuspendedAtLossMs);
   const attempts = recoveryAttempts;
   recoveryLossMs = recoveryBudgetStartMs = null;
   recoveryAttempts = 0;
-  viewerLog("info", `recovered after ${recoveryMs} ms, ${attempts} attempts`, { recoveryMs, attempts });
+  viewerLog("info", `recovered after ${activeMs} ms, ${attempts} attempts`, { recoveryMs, activeMs, suspendedMs, attempts });
 }
 
 // A failed session. A silent PC on a recycled session retries on a new signaling connection while
@@ -1345,6 +1355,7 @@ async function addRemoteIce(candidate, generation, ice) {
 // Keep the relay's WebSocket alive (15 s idle heartbeat, same as the host), and
 // recycle it silently when the relay stops answering (recovery.js signalingUnanswered).
 setInterval(() => {
+  suspendTracker.tick(performance.now());
   if (!signalingRegistered) return;
   const now = performance.now();
   if (signalingUnanswered({ pingSentMs: signalingPingSentMs, inboundMs: signalingInboundMs, nowMs: now })) {

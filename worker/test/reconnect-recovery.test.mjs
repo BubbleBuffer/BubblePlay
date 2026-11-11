@@ -5,7 +5,7 @@ import vm from "node:vm";
 import { createViewerSession } from "../public/dk-session.js";
 import {
   RECOVERY_BUDGET_MS, recycledAuthTimeoutMs, shouldRetryAuthTimeout, connectTimeoutMs, shouldRetryOnWake,
-  shouldReconnectAfterClose,
+  shouldReconnectAfterClose, createSuspendTracker, splitRecovery,
 } from "../public/recovery.js";
 
 const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").split(String.fromCharCode(13, 10)).join("\n");
@@ -47,7 +47,7 @@ function receiverHarness() {
   let now = 100_000;
   const context = vm.createContext({
     everAuthenticated: false, recoveryLossMs: null, recoveryBudgetStartMs: null, recoveryAttempts: 0,
-    performance: { now: () => now }, Math, recycledAuthTimeoutMs, shouldRetryAuthTimeout,
+    performance: { now: () => now }, Math, suspendTracker: createSuspendTracker(), splitRecovery, recoverySuspendedAtLossMs: 0, recycledAuthTimeoutMs, shouldRetryAuthTimeout,
     viewerLog: (level, event, detail) => output.logs.push({ level, event, detail }),
     recycleSignaling: reason => output.recycled.push(reason),
     endAuthenticatedSession: refusal => output.ended.push(refusal),
@@ -103,8 +103,21 @@ test("one info line reports the total time and attempts when the first frame ret
   h.context.noteRecovered();
   assert.equal(h.output.logs.length, 1);
   assert.equal(h.output.logs[0].level, "info");
-  assert.deepEqual({ ...h.output.logs[0].detail }, { recoveryMs: 3120, attempts: 2 });
+  assert.deepEqual({ ...h.output.logs[0].detail }, { recoveryMs: 3120, activeMs: 3120, suspendedMs: 0, attempts: 2 });
   assert.equal(h.context.recoveryLossMs, null);
+});
+
+test("the recovery line reports frozen or suspended time apart from active time", () => {
+  const h = receiverHarness();
+  h.context.noteSessionAuthenticated();
+  h.context.suspendTracker.tick(100_000);
+  h.context.noteConnectionLoss();
+  h.advance(856_700); // the PC sleeps; no tick fires meanwhile
+  h.context.suspendTracker.tick(100_000 + 856_700);
+  h.advance(3_900);
+  h.context.noteRecovered();
+  assert.deepEqual({ ...h.output.logs[0].detail }, { recoveryMs: 860_600, activeMs: 3_900, suspendedMs: 856_700, attempts: 0 });
+  assert.match(h.output.logs[0].event, /^recovered after 3900 ms/);
 });
 
 test("the connect wait is 5 s, 7.5 s, then 10 s, and only while recovering", () => {

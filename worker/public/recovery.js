@@ -30,6 +30,37 @@ export function mediaHeartbeatStep(state, nowMs, { heartbeatMs, limitMs = MEDIA_
   return "ping";
 }
 
+// Time the page was frozen or the PC asleep must not count as recovery time ("recovered after
+// 856700 ms" after a lid close, when the real recovery took 3.9 s). The tracker adds up suspended
+// time from two sources: Page Lifecycle freeze/resume, and a gap between two ticks of the 15 s
+// heartbeat longer than a throttled hidden tab can explain (its timers still fire about once a
+// minute). Times are performance.now() milliseconds.
+export const SUSPEND_GAP_MS = 90_000;
+export function createSuspendTracker({ gapMs = SUSPEND_GAP_MS } = {}) {
+  let lastTick = null, frozenAt = null, total = 0;
+  return {
+    /** Call on every heartbeat tick. */
+    tick(nowMs) {
+      if (frozenAt === null && lastTick !== null && nowMs - lastTick > gapMs) total += nowMs - lastTick;
+      lastTick = nowMs;
+    },
+    freeze(nowMs) { if (frozenAt === null) frozenAt = nowMs; },
+    resume(nowMs) {
+      if (frozenAt === null) return;
+      total += nowMs - frozenAt;
+      frozenAt = null;
+      lastTick = nowMs; // the gap that follows is already counted
+    },
+    /** Suspended milliseconds so far (an open freeze counts up to `nowMs`). */
+    totalMs(nowMs) { return total + (frozenAt === null ? 0 : nowMs - frozenAt); },
+  };
+}
+/** Split a recovery into wall-clock, suspended and active milliseconds. */
+export function splitRecovery(wallMs, suspendedMs) {
+  const suspended = Math.min(Math.max(Math.round(suspendedMs), 0), Math.round(wallMs));
+  return { recoveryMs: Math.round(wallMs), suspendedMs: suspended, activeMs: Math.round(wallMs) - suspended };
+}
+
 // A failed WebRTC transport can leave the host's old RTC epoch alive long
 // enough to consume and ignore a replacement offer. Recycling signaling makes
 // the relay notify the host first, so both sides converge on a fresh epoch.

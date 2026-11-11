@@ -81,7 +81,7 @@ Known gaps: the Android and Windows end-to-end tests run in CI only for the Kotl
 
 ## Recovery line (2026-11-04)
 
-After a lost signaling connection, each client logs one info line when the first frame is shown again: `recovered after <ms> ms, <n> attempts`, with the fields `recoveryMs` (loss to first frame) and `attempts` (signaling connections opened since the loss). Browser: target `receiver`; Android and the Windows client: the session log. It is not logged for a first connection. The signaling close lines carry `closeCode`. See [reconnect order](architecture/reconnect.md).
+After a lost signaling connection, each client logs one info line when the first frame is shown again: `recovered after <ms> ms, <n> attempts`, with the fields `recoveryMs` (loss to first frame) and `attempts` (signaling connections opened since the loss). Browser: target `receiver`; Android and the Windows client: the session log. It is not logged for a first connection. The signaling close lines carry `closeCode`. See [reconnect order](architecture/reconnect.md). The browser also separates time the page was frozen or the PC asleep (Page Lifecycle freeze/resume, or a gap above 90 s between 15 s heartbeat ticks): its line reads `recovered after <activeMs> ms` and carries `recoveryMs` (wall clock), `suspendedMs` and `activeMs`; measure the 3 s recovery target on `activeMs`. Android and the Windows client do not split yet.
 
 ## Browser reconnect lines (2026-11-06)
 
