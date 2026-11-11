@@ -309,8 +309,13 @@ impl Relay {
         if !self.healthy {
             return Err(AdminError::Unavailable);
         }
-        Ok(self
-            .pcs
+        Ok(self.listing())
+    }
+
+    /// The same rows without the health check: what an adapter that keeps one PC per object reports
+    /// to its directory.
+    pub fn listing(&self) -> Vec<PcListing> {
+        self.pcs
             .records
             .iter()
             .map(|(id, record)| PcListing {
@@ -321,7 +326,7 @@ impl Relay {
                 online: self.host_online(id),
                 admitted: record.admitted.len(),
             })
-            .collect())
+            .collect()
     }
 
     /// Forgets a PC. Persists the table first (the first action), then closes
