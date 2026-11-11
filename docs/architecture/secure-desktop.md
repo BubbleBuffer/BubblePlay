@@ -40,8 +40,13 @@ errors. Flow/drop transitions identify the reason; logs contain no key codes,
 typed text or coordinates. These diagnostics support incident investigation;
 the WhatsApp blackout's cause remains unproven.
 
-Host admin-agent I/O uses an overlapped local pipe: the hello write and reply
-share a two-second deadline, and each complete injection batch shares a
+Host admin-agent I/O uses an overlapped local pipe. The session thread never
+waits for a connect: the pipe open, server check and hello (deadline 10 s,
+retried once) run on a background thread (`admin-agent-connect`) that the next
+input batch polls. Until it finishes, input that needs the agent is dropped as
+`admin-unavailable` like any outage, and a pipe with every instance busy counts
+as "not responding", not "needs update". Only the injection batch blocks the
+session thread: each complete injection batch shares a
 500 ms write/reply deadline across chunks. Protocol encoding and flushing
 happen in memory; pipe I/O is overlapped.
 Timeout or uncertain delivery reports agent loss and backs off; input that may

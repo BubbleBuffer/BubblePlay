@@ -360,6 +360,8 @@ pub struct AdminAgentLink {
     allow_dev: bool,
     connection: Option<Connection>,
     retry_at: Option<Instant>,
+    /// A connect running on its own thread: the session thread never waits for the agent.
+    connecting: Option<std::sync::mpsc::Receiver<Result<Connection, LinkError>>>,
     state: LinkState,
     attempts: u64,
 }
@@ -371,6 +373,7 @@ impl AdminAgentLink {
             allow_dev,
             connection: None,
             retry_at: None,
+            connecting: None,
             state: LinkState::Idle,
             attempts: 0,
         }
@@ -420,15 +423,47 @@ impl AdminAgentLink {
         self.state = LinkState::Fallback(error);
     }
 
+    /// Never blocks: a connect (up to the hello deadline, twice) runs on its own thread and is
+    /// polled here. Until it finishes, input that needs the agent is dropped like any other
+    /// agent outage.
     fn ensure_connected(&mut self, now: Instant) -> bool {
         if self.connection.is_some() {
             return true;
+        }
+        if let Some(receiver) = &self.connecting {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.connecting = None;
+                    return self.finish_connect(result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.connecting = None;
+                    self.fail(LinkError::Failed("connect thread ended".into()));
+                    return false;
+                }
+            }
         }
         if self.retry_at.is_some_and(|at| now < at) {
             return false;
         }
         self.attempts += 1;
-        match Connection::open(&self.pipe, self.allow_dev, Role::Host) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (pipe, allow_dev) = (self.pipe.clone(), self.allow_dev);
+        let spawned = std::thread::Builder::new()
+            .name("admin-agent-connect".into())
+            .spawn(move || {
+                let _ = sender.send(Connection::open(&pipe, allow_dev, Role::Host));
+            });
+        match spawned {
+            Ok(_) => self.connecting = Some(receiver),
+            Err(error) => self.fail(LinkError::Failed(format!("connect thread: {error}"))),
+        }
+        false
+    }
+
+    fn finish_connect(&mut self, result: Result<Connection, LinkError>) -> bool {
+        match result {
             Ok(connection) => {
                 let handshake = connection.handshake;
                 tracing::info!(
@@ -462,38 +497,30 @@ impl AdminAgentLink {
             return None;
         }
         let mut applied_total = 0u32;
-        let mut retried = false;
         let deadline = Instant::now() + INJECT_TIMEOUT;
         for (index, chunk) in records.chunks(MAX_RECORDS_PER_FRAME).enumerate() {
-            let connection = loop {
-                let connection = self.connection.as_mut()?;
-                match connection.send_frame(chunk, deadline) {
-                    Ok(()) => break connection,
-                    Err(error) => {
-                        // The tray stops the agent after the last viewer leaves, while the host
-                        // keeps its pipe. A write that failed because the pipe is closed delivered
-                        // nothing, so the first batch can safely go again on a fresh connection.
-                        if !retried && index == 0 && write_never_delivered(&error) {
-                            retried = true;
-                            tracing::info!(
-                                %error,
-                                "admin agent pipe was closed before the batch was delivered; reconnecting once"
-                            );
-                            self.fail(LinkError::Failed(error.to_string()));
-                            self.retry_at = None;
-                            if !self.ensure_connected(Instant::now()) {
-                                // Nothing was delivered: the caller may inject locally.
-                                return None;
-                            }
-                            continue;
-                        }
-                        // A failed/cancelled write may already have delivered bytes.
-                        // The receipt is unknown: never repeat this input locally.
-                        self.fail(LinkError::Failed(error.to_string()));
-                        return Some((applied_total, ERROR_AGENT_LOST));
-                    }
+            let connection = self.connection.as_mut()?;
+            if let Err(error) = connection.send_frame(chunk, deadline) {
+                // The tray stops the agent after the last viewer leaves, while the host
+                // keeps its pipe. A write that failed because the pipe is closed delivered
+                // nothing, so the first batch may be injected locally while the link
+                // reconnects in the background.
+                if index == 0 && write_never_delivered(&error) {
+                    tracing::info!(
+                        %error,
+                        "admin agent pipe was closed before the batch was delivered; reconnecting"
+                    );
+                    self.fail(LinkError::Failed(error.to_string()));
+                    self.retry_at = None;
+                    self.ensure_connected(Instant::now());
+                    return None;
                 }
-            };
+                // A failed/cancelled write may already have delivered bytes.
+                // The receipt is unknown: never repeat this input locally.
+                self.fail(LinkError::Failed(error.to_string()));
+                return Some((applied_total, ERROR_AGENT_LOST));
+            }
+            let connection = self.connection.as_mut()?;
             let reply = connection.receipt(deadline);
             match reply {
                 Ok(AgentMessage::Injected {
@@ -638,8 +665,18 @@ mod tests {
         assert!(write_never_delivered(&error), "{error:?}");
     }
 
+    /// Polls until the background connect has finished (test helper).
+    fn settle(link: &mut AdminAgentLink) {
+        let end = Instant::now() + Duration::from_secs(20);
+        while link.connecting.is_some() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+            link.ensure_connected(Instant::now());
+        }
+        assert!(link.connecting.is_none(), "connect did not finish");
+    }
+
     #[test]
-    fn reconnect_and_resend_after_a_closed_pipe_reaches_the_new_connection() {
+    fn closed_pipe_write_reconnects_in_the_background_and_backs_off() {
         let _guard = test_server::pipe_lock();
         let name = format!(
             r"\\.\pipe\BubblePlay.AdminAgent.unit-resend-{}",
@@ -656,6 +693,7 @@ mod tests {
         // may inject locally (None), and the link backs off instead of retrying in a loop.
         let result = link.inject(&[move_one()]);
         assert_eq!(result, None);
+        settle(&mut link);
         assert!(
             matches!(link.state(), LinkState::Fallback(_)),
             "{:?}",
@@ -785,6 +823,7 @@ mod tests {
             flags: super::super::protocol::MOUSEEVENTF_MOVE,
         };
         assert_eq!(link.inject(&[move_one]), None);
+        settle(&mut link);
         assert!(matches!(
             link.state(),
             LinkState::Fallback(LinkError::Unavailable(_))
@@ -812,17 +851,40 @@ mod tests {
     }
 
     #[test]
+    fn session_side_inject_returns_promptly_while_the_agent_is_unresponsive() {
+        // Every pipe instance is held, so a connect waits (1 s per try, retried once). The old
+        // inline connect blocked the session thread for all of it (the hello wait is up to 10 s).
+        let _guard = test_server::pipe_lock();
+        let name = format!(
+            r"\\.\pipe\BubblePlay.AdminAgent.unit-prompt-{}",
+            std::process::id()
+        );
+        let _server = test_server::listen(&name);
+        let _held = open_pipe(&name).unwrap();
+        let mut link = AdminAgentLink::new(name, true);
+        let started = Instant::now();
+        assert_eq!(link.inject(&[move_one()]), None);
+        assert_eq!(link.inject(&[move_one()]), None);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "session thread blocked for {:?}",
+            started.elapsed()
+        );
+        settle(&mut link);
+    }
+
+    #[test]
     fn slow_failed_attempt_gets_a_full_backoff_after_completion() {
         let pipe = format!(
             r"\\.\pipe\BubblePlay.AdminAgent.unit-slow-missing-{}",
             std::process::id()
         );
         let mut link = AdminAgentLink::new(pipe, true);
-        let completed_after = Instant::now();
-        // Advance the attempt's start time without a multi-second sleep.
-        let started = completed_after - Duration::from_secs(3);
-        assert!(!link.ensure_connected(started));
-        assert!(link.retry_at.unwrap() >= completed_after + Duration::from_secs(2));
+        let before = Instant::now();
+        assert!(!link.ensure_connected(before));
+        settle(&mut link);
+        // The backoff counts from the moment the failed attempt is noticed.
+        assert!(link.retry_at.unwrap() >= before + Duration::from_secs(2));
         assert!(!link.ensure_connected(Instant::now()));
         assert_eq!(
             link.attempts(),
@@ -931,6 +993,7 @@ mod tests {
             flags: super::super::protocol::MOUSEEVENTF_MOVE,
         };
         assert_eq!(link.inject(&[move_one]), None);
+        settle(&mut link);
         assert!(
             matches!(link.state(), LinkState::Fallback(LinkError::Untrusted(_))),
             "{:?}",
