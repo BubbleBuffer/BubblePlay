@@ -56,6 +56,10 @@ The relay logs structured JSON to the console (Workers observability); `pc` and 
 
 Expected events log at info: media closed by the relay with "viewer departed" or a stale epoch, mDNS `.local` remote candidates, input paused for a native file drag, capture unavailable because the display is off, and the tray's agent probe finding no pipe within 20 s of starting the agent. Anything else in those places stays at warn. Serve failures log the time since the last relay registration; the serve retry delay restarts at 1 s after a run that was registered for over 60 s. The WSS v4 media link pings every 15 s on its own clock, and a silent-link close reports the inbound age and ping count. The tray logs why it stops the admin agent (`reason`).
 
+## Link capacity verdicts
+
+`WSS v4 link constrained` (target `link_capacity`, info) is logged when the WSS v4 rate controller finds the link slower than the sender. Fields: `capacity_bps`, `evidence` (queue-evidence samples), `bursts` (ACK bursts), `span_ms` (first to last evidence), `growth_ms` (how much deeper the queue is at the last evidence sample than at the first) and `samples`, the newest 16 delivery samples, space-separated, each `age_ms/kbps/rtt_ms/A|L/ack_gap_ms/recv_gap_ms`. `A` is an app-limited sample (the pipe had room), `L` a pipe-full one. `ack_gap_ms` is the host-side time since the previous ACK and `recv_gap_ms` the viewer's own receive-time difference to it (`-` if none). A stall in the viewer shows large `recv_gap_ms`; a stall on the way back (relay or WAN) shows a large `ack_gap_ms` with an even `recv_gap_ms`.
+
 ## Finding what happened around a feedback timestamp
 
 ```
