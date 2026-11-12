@@ -3,7 +3,7 @@ use super::{
     EncoderOptions, FrameDamage, Multipass, Preset, RateControlMode, ResourceMode, RoiMode, Tuning,
     VideoCodec,
 };
-use crate::frame_damage::{DamageRect, HevcQpDeltaMap};
+use crate::frame_damage::DamageRect;
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_INITIALIZE_PARAMS;
 
 #[test]
