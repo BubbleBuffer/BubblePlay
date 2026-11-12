@@ -152,6 +152,7 @@ Media and file sockets are not affected by this list.
 
 ## Known limits (M2)
 
+- Connection ids never repeat across hibernation wakes: a wake starts its ids at its clock in milliseconds shifted by `WAKE_ID_SHIFT_BITS`, above every restored socket's id, so a late close event for a gone socket cannot hit a new connection.
 - Pairing windows and pair-failure counters live in memory. A restart closes every window, and the host must send `pair-open` again.
 - The admin listing at `/__gate/manage/pcs` reports the count of admitted viewers per PC (`admitted`), never the IDs.
 - `last_seen` is derived, not stored: the PC table keeps `registered_ms` only, and on load `last_seen` is set equal to `registered_ms`. The admin listing shows a PC's last contact as its registration time until it connects again after a restart.
