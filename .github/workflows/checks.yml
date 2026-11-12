@@ -16,14 +16,39 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
+  # Which jobs a change needs (tools/ci-changes.mjs). Runs on a hosted runner so build01 only sees necessary jobs;
+  # a skipped job reports as skipped. Master pushes and manual runs always run everything.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      relay: ${{ steps.filter.outputs.relay }}
+      browser: ${{ steps.filter.outputs.browser }}
+      e2e: ${{ steps.filter.outputs.e2e }}
+      host: ${{ steps.filter.outputs.host }}
+      client: ${{ steps.filter.outputs.client }}
+      android: ${{ steps.filter.outputs.android }}
+      packaging: ${{ steps.filter.outputs.packaging }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: filter
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.base_ref || (github.event_name == 'push' && github.ref != 'refs/heads/master' && 'master') || '' }}
+        run: node tools/ci-changes.mjs "$BASE"
+
   browser:
     runs-on: [self-hosted, build01]
+    needs: changes
     # build01 is a persistent self-hosted host: never run code from fork PRs on it.
     # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay')
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay') && needs.changes.outputs.browser == 'true'
     strategy:
       matrix:
-        node: [22, 24]
+        # One Node version on pull requests, both on master and manual runs.
+        node: ${{ fromJSON(github.event_name == 'pull_request' && '[24]' || '[22, 24]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -42,8 +67,9 @@ jobs:
 
   windows-packaging:
     runs-on: windows-latest
+    needs: changes
     # GitHub-hosted Windows minutes are billed: run on PRs, master and manual runs only, not on lane pushes.
-    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/master') && needs.changes.outputs.packaging == 'true'
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -63,8 +89,9 @@ jobs:
 
   relay-rs:
     runs-on: [self-hosted, build01]
+    needs: changes
     # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.relay == 'true'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -161,8 +188,9 @@ jobs:
 
   browser-e2e:
     runs-on: [self-hosted, build01]
+    needs: changes
     # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.e2e == 'true'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -198,8 +226,9 @@ jobs:
   host:
     name: Host checks (windows-latest)
     runs-on: windows-latest
+    needs: changes
     # GitHub-hosted Windows minutes are billed: run on PRs, master and manual runs only, not on lane pushes.
-    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/master') && needs.changes.outputs.host == 'true'
     timeout-minutes: 30
     env:
       # Read by the nvidia-video-codec-sdk build script. Set for every step, because
@@ -247,7 +276,17 @@ jobs:
             & $lib /def:$def /machine:x64 /nologo "/out:$(Join-Path $out "$name.lib")"
             if ($LASTEXITCODE -ne 0) { throw "lib.exe failed for $name" }
           }
+      - name: Install the secure helper for the hung-foreground test
+        # host/tests/hung_foreground_input.rs sends input through the real host -> helper path.
+        shell: pwsh
+        run: |
+          cargo build --locked --offline --manifest-path host/Cargo.toml --bin bubbleplay_secure_helper
+          if ($LASTEXITCODE -ne 0) { throw 'secure helper build failed' }
+          ./host/scripts/ci-install-secure-helper.ps1 -Exe host/target/debug/bubbleplay_secure_helper.exe
       - name: Host tests and cargo check
+        env:
+          # host/tests/hung_foreground_input.rs drives this runner's interactive desktop.
+          BUBBLEPLAY_FOREGROUND_TESTS: "1"
         run: node tools/check.mjs host
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
@@ -259,8 +298,9 @@ jobs:
   client-win:
     name: Windows client checks (windows-latest)
     runs-on: windows-latest
+    needs: changes
     # GitHub-hosted Windows minutes are billed: run on PRs, master and manual runs only, not on lane pushes.
-    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/master') && needs.changes.outputs.client == 'true'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -293,9 +333,10 @@ jobs:
   android:
     name: Android unit tests and lint (build01)
     runs-on: [self-hosted, build01]
+    needs: changes
     # build01 is a persistent self-hosted host: never run code from fork PRs on it.
     # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay')
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay') && needs.changes.outputs.android == 'true'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
