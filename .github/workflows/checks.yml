@@ -288,6 +288,39 @@ jobs:
           # host/tests/hung_foreground_input.rs drives this runner's interactive desktop.
           BUBBLEPLAY_FOREGROUND_TESTS: "1"
         run: node tools/check.mjs host
+      - name: Admin agent e2e (basic-user token)
+        # The hosted runner account is an elevated administrator and the dev agent refuses to run
+        # elevated, so `Host tests` skips these tests. Run them again as a standard user;
+        # BUBBLEPLAY_E2E_REQUIRE_UNELEVATED turns a skip into a failure.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $built = cargo test --locked --offline --manifest-path host/Cargo.toml --test admin_agent_e2e --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'building admin_agent_e2e failed' }
+          $exe = ($built | ForEach-Object { try { $_ | ConvertFrom-Json } catch { } } |
+            Where-Object { $_.executable -and $_.target.name -eq 'admin_agent_e2e' } | Select-Object -Last 1).executable
+          if (-not $exe) { throw 'admin_agent_e2e executable not found' }
+          # `runas /trustlevel` keeps TokenIsElevated on the hosted runner (UAC is off), so use a
+          # throwaway local standard user that exists only for this step.
+          $user = 'bpe2e'
+          $plain = [guid]::NewGuid().ToString('N') + 'aA1!'
+          net user $user $plain /add | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'creating the e2e user failed' }
+          try {
+            $dir = Split-Path $exe
+            icacls $dir /grant "${user}:(OI)(CI)RX" /T /C | Out-Null
+            $cred = [pscredential]::new($user, (ConvertTo-SecureString $plain -AsPlainText -Force))
+            $log = Join-Path $env:RUNNER_TEMP 'admin-agent-e2e.log'
+            icacls $env:RUNNER_TEMP /grant "${user}:(OI)(CI)M" | Out-Null
+            $proc = Start-Process -FilePath $exe -ArgumentList '--test-threads=1' -Credential $cred -LoadUserProfile `
+              -Environment @{ BUBBLEPLAY_E2E_REQUIRE_UNELEVATED = '1' } `
+              -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
+            if (-not $proc.WaitForExit(300000)) { $proc.Kill(); throw 'admin_agent_e2e did not finish in 5 minutes' }
+            Get-Content $log, "$log.err" -ErrorAction SilentlyContinue
+            if ($proc.ExitCode -ne 0) { throw "admin_agent_e2e failed with exit code $($proc.ExitCode)" }
+          } finally {
+            net user $user /delete | Out-Null
+          }
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
       - name: Rustfmt
