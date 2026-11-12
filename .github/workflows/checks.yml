@@ -267,7 +267,17 @@ jobs:
             & $lib /def:$def /machine:x64 /nologo "/out:$(Join-Path $out "$name.lib")"
             if ($LASTEXITCODE -ne 0) { throw "lib.exe failed for $name" }
           }
+      - name: Install the secure helper for the hung-foreground test
+        # host/tests/hung_foreground_input.rs sends input through the real host -> helper path.
+        shell: pwsh
+        run: |
+          cargo build --locked --offline --manifest-path host/Cargo.toml --bin bubbleplay_secure_helper
+          if ($LASTEXITCODE -ne 0) { throw 'secure helper build failed' }
+          ./host/scripts/ci-install-secure-helper.ps1 -Exe host/target/debug/bubbleplay_secure_helper.exe
       - name: Host tests and cargo check
+        env:
+          # host/tests/hung_foreground_input.rs drives this runner's interactive desktop.
+          BUBBLEPLAY_FOREGROUND_TESTS: "1"
         run: node tools/check.mjs host
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
