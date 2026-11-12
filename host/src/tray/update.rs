@@ -18,8 +18,6 @@ pub const REGISTER_DEADLINE_MS: u64 = 120_000;
 pub const CRASH_LOOP_EXITS: usize = 3;
 pub const CRASH_LOOP_WINDOW_MS: u64 = 5 * 60_000;
 pub const GOOD_AFTER_MS: u64 = 10 * 60_000;
-/// Line the host logs once the signaling Worker accepted its registration.
-pub const REGISTERED_MARKER: &str = "signaling registered as host";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
