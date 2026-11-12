@@ -23,6 +23,8 @@ mod fake_relay;
 #[cfg(test)]
 mod integration_contract_tests;
 #[cfg(test)]
+mod media_control_contract_tests;
+#[cfg(test)]
 mod session_tests;
 #[cfg(test)]
 mod timing_contract_tests;
