@@ -318,8 +318,8 @@ jobs:
           # throwaway local standard user that exists only for this step.
           $user = 'bpe2e'
           $plain = [guid]::NewGuid().ToString('N') + 'aA1!'
-          net user $user $plain /add | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'creating the e2e user failed' }
+          # New-LocalUser, not `net user`: that one prompts for passwords over 14 characters.
+          New-LocalUser -Name $user -Password (ConvertTo-SecureString $plain -AsPlainText -Force) | Out-Null
           try {
             $dir = Split-Path $exe
             icacls $dir /grant "${user}:(OI)(CI)RX" /T /C | Out-Null
@@ -333,7 +333,7 @@ jobs:
             Get-Content $log, "$log.err" -ErrorAction SilentlyContinue
             if ($proc.ExitCode -ne 0) { throw "admin_agent_e2e failed with exit code $($proc.ExitCode)" }
           } finally {
-            net user $user /delete | Out-Null
+            Remove-LocalUser -Name $user
           }
       - name: Remove the e2e user
         if: always() && runner.environment == 'github-hosted'
