@@ -7,6 +7,7 @@ import {
   shouldReconnectAfterClose,
   recycledAuthTimeoutMs,
   connectTimeoutMs,
+  MEDIA_CONNECT_TIMEOUT_MS,
   shouldRetryOnWake,
   shouldRetryAuthTimeout,
   signalingUnanswered,
@@ -861,7 +862,7 @@ let wssStartupRecoveries = 0;
 // WSS v4 single-socket session state.
 const wssV4 = {
   gate: new V4ReceiveGate(), socket: null, socketOpen: false, everOpened: false, hostPresent: false,
-  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, lastSendAt: 0, lastInboundAt: 0, lastPingAt: 0, pingSentMs: null,
+  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, connectTimer: null, lastSendAt: 0, lastInboundAt: 0, lastPingAt: 0, pingSentMs: null,
   lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity,
   presentSkips: 0, gateDrops: 0, frames: 0,
 };
@@ -1494,6 +1495,7 @@ function clearWssTimers() {
   clearWssKeyframeWatchdog();
   clearInterval(wssV4.heartbeatTimer); wssV4.heartbeatTimer = null;
   clearTimeout(wssReconnectTimer); wssReconnectTimer = null;
+  clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
 }
 
 function stopWssMedia() {
@@ -1559,6 +1561,16 @@ function openWssV4Socket() {
   wssV4.socketOpen = false;
   wssV4.hostPresent = false;
   const current = () => usingWssMedia && wssV4.socket === socket && signalingTicket === ticket && authenticatedSession?.mediaReady;
+  clearTimeout(wssV4.connectTimer);
+  wssV4.connectTimer = setTimeout(() => {
+    wssV4.connectTimer = null;
+    if (!current() || wssV4.socketOpen) return;
+    viewerLog("warn", "wss-v4-connect-timeout", { waitedMs: MEDIA_CONNECT_TIMEOUT_MS, reconnects: wssV4.reconnects });
+    socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+    wssV4.socket = null;
+    try { socket.close(); } catch {} // already closing or closed
+    scheduleWssV4Reconnect("connect-timeout");
+  }, MEDIA_CONNECT_TIMEOUT_MS);
   socket.onopen = () => {
     if (!current()) return;
     socket.send(JSON.stringify({ type: "hello", role: "media-viewer", ticket }));
@@ -1575,6 +1587,7 @@ function openWssV4Socket() {
     let message;
     try { message = JSON.parse(event.data); } catch { return; }
     if (message.type === "hello-ok") {
+      clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
       const reconnect = wssV4.everOpened;
       wssV4.socketOpen = true;
       wssV4.everOpened = true;
@@ -1594,6 +1607,7 @@ function openWssV4Socket() {
   };
   socket.onclose = (event) => {
     if (!current()) return;
+    clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
     wssV4.socketOpen = false;
     wssV4.hostPresent = false;
     wssV4.socket = null;
@@ -2269,6 +2283,35 @@ function decodeWssFrame(frame) {
   if (frame.key && decoder?.state === "configured") armWssKeyframeWatchdog();
 }
 
+// Builds the peer connection. A server-specific ICE URI the validator accepted but the browser
+// rejects gets one retry on the plain STUN fallback. Returns null when construction still throws.
+function openPeerConnection(peerOptions) {
+  try {
+    return new RTCPeerConnection(peerOptions);
+  } catch (firstError) {
+    viewerLog("warn", "rtc-construct-failed", { error: String(firstError?.message || firstError), stunFallback: currentIceServers === STUN_FALLBACK });
+    if (currentIceServers === STUN_FALLBACK) return null;
+  }
+  currentIceServers = STUN_FALLBACK;
+  try {
+    return new RTCPeerConnection({ ...peerOptions, iceServers: STUN_FALLBACK });
+  } catch (error) {
+    viewerLog("error", "rtc-construct-failed", { error: String(error?.message || error), stunFallback: true });
+    return null;
+  }
+}
+
+// WebRTC cannot start in this browser. Auto mode moves to WSS at once; a forced WebRTC page has no
+// other transport to use, so it shows the error.
+function peerConstructionFailed() {
+  if (requestedTransport === TRANSPORT.AUTO) {
+    switchToWss("rtc-construct-failed");
+    return;
+  }
+  hudState.ice = "ice-config-error";
+  hud.classList.add("bad");
+}
+
 async function startPeer(generation = peerGeneration) {
   if (requestedTransport === TRANSPORT.WSS || usingWssMedia) return;
   if (!authenticatedSession?.controlReady) return;
@@ -2283,25 +2326,11 @@ async function startPeer(generation = peerGeneration) {
   // This must be set during construction, but only the opt-in WebCodecs path
   // needs it. The native path keeps browser decode/render untouched.
   if (useWebCodecs) peerOptions.encodedInsertableStreams = true;
-  let candidate;
-  try {
-    candidate = new RTCPeerConnection(peerOptions);
-  } catch {
-    // The validator should prevent this, but retain a safe direct fallback
-    // if a browser rejects a server-specific ICE URI we accepted.
-    if (currentIceServers === STUN_FALLBACK) {
-      offerSent = false;
-      hudState.ice = "ice-config-error";
-      return;
-    }
-    currentIceServers = STUN_FALLBACK;
-    try {
-      candidate = new RTCPeerConnection({ ...peerOptions, iceServers: STUN_FALLBACK });
-    } catch {
-      offerSent = false;
-      hudState.ice = "ice-config-error";
-      return;
-    }
+  const candidate = openPeerConnection(peerOptions);
+  if (!candidate) {
+    offerSent = false;
+    peerConstructionFailed();
+    return;
   }
   pc = candidate;
   rtcStartupFallback?.stop();
