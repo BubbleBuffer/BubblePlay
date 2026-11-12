@@ -1,0 +1,5 @@
+# Thresholds for the ratcheted clippy lints (tools/lint/gates.mjs sets CLIPPY_CONF_DIR to this folder).
+too-many-lines-threshold = 80
+cognitive-complexity-threshold = 25
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

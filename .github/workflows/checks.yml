@@ -35,6 +35,9 @@ jobs:
           cache-dependency-path: worker/package-lock.json
       - run: npm --prefix worker ci --ignore-scripts
       - run: node tools/check.mjs client
+      - name: Lint gates (shrink-only baselines)
+        if: matrix.node == 24
+        run: node tools/lint/gates.mjs
       - run: node --test tools/tests/*.test.mjs
 
   windows-packaging:
@@ -115,6 +118,10 @@ jobs:
           cargo test --locked --workspace --no-fail-fast
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo fmt --all -- --check
+      - name: Clippy ratchet (relay-rs, bp-device-key)
+        run: |
+          node tools/lint/gates.mjs clippy relay-rs
+          node tools/lint/gates.mjs clippy bp-device-key
       - name: bp-relay-core builds for wasm32
         working-directory: relay-rs
         run: cargo check --locked -p bp-relay-core --target wasm32-unknown-unknown
@@ -134,6 +141,8 @@ jobs:
         run: |
           cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
           cargo fmt --check
+      - name: Clippy ratchet (relay worker)
+        run: node tools/lint/gates.mjs clippy relay-worker
       - name: bp-relay-worker builds (worker-build --release)
         working-directory: relay-rs/worker
         run: worker-build --release
@@ -244,6 +253,8 @@ jobs:
         run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
       - name: Rustfmt
         run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+      - name: Clippy ratchet
+        run: node tools/lint/gates.mjs clippy host -- --offline
 
   client-win:
     name: Windows client checks (windows-latest)
@@ -271,6 +282,8 @@ jobs:
         run: cargo test --locked --offline --manifest-path client-win/Cargo.toml
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --offline --manifest-path client-win/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy ratchet
+        run: node tools/lint/gates.mjs clippy client-win -- --offline
       - name: Rustfmt
         # The frozen mock UI (src/ui, src/mock.rs, src/model.rs, tests/ui_layout.rs) predates
         # this check and is skipped: main.rs marks those modules #[rustfmt::skip] and the

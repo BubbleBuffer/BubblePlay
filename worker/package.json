@@ -9,6 +9,9 @@
     "check": "node ../tools/check.mjs client"
   },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "eslint": "10.13.0",
+    "globals": "17.13.0",
     "ws": "^8.21.3"
   }
 }
