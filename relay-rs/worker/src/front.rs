@@ -11,13 +11,15 @@
 //! count and whether its host is online. The report is the only way a PC enters the directory, and
 //! the directory refuses a new PC once it holds `MAX_PCS`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bp_relay_core::directory::{DirEntry, Directory};
 use bp_relay_core::gate::{
-    Gate, GateEffect, GateSnapshot, Hold, HoldCheck, Request as GateRequest, Verdict,
+    Gate, GateEffect, GateSnapshot, Hold, HoldCheck, Prefix, Request as GateRequest, Verdict,
 };
+use bp_relay_core::holds::HoldCounter;
 use bp_relay_core::presence::{self, PRESENCE_PATH, PresenceLimiter};
 use bp_relay_core::relay::{PcTable, reasons};
 use serde_json::json;
@@ -55,6 +57,8 @@ pub struct FrontLive {
     pub(crate) gate: Gate,
     /// Per-prefix counter for `GET /presence`. Memory only: eviction resets it.
     pub(crate) presence: PresenceLimiter,
+    /// Navigations held open for approval, in total and per client prefix.
+    pub(crate) holds: HoldCounter,
     pub(crate) directory: Directory,
     /// PC records from before the per-PC split that no PC object has taken yet.
     pub(crate) legacy: PcTable,
@@ -66,6 +70,21 @@ pub struct FrontLive {
     pub(crate) public_host: String,
     /// The alarm time last set, if known. The outer None means unknown. Some(None) means none.
     pub(crate) armed: Option<Option<u64>>,
+}
+
+/// One counted held navigation. Dropping it, whether the hold ended or the request was cancelled,
+/// gives the slot back.
+struct HeldNavigation<'a> {
+    live: &'a RefCell<Option<FrontLive>>,
+    prefix: Prefix,
+}
+
+impl Drop for HeldNavigation<'_> {
+    fn drop(&mut self) {
+        if let Some(live) = self.live.borrow_mut().as_mut() {
+            live.holds.release(self.prefix);
+        }
+    }
 }
 
 impl FrontLive {
@@ -179,6 +198,20 @@ impl crate::Relay {
             }
             Verdict::Hold(hold, effects) => {
                 self.run_gate_effects(effects).await;
+                let prefix = Prefix::of(client);
+                let acquired = {
+                    let mut guard = self.live.borrow_mut();
+                    guard
+                        .as_mut()
+                        .is_some_and(|live| live.holds.acquire(prefix))
+                };
+                if !acquired {
+                    return http::dropped();
+                }
+                let _held = HeldNavigation {
+                    live: &self.live,
+                    prefix,
+                };
                 return self.hold_navigation(hold).await;
             }
             Verdict::Drop => return http::dropped(),
@@ -431,6 +464,7 @@ async fn wake_state(
     Ok(FrontLive {
         gate,
         presence: PresenceLimiter::new(),
+        holds: HoldCounter::default(),
         directory: Directory::new(entries),
         legacy,
         origin,
