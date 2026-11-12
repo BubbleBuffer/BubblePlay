@@ -111,7 +111,7 @@ const RATE_SUSTAIN: Duration = Duration::from_millis(500);
 const RATE_MIN_RTT_WINDOW: Duration = Duration::from_secs(10);
 const RATE_RTT_SLACK_MS: f64 = 60.0;
 const RATE_RTT_FACTOR: f64 = 2.0;
-const WRITE_STALL_LIMIT: Duration = Duration::from_secs(10);
+pub const WRITE_STALL_LIMIT: Duration = Duration::from_secs(10);
 const LINK_QUEUE_CAPACITY: usize = INFLIGHT_MAX_FRAMES_CAP + 2;
 /// Longest `V4Link::shutdown` waits for its worker before abandoning it. A
 /// worker stuck in DNS, TCP, TLS or upgrade finishes on its own later.

@@ -27,8 +27,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::json;
 
-const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
+pub const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// Failed probes back off by doubling up to this interval.
 const WORKER_VERSION_PROBE_MAX_INTERVAL: Duration = Duration::from_secs(300);

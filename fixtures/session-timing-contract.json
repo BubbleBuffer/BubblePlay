@@ -92,7 +92,6 @@
     },
     "unpinned": {
       "signalingHeartbeatMs": "SIGNALING_HEARTBEAT_INTERVAL is private to the bin crate (main.rs)",
-      "writeStallMs": "WRITE_STALL_LIMIT is private in wss_v4.rs",
       "serveBackoff": "private fns and literals in main.rs (bin crate)",
       "keyframeRequestCooldownMs": "private const in main.rs (bin crate)",
       "rememberedMonitorMaxAttempts": "private const in main.rs (bin crate)"
