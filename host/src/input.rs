@@ -1460,6 +1460,9 @@ pub struct InputSink {
     secure_desktop: bool,
     secure_input_allowed: bool,
     foreground_privilege: crate::desktop_session::ForegroundPrivilegeTracker,
+    /// Normal-desktop input currently goes through the secure helper because
+    /// it verified a foreground above the admin agent's integrity.
+    elevated_route: bool,
     admin_enabled: bool,
     status_changes: InputStatusChanges,
     diagnostics: InputDiagnosticCounters,
@@ -3377,6 +3380,7 @@ impl InputSink {
             secure_desktop: false,
             secure_input_allowed: false,
             foreground_privilege: Default::default(),
+            elevated_route: false,
             admin_enabled: false,
             status_changes: Default::default(),
             diagnostics: Default::default(),
@@ -3906,6 +3910,77 @@ impl InputSink {
         self.send_inputs_with_route("display-wake", &[input], true)
     }
 
+    /// UIPI drops the admin agent's input while the foreground belongs to a
+    /// process above High integrity (the System-integrity DWM ghost of a hung
+    /// window). The LocalSystem helper verifies that case itself and injects on
+    /// the default desktop; submission is asynchronous like the secure route.
+    /// `None` falls through to the admin agent.
+    fn send_via_elevated_helper(&mut self, inputs: &[INPUT]) -> Option<InputApplication> {
+        let ready = self.admin_enabled
+            && self.secure_helper.as_ref().is_some_and(|link| {
+                link.lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .elevated_input_ready()
+            });
+        self.set_elevated_route(ready);
+        if !ready {
+            return None;
+        }
+        let records = inputs
+            .iter()
+            .map(input_record)
+            .collect::<Option<Vec<_>>>()?;
+        let accepted = self.secure_helper.as_ref().is_some_and(|link| {
+            link.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .send_input(&records)
+        });
+        if !accepted {
+            return None;
+        }
+        self.diagnostics.route(InputRoute::Secure);
+        self.note_input_flow(None);
+        Some(InputApplication::default())
+    }
+
+    fn set_elevated_route(&mut self, on: bool) {
+        if self.elevated_route == on {
+            return;
+        }
+        self.elevated_route = on;
+        let window = unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
+        let mut class = [0u16; 64];
+        let n =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetClassNameW(window, &mut class) }
+                .max(0) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        let pid = self.foreground_privilege.pid();
+        let exe = pid
+            .and_then(crate::admin_agent::trust::process_image_path)
+            .map(|path| path.display().to_string());
+        let integrity = self
+            .foreground_privilege
+            .target_integrity()
+            .map(|rid| format!("{rid:#x}"));
+        if on {
+            info!(
+                foreground_pid = pid,
+                foreground_exe = exe.as_deref(),
+                foreground_class = %class,
+                foreground_integrity = integrity.as_deref(),
+                "remote input routed through secure helper: foreground above admin-agent integrity"
+            );
+        } else {
+            info!(
+                foreground_pid = pid,
+                foreground_exe = exe.as_deref(),
+                foreground_class = %class,
+                foreground_integrity = integrity.as_deref(),
+                "remote input routed back from secure helper"
+            );
+        }
+    }
+
     fn send_inputs_with_route(
         &mut self,
         operation: &'static str,
@@ -3979,6 +4054,11 @@ impl InputSink {
                 );
             }
             return InputApplication::default();
+        }
+        if !local_only {
+            if let Some(application) = self.send_via_elevated_helper(inputs) {
+                return application;
+            }
         }
         let requires_admin = !local_only && self.foreground_privilege.requires_admin();
         let via_agent = if !local_only && (self.admin_enabled || self.development_agent) {
