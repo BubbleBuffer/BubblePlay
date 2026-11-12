@@ -92,6 +92,6 @@ test('m3 bench script runs against local workerd', { timeout: RUN_TIMEOUT_MS + 6
     }
   } finally {
     if (relay) await relay.stop();
-    rmSync(persistDir, { recursive: true, force: true });
+    rmSync(persistDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   }
 });

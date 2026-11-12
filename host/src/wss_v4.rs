@@ -2150,6 +2150,7 @@ mod tests {
             seq,
             capture_ts_us: u64::from(seq) * 10_000,
             discontinuity: false,
+            samples: crate::audio::FRAME_SAMPLES_20MS,
             payload: vec![0xfc, 0xff, 0xfe],
         }
     }

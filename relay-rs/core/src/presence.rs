@@ -122,6 +122,19 @@ pub fn answer(
     ids: Option<&str>,
     now_ms: u64,
 ) -> Response {
+    answer_with(limiter, |id| relay.pc_online(id), client, ids, now_ms)
+}
+
+/// [`answer`] with the lookup supplied by the caller: an adapter whose PCs live in more than one
+/// object (the Cloudflare Worker) answers from its directory instead of a `Relay`. `online` gets
+/// each id in canonical form.
+pub fn answer_with(
+    limiter: &mut PresenceLimiter,
+    online: impl Fn(&str) -> bool,
+    client: IpAddr,
+    ids: Option<&str>,
+    now_ms: u64,
+) -> Response {
     if let Err(retry_after) = limiter.check(client, now_ms) {
         let mut response = json_response(429, &json!({ "error": "rate limited" }));
         response
@@ -133,8 +146,8 @@ pub fn answer(
         Ok(ids) => {
             let mut body = Map::new();
             for id in ids {
-                let online = relay.pc_online(&id);
-                body.insert(id, Value::Bool(online));
+                let is_online = online(&id);
+                body.insert(id, Value::Bool(is_online));
             }
             json_response(200, &Value::Object(body))
         }

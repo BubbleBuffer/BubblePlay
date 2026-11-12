@@ -27,12 +27,20 @@ compatibility_date = "2026-07-15"
 [observability]
 enabled = true
 
+# RELAY is the front object (gate, HTTP, directory). PC_RELAY is one object per PC for its sockets.
 [durable_objects]
-bindings = [{ name = "RELAY", class_name = "Relay" }]
+bindings = [
+  { name = "RELAY", class_name = "Relay" },
+  { name = "PC_RELAY", class_name = "PcRelay" },
+]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Relay"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PcRelay"]
 
 # In-place deploy on an existing JS relay script. The default above stays uncommented for a fresh
 # script. To deploy over the live JS script instead, comment out the default [durable_objects] table
@@ -44,6 +52,7 @@ new_sqlite_classes = ["Relay"]
 # [durable_objects]
 # bindings = [
 #   { name = "RELAY", class_name = "Relay" },
+#   { name = "PC_RELAY", class_name = "PcRelay" },
 #   { name = "ROOM", class_name = "Room" },
 #   { name = "MEDIA_ROOM", class_name = "MediaRoom" },
 #   { name = "GATE", class_name = "ApprovalGate" },
@@ -69,6 +78,10 @@ new_sqlite_classes = ["Relay"]
 # [[migrations]]
 # tag = "v5"
 # new_sqlite_classes = ["Relay"]
+#
+# [[migrations]]
+# tag = "v6"
+# new_sqlite_classes = ["PcRelay"]
 
 [vars]
 # The public origin of the relay. The relay proof is bound to it, so bench-p99 needs the same value as --origin.

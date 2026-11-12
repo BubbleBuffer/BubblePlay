@@ -18,8 +18,16 @@ not_found_handling = "none"
 enabled = true
 
 [durable_objects]
-bindings = [{ name = "RELAY", class_name = "Relay" }]
+# RELAY is the front object (gate, HTTP, directory); PC_RELAY is one object per PC for its sockets.
+bindings = [
+  { name = "RELAY", class_name = "Relay" },
+  { name = "PC_RELAY", class_name = "PcRelay" },
+]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Relay"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PcRelay"]

@@ -51,31 +51,40 @@ impl Relay {
         now_ms: u64,
         out: &mut Vec<Action>,
     ) {
-        let Some(conn) = self.open_conn(id) else {
+        // No Conn clone here: this is the per-frame path. Take what the rest needs by value.
+        let Some(conn) = self.conns.get(&id).filter(|conn| !conn.closing) else {
             return;
         };
-        if !self.data_epoch_current(&conn) {
+        let (kind, side) = (conn.role.kind(), conn.role.side());
+        let epoch_current = self.data_epoch_current(conn);
+        let other = self.other_of(conn);
+        if !epoch_current {
             self.close(id, 1008, reasons::INVALID_PACKET, "data.stale-epoch", out);
             return;
         }
         self.record_activity(id, now_ms, out);
-        let side = conn.role.side();
-        match conn.role.kind() {
+        match kind {
             // Binary frames are never forwarded on a signalling socket (decision
             // 15: the /ws allowlist is text only). Dropped in both directions,
             // socket kept, the same as a frame in a disallowed direction.
             Kind::Signal => {}
             // Go drops an invalid media frame and keeps the socket.
             Kind::Media => {
-                if validate_media_binary(side, bytes).is_ok() {
-                    self.forward_binary(&conn, bytes, out);
+                if validate_media_binary(side, bytes).is_ok()
+                    && let Some(other) = other
+                {
+                    self.send_binary(other, bytes, out);
                 }
             }
             Kind::File => match validate_file_binary(side, bytes) {
-                Ok(_) => self.forward_binary(&conn, bytes, out),
+                Ok(_) => {
+                    if let Some(other) = other {
+                        self.send_binary(other, bytes, out);
+                    }
+                }
                 Err(_) => {
                     // Go closes the other end of the pair, then this socket.
-                    if let Some(other) = self.other_of(&conn) {
+                    if let Some(other) = other {
                         self.evict(other, 1001, "file-peer-left", "file.peer-left", out);
                     }
                     self.close(
@@ -320,13 +329,6 @@ impl Relay {
     /// True when the socket is a viewer in pairing mode.
     fn is_pairing(&self, id: ConnId) -> bool {
         self.conns.get(&id).is_some_and(|c| c.pairing)
-    }
-
-    /// Forwards a binary frame to the other side of the same family, if present.
-    fn forward_binary(&self, conn: &Conn, bytes: &[u8], out: &mut Vec<Action>) {
-        if let Some(other) = self.other_of(conn) {
-            self.send_binary(other, bytes, out);
-        }
     }
 
     /// The socket that is the current peer on the other side of `conn`.

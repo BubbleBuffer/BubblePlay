@@ -129,6 +129,15 @@ impl Relay {
         &self.pcs
     }
 
+    /// Takes the PC records of an older store when this relay holds none. An adapter that keeps one
+    /// PC per object uses it once, when a PC's object starts empty and the old table has its PC.
+    /// The caller persists the table afterwards.
+    pub fn adopt_pcs(&mut self, table: PcTable) {
+        if self.pcs.records.is_empty() {
+            self.pcs = table;
+        }
+    }
+
     /// Records whether the PC store can be written. While false, registration
     /// is refused and the admin calls return `AdminError::Unavailable`. The
     /// adapter calls this with false when a `PersistPcs` fails.
@@ -246,7 +255,9 @@ impl Relay {
     pub fn on_binary(&mut self, id: ConnId, bytes: &[u8], now_ms: u64) -> Vec<Action> {
         let mut out = Vec::new();
         self.clock_ms = self.clock_ms.max(now_ms);
-        let Some(conn) = self.open_conn(id) else {
+        // Read through a reference: this runs for every media frame, and a Conn clone copies four
+        // strings.
+        let Some(conn) = self.conns.get(&id).filter(|conn| !conn.closing) else {
             return out;
         };
         if conn.phase != Phase::Live {
@@ -309,8 +320,13 @@ impl Relay {
         if !self.healthy {
             return Err(AdminError::Unavailable);
         }
-        Ok(self
-            .pcs
+        Ok(self.listing())
+    }
+
+    /// The same rows without the health check: what an adapter that keeps one PC per object reports
+    /// to its directory.
+    pub fn listing(&self) -> Vec<PcListing> {
+        self.pcs
             .records
             .iter()
             .map(|(id, record)| PcListing {
@@ -321,7 +337,7 @@ impl Relay {
                 online: self.host_online(id),
                 admitted: record.admitted.len(),
             })
-            .collect())
+            .collect()
     }
 
     /// Forgets a PC. Persists the table first (the first action), then closes

@@ -12,14 +12,27 @@ pub const HEADER_BYTES: usize = 28;
 pub const MAX_PAYLOAD_BYTES: usize = 1500;
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 2;
+/// Samples per channel in a 10 ms packet (WebRTC).
 pub const FRAME_SAMPLES: u16 = 480;
+/// Samples per channel in a 20 ms packet (WSS: half the messages per second).
+pub const FRAME_SAMPLES_20MS: u16 = 960;
 
 const CODEC_OPUS: u8 = 1;
 const FLAG_DISCONTINUITY: u8 = 0x01;
 
+/// True for the two accepted packet sizes, 10 ms and 20 ms.
+pub fn is_frame_samples(samples: u16) -> bool {
+    samples == FRAME_SAMPLES || samples == FRAME_SAMPLES_20MS
+}
+
 /// Serialises one packet: 28-byte big-endian header followed by the Opus payload.
 pub fn encode_packet(frame: &AudioFrame) -> Result<Vec<u8>> {
     let len = frame.payload.len();
+    ensure!(
+        is_frame_samples(frame.samples),
+        "unsupported frame samples {}",
+        frame.samples
+    );
     ensure!(
         (1..=MAX_PAYLOAD_BYTES).contains(&len),
         "audio payload of {len} bytes is outside 1..={MAX_PAYLOAD_BYTES}"
@@ -37,7 +50,7 @@ pub fn encode_packet(frame: &AudioFrame) -> Result<Vec<u8>> {
     out.extend_from_slice(&SAMPLE_RATE.to_be_bytes());
     out.extend_from_slice(&frame.seq.to_be_bytes());
     out.extend_from_slice(&frame.capture_ts_us.to_be_bytes());
-    out.extend_from_slice(&FRAME_SAMPLES.to_be_bytes());
+    out.extend_from_slice(&frame.samples.to_be_bytes());
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&frame.payload);
     Ok(out)
@@ -78,7 +91,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<AudioFrame> {
     let capture_ts_us = u64::from_be_bytes(bytes[16..24].try_into().context("capture time")?);
     let samples = u16::from_be_bytes(bytes[24..26].try_into().context("frame samples")?);
     ensure!(
-        samples == FRAME_SAMPLES,
+        is_frame_samples(samples),
         "unsupported frame samples {samples}"
     );
     let reserved = u16::from_be_bytes(bytes[26..28].try_into().context("reserved")?);
@@ -93,6 +106,7 @@ pub fn decode_packet(bytes: &[u8]) -> Result<AudioFrame> {
         seq,
         capture_ts_us,
         discontinuity: flags & FLAG_DISCONTINUITY != 0,
+        samples,
         payload: payload.to_vec(),
     })
 }
@@ -163,6 +177,11 @@ mod tests {
                 "{name} discontinuity"
             );
             assert_eq!(
+                u64::from(frame.samples),
+                entry["frameSamples"].as_u64().unwrap(),
+                "{name} frame samples"
+            );
+            assert_eq!(
                 frame.payload,
                 unhex(entry["payloadHex"].as_str().unwrap()),
                 "{name} payload"
@@ -170,7 +189,7 @@ mod tests {
             // Canonical: re-encoding reproduces the fixture bytes exactly.
             assert_eq!(encode_packet(&frame).unwrap(), bytes, "{name} round trip");
         }
-        assert_eq!(accepted, 2, "fixture accepted-packet count changed");
+        assert_eq!(accepted, 3, "fixture accepted-packet count changed");
     }
 
     #[test]
@@ -216,6 +235,7 @@ mod tests {
             seq: 1,
             capture_ts_us: 2,
             discontinuity: false,
+            samples: FRAME_SAMPLES,
             payload: vec![0xAB; len],
         };
         let max = encode_packet(&frame(MAX_PAYLOAD_BYTES)).expect("1500 bytes is allowed");
@@ -238,6 +258,7 @@ mod tests {
             seq: u32::MAX,
             capture_ts_us: u64::MAX,
             discontinuity: true,
+            samples: FRAME_SAMPLES_20MS,
             payload: vec![1, 2, 3],
         };
         let back = decode_packet(&encode_packet(&frame).unwrap()).unwrap();

@@ -61,7 +61,7 @@ after(async () => {
   if (ntfy) await ntfy.stop();
   relay = null;
   ntfy = null;
-  if (persistDir) rmSync(persistDir, { recursive: true, force: true });
+  if (persistDir) rmSync(persistDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 });
 
 // Restarts and the TURN case run on their own instance and persist directory, so the shared one is
@@ -446,7 +446,7 @@ test('m3 a restart keeps the registered PC and its admitted list', { timeout: RE
       socket.close();
     });
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   }
 });
 
@@ -475,7 +475,7 @@ test('m3 after a restart a host re-registers with its key and a different key is
       assert.deepEqual(await refused.expectClose(10_000), { code: 1008, reason: 'invalid hello' });
     });
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   }
 });
 
@@ -811,12 +811,41 @@ test('m3 /pair/x with a cookie is still 404, as before /pair was served', { time
 });
 
 // Inert stub classes (src/stubs.rs) exist only so an in-place deploy keeps the JS relay's classes.
-// Nothing routes to them: the local config binds only RELAY, and the routes keep their answers.
+// Nothing routes to them: the local config binds only the front and PC classes, and the routes keep
+// their answers.
 
-test('m3 the local config binds only RELAY, so no request can reach a stub class', () => {
+test('m3 the local config binds only RELAY and PC_RELAY, so no request can reach a stub class', () => {
   const toml = readFileSync(path.join(crateRoot, 'wrangler.toml'), 'utf8');
   const classes = [...toml.matchAll(/class_name\s*=\s*"([^"]+)"/g)].map((match) => match[1]);
-  assert.deepEqual(classes, ['Relay']);
+  assert.deepEqual(classes, ['Relay', 'PcRelay']);
+});
+
+// Each PC has its own session object: two PCs are served at once, each viewer reaches its own host,
+// and the directory (listing, presence, delete) still sees both.
+test('m3 two PCs run in separate objects and the directory still lists both', { timeout: CASE_TIMEOUT_MS }, async () => {
+  const [a, b] = [identity(160), identity(161)];
+  const { socket: hostA } = await registerHost(relay.port, a);
+  const { socket: hostB } = await registerHost(relay.port, b);
+  const viewerA = await viewerJoin(relay.port, a.id);
+  const viewerB = await viewerJoin(relay.port, b.id);
+  assert.ok(viewerA.ok.mediaEpoch && viewerB.ok.mediaEpoch, 'each viewer reaches its own PC');
+  const rows = JSON.parse((await adminGet(relay.port, ADMIN)).body.toString('utf8'));
+  for (const host of [a, b]) {
+    assert.equal(rows.find((r) => r.id === host.id)?.online, true, 'the directory shows both PCs online');
+  }
+  const deleted = await httpRequest(relay.port, {
+    method: 'DELETE',
+    path: `/__gate/manage/pcs/${a.id}`,
+    headers: { Authorization: `Bearer ${ADMIN}` },
+  });
+  assert.equal(deleted.status, 204);
+  assert.deepEqual(await hostA.expectClose(10_000), { code: 1008, reason: 'peer removed' });
+  const after = JSON.parse((await adminGet(relay.port, ADMIN)).body.toString('utf8'));
+  assert.equal(after.find((r) => r.id === a.id), undefined);
+  assert.equal(after.find((r) => r.id === b.id)?.online, true, 'the other PC is untouched');
+  hostB.close();
+  viewerA.socket.close();
+  viewerB.socket.close();
 });
 
 test('m3 stub-named paths keep the relay 404 with an empty body, and / still serves the page', { timeout: CASE_TIMEOUT_MS }, async () => {
@@ -851,7 +880,7 @@ test('m3 a WebSocket hello with turn gets a credentialed TURN ICE server', { tim
       { ntfy, turn: true },
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   }
 });
 
@@ -880,6 +909,6 @@ test('m3 a restart keeps the gate cookie', { timeout: RESTART_TIMEOUT_MS }, asyn
       { ntfy },
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
   }
 });

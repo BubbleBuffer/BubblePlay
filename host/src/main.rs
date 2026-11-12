@@ -4005,11 +4005,26 @@ fn run_serve(
             && args.audio
             && viewer_attached
             && (wss_audio_requested || rtc_audio_requested);
-        if !audio_wanted {
+        // WSS carries 20 ms packets (half the relay messages); WebRTC keeps 10 ms. A capture that
+        // was started for the other transport is restarted at the right size.
+        let audio_frame_samples = if wss_media.is_some() {
+            bubbleplay_host::audio::FRAME_SAMPLES_20MS
+        } else {
+            bubbleplay_host::audio::FRAME_SAMPLES
+        };
+        if !audio_wanted
+            || audio_capture
+                .as_ref()
+                .is_some_and(|capture| capture.frame_samples() != audio_frame_samples)
+        {
             audio_capture = None;
         }
         if audio_wanted && audio_capture.is_none() && Instant::now() >= next_audio_start {
-            match bubbleplay_host::audio::AudioCapture::start(media_clock_start, activity.clone()) {
+            match bubbleplay_host::audio::AudioCapture::start(
+                media_clock_start,
+                activity.clone(),
+                audio_frame_samples,
+            ) {
                 Ok(capture) => audio_capture = Some(capture),
                 Err(error) => {
                     if !audio_start_failed {

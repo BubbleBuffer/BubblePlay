@@ -52,10 +52,11 @@ class AudioPlayer(audible: Boolean) {
         val t = track ?: return
         val queuedMs = AudioPolicy.framesToMs(AudioPolicy.queuedFrames(writtenFrames, t.playbackHeadPosition))
         if (drop.shouldDrop(queuedMs)) return
-        decode(packet.payload)
+        decode(packet)
     }
 
-    private fun decode(payload: ByteArray) {
+    private fun decode(packet: AudioPacket) {
+        val payload = packet.payload
         val c = codec ?: return
         val index = c.dequeueInputBuffer(0)
         if (index >= 0) {
@@ -64,7 +65,7 @@ class AudioPlayer(audible: Boolean) {
             buffer.clear()
             buffer.put(payload)
             c.queueInputBuffer(index, 0, payload.size, ptsUs, 0)
-            ptsUs += FRAME_US
+            ptsUs += packet.durationUs
         }
         // Drain whatever is ready; output that is not ready yet comes with a later packet.
         while (true) {
@@ -164,9 +165,8 @@ class AudioPlayer(audible: Boolean) {
         private const val TAG = "BubblePlayAudio"
         private const val MIME = "audio/opus"
         private const val BYTES_PER_FRAME = 4 // 16-bit stereo
-        private const val FRAME_US = 10_000L // 480 samples at 48 kHz
-        /** Track buffer floor: 4 packets, 40 ms. */
-        private const val MIN_BUFFER_FRAMES = 4 * AudioWire.FRAME_SAMPLES
+        /** Track buffer floor: 40 ms (4 x 10 ms or 2 x 20 ms packets). */
+        private const val MIN_BUFFER_FRAMES = 4 * 480
 
         /** Whether this device has an Opus decoder; checked once. */
         val decoderAvailable: Boolean by lazy {

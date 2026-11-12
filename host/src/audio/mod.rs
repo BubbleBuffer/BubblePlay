@@ -1,5 +1,5 @@
 //! Host PC audio: WASAPI loopback of the default playback device, encoded as
-//! 10 ms Opus frames. Capture runs on its own thread. Device and encoder
+//! 10 ms (WebRTC) or 20 ms (WSS) Opus frames. Capture runs on its own thread. Device and encoder
 //! problems are logged and retried there, so video never waits on audio.
 
 mod convert;
@@ -8,7 +8,7 @@ mod gate;
 mod wasapi;
 mod wire;
 
-pub use wire::{decode_packet, encode_packet};
+pub use wire::{decode_packet, encode_packet, FRAME_SAMPLES, FRAME_SAMPLES_20MS};
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +23,6 @@ use crate::activity::Activity;
 use encoder::{FrameAssembler, OpusEncoder};
 use gate::{frame_is_active, SilenceGate};
 use wasapi::{ComApartment, Device, Read};
-use wire::FRAME_SAMPLES;
 
 /// Frames kept for the drain queue when no sink is set. Beyond this the oldest is dropped.
 const PENDING_CAPACITY: usize = 10;
@@ -41,12 +40,14 @@ const FILL_AFTER: Duration = Duration::from_millis(50);
 const MAX_FILL_FRAMES_PER_PASS: usize = 100;
 const SILENCE: [[f32; 2]; FRAME_SAMPLES as usize] = [[0.0; 2]; FRAME_SAMPLES as usize];
 
-/// One encoded 10 ms packet, ready for `encode_packet`.
+/// One encoded packet, ready for `encode_packet`.
 #[derive(Debug, Clone)]
 pub struct AudioFrame {
     pub seq: u32,
     pub capture_ts_us: u64,
     pub discontinuity: bool,
+    /// Samples per channel: `FRAME_SAMPLES` (10 ms) or `FRAME_SAMPLES_20MS`.
+    pub samples: u16,
     pub payload: Vec<u8>,
 }
 
@@ -59,12 +60,18 @@ pub struct AudioCapture {
     sink: Arc<Mutex<Option<AudioSink>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    frame_samples: u16,
 }
 
 impl AudioCapture {
     /// `clock_start` is the origin of `capture_ts_us`, the same clock video uses.
     /// Only a failed thread spawn is returned; device and encoder failures stay in the thread.
-    pub fn start(clock_start: Instant, activity: Activity) -> Result<Self> {
+    /// `frame_samples` is the packet size: `FRAME_SAMPLES` (10 ms) or `FRAME_SAMPLES_20MS`.
+    pub fn start(clock_start: Instant, activity: Activity, frame_samples: u16) -> Result<Self> {
+        anyhow::ensure!(
+            wire::is_frame_samples(frame_samples),
+            "unsupported audio frame size {frame_samples}"
+        );
         let pending = Arc::new(Mutex::new(Pending::default()));
         let sink = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
@@ -74,7 +81,7 @@ impl AudioCapture {
                 let pending = Arc::clone(&pending);
                 let sink = Arc::clone(&sink);
                 let stop = Arc::clone(&stop);
-                move || run(clock_start, activity, pending, sink, stop)
+                move || run(clock_start, activity, frame_samples, pending, sink, stop)
             })
             .context("spawn audio capture thread")?;
         Ok(Self {
@@ -82,7 +89,13 @@ impl AudioCapture {
             sink,
             stop,
             thread: Some(thread),
+            frame_samples,
         })
+    }
+
+    /// The packet size this capture produces.
+    pub fn frame_samples(&self) -> u16 {
+        self.frame_samples
     }
 
     /// Hands each new packet to `sink` on the capture thread, in place of the drain queue.
@@ -163,6 +176,8 @@ struct Pipeline {
     open_encoder: fn() -> Result<OpusEncoder>,
     encoder_warn: WarnOnce,
     seq: u32,
+    /// Samples per channel in each packet.
+    frame_samples: u16,
 }
 
 impl Pipeline {
@@ -171,19 +186,24 @@ impl Pipeline {
         activity: Activity,
         pending: Arc<Mutex<Pending>>,
         sink: Arc<Mutex<Option<AudioSink>>>,
+        frame_samples: u16,
     ) -> Self {
         Self {
             clock_start,
             activity,
             pending,
             sink,
-            assembler: FrameAssembler::default(),
-            gate: SilenceGate::new(),
+            assembler: FrameAssembler::new(frame_samples),
+            // Silence is sent for about 200 ms whatever the packet size.
+            gate: SilenceGate::with_limit(
+                gate::MAX_SILENT_FRAMES * u32::from(FRAME_SAMPLES) / u32::from(frame_samples),
+            ),
             encoder: None,
             encoder_attempt: None,
             open_encoder: OpusEncoder::new,
             encoder_warn: WarnOnce::default(),
             seq: 0,
+            frame_samples,
         }
     }
 
@@ -193,7 +213,7 @@ impl Pipeline {
         self.assembler.clear();
     }
 
-    /// Feeds 48 kHz stereo; every completed 10 ms frame goes through the gate.
+    /// Feeds 48 kHz stereo; every completed frame goes through the gate.
     /// `now` stamps the frames this call completes.
     fn push_stereo(&mut self, frames: &[[f32; 2]], now: Instant) {
         self.assembler.push(frames);
@@ -218,6 +238,7 @@ impl Pipeline {
             seq,
             capture_ts_us,
             discontinuity,
+            samples: self.frame_samples,
             payload,
         };
         // Copy the sink out so the lock is released before the callback runs.
@@ -311,13 +332,14 @@ impl Filler {
 fn run(
     clock_start: Instant,
     activity: Activity,
+    frame_samples: u16,
     pending: Arc<Mutex<Pending>>,
     sink: Arc<Mutex<Option<AudioSink>>>,
     stop: Arc<AtomicBool>,
 ) {
     // Declared first so it is dropped last, after the COM objects.
     let _com = ComApartment::enter();
-    let mut pipe = Pipeline::new(clock_start, activity, pending, sink);
+    let mut pipe = Pipeline::new(clock_start, activity, pending, sink, frame_samples);
     let mut device: Option<Device> = None;
     let mut device_warn = WarnOnce::default();
     let mut last_attempt: Option<Instant> = None;
@@ -410,6 +432,7 @@ mod tests {
             seq,
             capture_ts_us: seq as u64,
             discontinuity: false,
+            samples: FRAME_SAMPLES,
             payload: vec![0xFC],
         }
     }
@@ -418,7 +441,13 @@ mod tests {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let sink = Arc::new(Mutex::new(None));
         let activity = Activity::new().expect("activity");
-        let pipe = Pipeline::new(Instant::now(), activity, Arc::clone(&pending), sink);
+        let pipe = Pipeline::new(
+            Instant::now(),
+            activity,
+            Arc::clone(&pending),
+            sink,
+            FRAME_SAMPLES,
+        );
         (pipe, pending)
     }
 
@@ -496,6 +525,7 @@ mod tests {
             Activity::new().expect("activity"),
             Arc::clone(&pending),
             Arc::new(Mutex::new(Some(sink))),
+            FRAME_SAMPLES,
         );
         let now = Instant::now();
         // 50 packets is well past the drain queue's capacity of 10.
@@ -538,6 +568,42 @@ mod tests {
     }
 
     #[test]
+    fn a_20_ms_pipeline_emits_960_sample_packets_and_keeps_the_silence_window() {
+        let pending = Arc::new(Mutex::new(Pending::default()));
+        let mut pipe = Pipeline::new(
+            Instant::now(),
+            Activity::new().expect("activity"),
+            Arc::clone(&pending),
+            Arc::new(Mutex::new(None)),
+            FRAME_SAMPLES_20MS,
+        );
+        let now = Instant::now();
+        let sine: Vec<[f32; 2]> = (0..FRAME_SAMPLES_20MS as usize * 3)
+            .map(|i| {
+                let v = (i as f32 * 0.05).sin() * 0.5;
+                [v, -v]
+            })
+            .collect();
+        pipe.push_stereo(&sine, now);
+        let sent = take(&pending);
+        assert_eq!(sent.len(), 3, "one packet per 20 ms of audio");
+        for f in &sent {
+            assert_eq!(f.samples, FRAME_SAMPLES_20MS);
+            let back = decode_packet(&encode_packet(f).expect("encodable")).expect("decodable");
+            assert_eq!(back.samples, FRAME_SAMPLES_20MS);
+            let samples = opus::packet::get_nb_samples(&f.payload, 48_000).expect("opus packet");
+            assert_eq!(
+                samples, FRAME_SAMPLES_20MS as usize,
+                "an Opus frame of 20 ms"
+            );
+        }
+        // Digital silence is still sent for about 200 ms (10 packets of 20 ms), then suppressed.
+        let silence = vec![[0.0f32; 2]; FRAME_SAMPLES_20MS as usize * 30];
+        pipe.push_stereo(&silence, now);
+        assert_eq!(take(&pending).len(), 10);
+    }
+
+    #[test]
     fn gap_marks_the_next_packet_and_drops_partial_audio() {
         let (mut pipe, pending) = pipeline();
         let now = Instant::now();
@@ -561,7 +627,13 @@ mod tests {
         let pending = Arc::new(Mutex::new(Pending::default()));
         let origin = Instant::now();
         let sink = Arc::new(Mutex::new(None));
-        let mut pipe = Pipeline::new(origin, Activity::new().unwrap(), Arc::clone(&pending), sink);
+        let mut pipe = Pipeline::new(
+            origin,
+            Activity::new().unwrap(),
+            Arc::clone(&pending),
+            sink,
+            FRAME_SAMPLES,
+        );
         let later = origin + Duration::from_millis(250);
         pipe.push_stereo(&vec![[0.3f32, 0.3]; FRAME_SAMPLES as usize], later);
         let sent = take(&pending);

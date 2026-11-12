@@ -379,3 +379,26 @@ fn device_key_runtime_contract() {
     );
     assert!(wrong_nonce.is_err());
 }
+
+#[test]
+fn adopted_legacy_record_reregisters_without_token_and_never_overwrites() {
+    // A record from the single-object relay, taken by an empty per-PC relay: the PC keeps working
+    // without the registration token.
+    let mut old = Harness::new();
+    let a = identity(1);
+    old.register_host(&a, Some(TOKEN));
+    let table = old.relay.pcs().clone();
+    assert_eq!(table.len(), 1);
+
+    let mut h = Harness::new();
+    h.relay.adopt_pcs(table);
+    let (host, actions) = h.register_host(&a, None);
+    assert!(sent_types(&actions, host.id).contains(&"hello-ok".to_owned()));
+
+    // A relay that already holds a PC keeps its own records.
+    let mut other = Harness::new();
+    other.register_host(&identity(2), Some(TOKEN));
+    let own = other.relay.pcs().clone();
+    other.relay.adopt_pcs(old.relay.pcs().clone());
+    assert_eq!(other.relay.pcs(), &own);
+}

@@ -1,47 +1,59 @@
-//! The state the Durable Object keeps in memory while it runs: the core relay, the gate, the
-//! presence limiter and the live sockets. The sockets' own state is in their attachments and survives hibernation.
+//! The state a PC's Durable Object keeps in memory while it runs: the core relay and the live
+//! sockets. The sockets' own state is in their attachments and survives hibernation. (The front
+//! object's in-memory state, the gate and the directory, is in front.rs.)
 
 use std::collections::BTreeMap;
 
-use bp_relay_core::gate::Gate;
-use bp_relay_core::presence::PresenceLimiter;
+use bp_relay_core::directory::REPORT_EVERY_MS;
 use bp_relay_core::relay::{ConnId, Relay as CoreRelay};
 use worker::js_sys::{Date as JsDate, Function, Reflect};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::{Date, State, WebSocket, web_sys};
 
 /// While the PC store is unhealthy, the alarm wakes this often to retry the write.
-const STORE_RETRY_MS: u64 = 1_000;
+pub const STORE_RETRY_MS: u64 = 1_000;
 
-pub struct Live {
+/// What this object last told the directory about its host's presence (memory only: a wake
+/// reports again).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reported {
+    pub online: bool,
+    pub at_ms: u64,
+}
+
+pub struct PcLive {
     pub core: CoreRelay,
-    pub gate: Gate,
-    /// Per-prefix counter for `GET /presence`. Memory only: eviction resets it.
-    pub presence: PresenceLimiter,
     pub sockets: BTreeMap<ConnId, WebSocket>,
-    /// The canonical public origin, for the browser-socket check.
-    pub origin: String,
     pub pcs_healthy: bool,
-    /// The admin bearer, for the admin API and healthz.
-    pub admin_token: String,
-    /// The public origin's host, lowercase, without a port. The healthz Host check uses it.
-    pub public_host: String,
+    /// The last presence report the directory acknowledged, if any.
+    pub reported: Option<Reported>,
+    /// True when the directory has not yet been told the current state (a report failed).
+    pub report_pending: bool,
+    /// True once this object has asked the front object for a record left by the single-object
+    /// relay (memory only: a new start asks again, and the answer is then 404).
+    pub legacy_checked: bool,
     /// The alarm time last set, if known. The outer None means unknown, so the next call sets
     /// it. Some(None) means no alarm is set.
     pub armed: Option<Option<u64>>,
 }
 
-impl Live {
+impl PcLive {
     /// The alarm change that matches the earliest deadline, or None when the armed alarm
     /// already matches. Some(None) means delete the alarm.
     pub fn alarm_change(&mut self, now: u64) -> Option<Option<u64>> {
-        let mut next = [self.core.next_deadline(), self.gate.next_deadline()]
-            .into_iter()
-            .flatten()
-            .min();
-        if !self.pcs_healthy {
-            let retry = now.saturating_add(STORE_RETRY_MS);
-            next = Some(next.map_or(retry, |deadline| deadline.min(retry)));
+        let mut next = self.core.next_deadline();
+        let mut earlier = |at: u64| next = Some(next.map_or(at, |deadline| deadline.min(at)));
+        if !self.pcs_healthy || self.report_pending {
+            earlier(now.saturating_add(STORE_RETRY_MS));
+        }
+        // An online host's presence is repeated to the directory, so a lost object cannot leave it
+        // online for ever.
+        if let Some(Reported {
+            online: true,
+            at_ms,
+        }) = self.reported
+        {
+            earlier(at_ms.saturating_add(REPORT_EVERY_MS));
         }
         if self.armed == Some(next) {
             return None;

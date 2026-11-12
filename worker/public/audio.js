@@ -15,7 +15,8 @@ export const AUDIO_FLAG_DISCONTINUITY = 0x01;
 export const AUDIO_CODEC_OPUS = 1;
 export const AUDIO_CHANNELS = 2;
 export const AUDIO_SAMPLE_RATE = 48_000;
-export const AUDIO_FRAME_SAMPLES = 480;
+// Samples per channel in one packet: 10 ms (WebRTC) or 20 ms (WSS). Anything else is rejected.
+export const AUDIO_FRAME_SAMPLES = [480, 960];
 export const AUDIO_LEAD_MS = 40;
 export const AUDIO_MAX_AHEAD_MS = 150;
 const MAX_SAFE_TIMESTAMP = 9_007_199_254_740_991n;
@@ -46,7 +47,7 @@ export function parseAudioPacket(packet) {
   if (view.getUint32(0) !== AUDIO_MAGIC || view.getUint8(4) !== AUDIO_VERSION ||
       (flags & ~AUDIO_FLAG_DISCONTINUITY) !== 0 || view.getUint8(6) !== AUDIO_CODEC_OPUS ||
       view.getUint8(7) !== AUDIO_CHANNELS || view.getUint32(8) !== AUDIO_SAMPLE_RATE ||
-      view.getUint16(24) !== AUDIO_FRAME_SAMPLES || view.getUint16(26) !== 0) return null;
+      !AUDIO_FRAME_SAMPLES.includes(view.getUint16(24)) || view.getUint16(26) !== 0) return null;
   return {
     discontinuity: (flags & AUDIO_FLAG_DISCONTINUITY) !== 0,
     codec: AUDIO_CODEC_OPUS,
@@ -54,7 +55,7 @@ export function parseAudioPacket(packet) {
     sampleRate: AUDIO_SAMPLE_RATE,
     seq: view.getUint32(12),
     captureTsUs: view.getBigUint64(16),
-    frameSamples: AUDIO_FRAME_SAMPLES,
+    frameSamples: view.getUint16(24),
     data: bytes.subarray(AUDIO_HEADER_BYTES),
   };
 }

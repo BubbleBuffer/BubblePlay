@@ -2,7 +2,7 @@
 // WebSocket cannot send Origin or CF-Connecting-IP), device keys and relay proofs with the same
 // encodings as bp-device-key, and a wrangler dev lifecycle that can stop and start again on the
 // same --persist-to directory. Every value here is throwaway and reaches only local workerd.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import { existsSync } from 'node:fs';
 import http from 'node:http';
@@ -11,7 +11,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const crateRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const wranglerBin = path.join(crateRoot, 'node_modules', '.bin', 'wrangler');
+// Run wrangler's entry script with node itself: the .bin shim is a shell script, which Windows cannot spawn.
+const wranglerEntry = path.join(crateRoot, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
 
 // The relay's PUBLIC_ORIGIN is the loopback origin of the instance under test. Each instance
 // binds its own relay proofs and Origin checks to it; http is allowed for loopback only.
@@ -397,7 +398,12 @@ const live = new Set();
 
 function signalGroup(pid, sig) {
   try {
-    process.kill(process.platform === 'win32' ? pid : -pid, sig);
+    if (process.platform === 'win32') {
+      // Killing wrangler alone leaves its workerd running: end the whole tree (this pid's own).
+      spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore' });
+      return;
+    }
+    process.kill(-pid, sig);
   } catch {
     // Already gone.
   }
@@ -590,8 +596,8 @@ export async function startRelay({ persistDir, maxConnections = 256, ntfy = null
   if (!existsSync(path.join(crateRoot, 'build', 'worker', 'shim.mjs'))) {
     throw new Error('build/worker/shim.mjs is missing: run worker-build --release first');
   }
-  if (!existsSync(wranglerBin)) {
-    throw new Error('node_modules/.bin/wrangler is missing: install the pinned wrangler first');
+  if (!existsSync(wranglerEntry)) {
+    throw new Error('node_modules/wrangler is missing: install the pinned wrangler first');
   }
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
@@ -607,8 +613,9 @@ export async function startRelay({ persistDir, maxConnections = 256, ntfy = null
   if (gateHoldMs !== null) vars.push(['GATE_HOLD_MS', String(gateHoldMs)]);
   let output = '';
   const child = spawn(
-    wranglerBin,
+    process.execPath,
     [
+      wranglerEntry,
       'dev',
       '--local',
       '--ip',
@@ -666,5 +673,5 @@ export async function startRelay({ persistDir, maxConnections = 256, ntfy = null
     await stop();
     throw err;
   }
-  return { port, base, origin, stop, log: () => output };
+  return { port, base, origin, pid: child.pid, stop, log: () => output };
 }
