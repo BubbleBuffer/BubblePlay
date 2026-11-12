@@ -26,8 +26,7 @@ use serde_json::{Map, Value};
 
 use crate::limits::{
     ADMIT_MAX, ADMIT_VIEWERS_MAX, AUTH_MAX, CTL_DATA_MAX, CTL_SEQ_MAX, FILE_HEADER_BYTES,
-    FILE_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT, PAIR_MAX, SIGNAL_BINARY_MAX,
-    SIGNAL_LIMIT,
+    FILE_LIMIT, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT, PAIR_MAX, SIGNAL_LIMIT,
 };
 
 /// A message the relay refuses. Go does one of two things with it, and the
@@ -186,15 +185,6 @@ pub enum SignalKind {
     Ping,
     /// Either side: closes the socket.
     Bye,
-    /// Not accepted any more. Named only by SignalMessage::bufferable, which
-    /// the pending buffer still consults.
-    Offer,
-    /// Not accepted any more (see Offer).
-    Ice,
-    /// Not accepted any more (see Offer).
-    FirstFrame,
-    /// Not accepted any more (see Offer).
-    MediaControl,
     /// Host to relay: the viewer IDs allowed to join. Consumed, never forwarded.
     Admit,
     /// Host to relay: opens a pairing window. Consumed, never forwarded.
@@ -225,10 +215,6 @@ impl SignalKind {
         match self {
             SignalKind::Ping => "ping",
             SignalKind::Bye => "bye",
-            SignalKind::Offer => "offer",
-            SignalKind::Ice => "ice",
-            SignalKind::FirstFrame => "first-frame",
-            SignalKind::MediaControl => "media-control",
             SignalKind::Admit => "admit",
             SignalKind::PairOpen => "pair-open",
             SignalKind::PairClose => "pair-close",
@@ -299,22 +285,11 @@ impl<'a> SignalMessage<'a> {
         self.field("action")
     }
 
-    /// The phase of a first-frame message.
-    pub fn phase(&self) -> &str {
-        self.field("phase")
-    }
-
-    /// Go's bufferable helper: keep this viewer message while no host is
-    /// connected.
+    /// True when the relay keeps this viewer message while no host is connected. Only auth-hello
+    /// is held, for the next host registration, which sends peer-joined first. The host verifies
+    /// it as if it had arrived live.
     pub fn bufferable(&self) -> bool {
-        match self.kind {
-            // auth-hello is held only for the next host registration, which
-            // sends peer-joined first. The host verifies it as if it had arrived live.
-            SignalKind::Offer | SignalKind::Ice | SignalKind::AuthHello => true,
-            SignalKind::FirstFrame => self.phase() == "request",
-            SignalKind::MediaControl => matches!(self.action(), "start" | "monitors" | "follow"),
-            _ => false,
-        }
+        self.kind == SignalKind::AuthHello
     }
 
     /// See SignalKind::consumed_by_relay.
@@ -507,19 +482,6 @@ pub fn validate_media_binary(side: Side, bytes: &[u8]) -> Result<(), Invalid> {
         return Err(Invalid::Close);
     }
     if side != Side::Host || bytes.len() <= MEDIA_HEADER_BYTES {
-        return Err(Invalid::Drop);
-    }
-    Ok(())
-}
-
-/// Validate a binary frame on a signaling socket: 1..=16384 bytes. A frame
-/// over the socket's 512 KiB read limit closes it; any other size outside the
-/// range is dropped.
-pub fn validate_signal_binary(bytes: &[u8]) -> Result<(), Invalid> {
-    if bytes.len() > SIGNAL_LIMIT {
-        return Err(Invalid::Close);
-    }
-    if bytes.is_empty() || bytes.len() > SIGNAL_BINARY_MAX {
         return Err(Invalid::Drop);
     }
     Ok(())

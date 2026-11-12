@@ -6,12 +6,6 @@
 /// Read limit of a signaling socket (`signalLimit`): 512 KiB of text.
 pub const SIGNAL_LIMIT: usize = 512 * 1024;
 
-/// Smallest binary frame on a signaling socket.
-pub const SIGNAL_BINARY_MIN: usize = 1;
-
-/// Largest binary frame on a signaling socket (16384 bytes).
-pub const SIGNAL_BINARY_MAX: usize = 16 * 1024;
-
 /// Length of the host's media frame header (magic, version, flags, codec,
 /// channels, sample rate, timestamps, ...).
 pub const MEDIA_HEADER_BYTES: usize = 28;

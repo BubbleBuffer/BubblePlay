@@ -3,9 +3,9 @@
 
 use bp_relay_core::{
     FILE_LIMIT, HELLO_LIMIT, Invalid, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT,
-    PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES, SIGNAL_BINARY_MAX, SIGNAL_LIMIT, Side,
+    PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES, SIGNAL_LIMIT, Side,
     SignalKind, validate_file_binary, validate_media_binary, validate_media_text,
-    validate_signal_binary, validate_signal_text,
+    validate_signal_text,
 };
 
 const EPOCH: &str = "0123456789abcdef0123456789abcdef";
@@ -27,7 +27,6 @@ fn padded(base: &str, len: usize) -> String {
 #[test]
 fn limits_match_relay_server_go() {
     assert_eq!(SIGNAL_LIMIT, 512 * 1024);
-    assert_eq!(SIGNAL_BINARY_MAX, 16384);
     assert_eq!(HELLO_LIMIT, 16384);
     assert_eq!(MEDIA_HEADER_BYTES, 28);
     assert_eq!(MEDIA_LIMIT, 8 * 1024 * 1024 + 28);
@@ -51,14 +50,6 @@ fn media_control_on_the_media_socket_at_512_bytes() {
     assert!(validate_media_text(Side::Viewer, &padded(base, 512), EPOCH).is_ok());
     assert!(validate_media_text(Side::Viewer, &padded(base, 513), EPOCH).is_err());
     assert!(validate_media_text(Side::Viewer, &padded(base, MEDIA_CONTROL_MAX), EPOCH).is_ok());
-}
-
-#[test]
-fn signal_binary_bounds() {
-    assert!(validate_signal_binary(&[]).is_err());
-    assert!(validate_signal_binary(&[0]).is_ok());
-    assert!(validate_signal_binary(&zeros(SIGNAL_BINARY_MAX)).is_ok());
-    assert!(validate_signal_binary(&zeros(SIGNAL_BINARY_MAX + 1)).is_err());
 }
 
 #[test]
@@ -395,14 +386,6 @@ fn media_ack_and_keyframe_key_sets() {
 
 #[test]
 fn binary_frames_close_past_the_read_limit_and_on_file_breaks() {
-    assert_eq!(
-        validate_signal_binary(&zeros(SIGNAL_LIMIT + 1)).unwrap_err(),
-        Invalid::Close
-    );
-    assert_eq!(
-        validate_signal_binary(&zeros(SIGNAL_BINARY_MAX + 1)).unwrap_err(),
-        Invalid::Drop
-    );
     assert_eq!(
         validate_media_binary(Side::Host, &zeros(MEDIA_LIMIT + 1)).unwrap_err(),
         Invalid::Close
