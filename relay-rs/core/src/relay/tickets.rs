@@ -15,7 +15,13 @@ impl Relay {
     /// Checks a ticket against the signalling peer of `issuer_role` for `pc`.
     /// Returns that peer's epoch when the ticket is good. A ticket is good while
     /// its issuer is open and before it expires (12 h).
-    pub(super) fn valid_ticket(&self, issuer_role: Role, pc: &str, text: &str, now_ms: u64) -> Option<String> {
+    pub(super) fn valid_ticket(
+        &self,
+        issuer_role: Role,
+        pc: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> Option<String> {
         util::decode_b64url(text, 32)?;
         let issuer = self.peers.get(&key_for(issuer_role, "", pc)).copied()?;
         let conn: Conn = self.open_conn(issuer)?;
@@ -28,7 +34,12 @@ impl Relay {
 
     /// Mints a ticket for a signalling socket: 32 random bytes, base64url. Only
     /// the SHA-256 of the text is kept (Go hashes the text, server.go:572).
-    pub(super) fn issue_ticket(&mut self, id: ConnId, now_ms: u64, rng: &mut dyn RelayRng) -> String {
+    pub(super) fn issue_ticket(
+        &mut self,
+        id: ConnId,
+        now_ms: u64,
+        rng: &mut dyn RelayRng,
+    ) -> String {
         let raw: [u8; 32] = util::random(rng);
         let text = util::b64url(&raw);
         let hash = sha256(text.as_bytes());

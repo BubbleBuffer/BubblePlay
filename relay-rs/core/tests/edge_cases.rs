@@ -3,9 +3,8 @@
 
 use bp_relay_core::{
     FILE_LIMIT, HELLO_LIMIT, Invalid, MEDIA_CONTROL_MAX, MEDIA_HEADER_BYTES, MEDIA_LIMIT,
-    PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES, SIGNAL_LIMIT, Side,
-    SignalKind, validate_file_binary, validate_media_binary, validate_media_text,
-    validate_signal_text,
+    PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES, SIGNAL_LIMIT, Side, SignalKind,
+    validate_file_binary, validate_media_binary, validate_media_text, validate_signal_text,
 };
 
 const EPOCH: &str = "0123456789abcdef0123456789abcdef";
