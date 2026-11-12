@@ -137,6 +137,19 @@ jobs:
       - name: bp-relay-worker builds (worker-build --release)
         working-directory: relay-rs/worker
         run: worker-build --release
+      # The bundle CI built and tested, stamped like tools/deploy-relay.mjs stamps it, so a deploy can use
+      # exactly this one: node tools/deploy-relay.mjs --config <wrangler.prod.toml> --skip-build.
+      - name: Stamp and keep the tested relay bundle
+        run: |
+          worker_build="$(sed -n 's/^worker = "=\(.*\)"//p' relay-rs/worker/Cargo.toml)"
+          printf '{"commit":"%s","builtAt":"%s","workerBuild":"%s"}
+' "$GITHUB_SHA" "$(date -u +%FT%TZ)" "$worker_build" > relay-rs/worker/build/BUILD_INFO.json
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: relay-worker-bundle
+          path: relay-rs/worker/build/
+          if-no-files-found: error
+          retention-days: 30
       # wrangler 4.148.0 was published 2026-10-06: the newest release at least two weeks old on
       # 2026-10-23 (4.149.0 is 13.9 days old). The crate has no lockfile for wrangler, so the exact pin is the guarantee.
       - name: Install wrangler (pinned)
