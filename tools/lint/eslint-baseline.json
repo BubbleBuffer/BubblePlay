@@ -1,0 +1,156 @@
+{
+  "worker/public/audio.js": {
+    "no-magic-numbers": 16
+  },
+  "worker/public/chrome.js": {
+    "no-magic-numbers": 10
+  },
+  "worker/public/cursor.js": {
+    "no-magic-numbers": 12
+  },
+  "worker/public/devicekey-kdf-worker.js": {
+    "no-magic-numbers": 2
+  },
+  "worker/public/devicekey-store.js": {
+    "max-lines-per-function": 1,
+    "no-magic-numbers": 1
+  },
+  "worker/public/devicekey-ui.js": {
+    "max-lines-per-function": 2,
+    "no-control-regex": 1,
+    "no-magic-numbers": 5
+  },
+  "worker/public/devicekey.js": {
+    "no-magic-numbers": 48,
+    "no-unused-vars": 2
+  },
+  "worker/public/dk-app.js": {
+    "max-lines-per-function": 2,
+    "no-magic-numbers": 9,
+    "no-useless-assignment": 1
+  },
+  "worker/public/dk-crypto.js": {
+    "no-magic-numbers": 67
+  },
+  "worker/public/dk-feedback.js": {
+    "max-lines-per-function": 1,
+    "no-magic-numbers": 5
+  },
+  "worker/public/dk-gate.js": {
+    "no-magic-numbers": 8
+  },
+  "worker/public/dk-handshake.js": {
+    "no-magic-numbers": 1
+  },
+  "worker/public/dk-log.js": {
+    "max-lines-per-function": 1,
+    "no-magic-numbers": 16
+  },
+  "worker/public/dk-relay.js": {
+    "no-magic-numbers": 6
+  },
+  "worker/public/dk-session.js": {
+    "max-lines-per-function": 1,
+    "no-control-regex": 1,
+    "no-magic-numbers": 7
+  },
+  "worker/public/dk-upload.js": {
+    "max-lines-per-function": 1,
+    "no-magic-numbers": 12
+  },
+  "worker/public/file-client.js": {
+    "no-empty": 1,
+    "no-magic-numbers": 13
+  },
+  "worker/public/file-transfer.js": {
+    "no-magic-numbers": 165
+  },
+  "worker/public/file-ui.js": {
+    "max-lines-per-function": 1,
+    "no-magic-numbers": 23
+  },
+  "worker/public/input.js": {
+    "no-magic-numbers": 274
+  },
+  "worker/public/latency-worker.js": {
+    "no-empty": 4,
+    "no-magic-numbers": 36
+  },
+  "worker/public/latency.js": {
+    "max-lines-per-function": 1,
+    "no-magic-numbers": 68
+  },
+  "worker/public/media-v4.js": {
+    "no-magic-numbers": 49
+  },
+  "worker/public/media.js": {
+    "max-lines-per-function": 2,
+    "no-empty": 10,
+    "no-magic-numbers": 84
+  },
+  "worker/public/monitor-previews.js": {
+    "no-magic-numbers": 6
+  },
+  "worker/public/monitor-selection.js": {
+    "no-magic-numbers": 2
+  },
+  "worker/public/receiver.js": {
+    "max-lines-per-function": 7,
+    "no-dupe-else-if": 1,
+    "no-empty": 32,
+    "no-magic-numbers": 172,
+    "no-unused-vars": 6
+  },
+  "worker/public/recovery.js": {
+    "no-magic-numbers": 4
+  },
+  "worker/public/remote-clipboard.js": {
+    "no-magic-numbers": 6
+  },
+  "worker/public/settings.js": {
+    "no-magic-numbers": 4
+  },
+  "worker/public/sharp-viewport.js": {
+    "no-magic-numbers": 3
+  },
+  "worker/public/transport.js": {
+    "no-useless-assignment": 1
+  },
+  "worker/public/turn.js": {
+    "no-control-regex": 1,
+    "no-magic-numbers": 1
+  },
+  "worker/public/wss-pipeline.js": {
+    "max-lines-per-function": 1,
+    "no-magic-numbers": 24
+  },
+  "worker/public/wss-worker-client.js": {
+    "no-magic-numbers": 1
+  },
+  "worker/test/cdp-boundary.test.mjs": {
+    "no-regex-spaces": 2,
+    "no-useless-escape": 8
+  },
+  "worker/test/clipboard-image.test.mjs": {
+    "no-unused-vars": 1
+  },
+  "worker/test/devicekey.test.mjs": {
+    "max-lines-per-function": 1
+  },
+  "worker/test/dk-crypto.test.mjs": {
+    "no-loss-of-precision": 1
+  },
+  "worker/test/file-drop.test.mjs": {
+    "no-undef": 2,
+    "no-unused-vars": 1
+  },
+  "worker/test/input-status.test.mjs": {
+    "no-regex-spaces": 1
+  },
+  "worker/test/media.test.mjs": {
+    "no-unused-vars": 1
+  },
+  "worker/test/viewer-socket-tickets.test.mjs": {
+    "no-dupe-keys": 1
+  }
+}

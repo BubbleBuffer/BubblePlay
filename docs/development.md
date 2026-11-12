@@ -87,6 +87,7 @@ node tools/check.mjs          # all deterministic checks, offline Rust resolutio
 node tools/check.mjs client   # Node tests and all JavaScript/inline-script syntax
 node tools/check.mjs host     # Rust tests and checks across all targets
 node tools/check.mjs syntax   # syntax only
+node tools/check.mjs lint     # lint gates: file length, suppressions, ESLint (shrink-only baselines in tools/lint/)
 ```
 
 The checker uses the current Node executable directly. Missing dependencies fail the offline check rather than triggering installation.
