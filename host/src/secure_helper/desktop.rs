@@ -38,11 +38,11 @@ use windows::{
             },
             Input::KeyboardAndMouse::*,
             WindowsAndMessaging::{
-                DispatchMessageW, DrawIconEx, GetCursorInfo, GetIconInfo, GetSystemMetrics,
-                GetWindowThreadProcessId, PeekMessageW, PostMessageW, CURSORINFO, CURSOR_SHOWING,
-                DI_NORMAL, EVENT_SYSTEM_DESKTOPSWITCH, HICON, ICONINFO, MSG, PM_REMOVE,
-                SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-                WINEVENT_OUTOFCONTEXT, WM_CLOSE, WM_COMMAND,
+                DispatchMessageW, DrawIconEx, GetClassNameW, GetCursorInfo, GetForegroundWindow,
+                GetIconInfo, GetSystemMetrics, GetWindowThreadProcessId, PeekMessageW,
+                PostMessageW, CURSORINFO, CURSOR_SHOWING, DI_NORMAL, EVENT_SYSTEM_DESKTOPSWITCH,
+                HICON, ICONINFO, MSG, PM_REMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WINEVENT_OUTOFCONTEXT, WM_CLOSE, WM_COMMAND,
             },
         },
     },
@@ -210,7 +210,9 @@ impl Worker {
             let _ = t.join();
         }
     }
-    pub fn spawn(session: u32, sid: String, region: Region, epoch: u64) -> Self {
+    /// `elevated` is set only for hosts that negotiated
+    /// [`protocol::ELEVATED_FOREGROUND_VERSION`].
+    pub fn spawn(session: u32, sid: String, region: Region, epoch: u64, elevated: bool) -> Self {
         let (s, r) = mpsc::sync_channel(32);
         let (es, er) = mpsc::sync_channel(4);
         let (receipt_send, receipts) = mpsc::sync_channel(32);
@@ -222,6 +224,7 @@ impl Worker {
                 &sid,
                 region,
                 epoch,
+                elevated,
                 r,
                 es,
                 thread_stop,
@@ -536,11 +539,57 @@ fn composite_cursor(dc: HDC, region: Region) {
     }
 }
 #[allow(clippy::too_many_arguments)]
+/// The foreground window the helper verified itself (never the host's claim).
+struct ElevatedForeground {
+    pid: u32,
+    exe: String,
+    class: String,
+    integrity: u32,
+}
+fn elevated_foreground(session: u32) -> Option<ElevatedForeground> {
+    let window = unsafe { GetForegroundWindow() };
+    if window.is_invalid() {
+        return None;
+    }
+    let mut buffer = [0u16; 64];
+    let n = unsafe { GetClassNameW(window, &mut buffer) }.max(0) as usize;
+    let class = String::from_utf16_lossy(&buffer[..n]);
+    // Cheap rejection first: the 100 ms worker respawn calls this on every
+    // ordinary foreground too.
+    if class != "Ghost" {
+        return None;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    let exe = crate::admin_agent::trust::process_image_path(pid)?
+        .to_string_lossy()
+        .into_owned();
+    let integrity = crate::desktop_session::process_integrity_rid(pid)?;
+    let expected = std::path::PathBuf::from(std::env::var_os("SystemRoot")?)
+        .join("System32")
+        .join("dwm.exe");
+    protocol::elevated_foreground_matches(
+        &class,
+        &exe,
+        crate::admin_agent::trust::process_session_id(pid),
+        integrity,
+        &expected.to_string_lossy(),
+        session,
+    )
+    .then_some(ElevatedForeground {
+        pid,
+        exe,
+        class,
+        integrity,
+    })
+}
+#[allow(clippy::too_many_arguments)]
 fn run(
     session: u32,
     sid: &str,
     region: Region,
     epoch: u64,
+    elevated: bool,
     commands: Receiver<Command>,
     events: SyncSender<Event>,
     stopping: Arc<AtomicBool>,
@@ -549,6 +598,22 @@ fn run(
     let switch_generation = DESKTOP_SWITCHES.load(Ordering::Acquire);
     let desktop = InputDesktop::open()?;
     if desktop.kind() != DesktopKind::Secure {
+        if elevated && desktop.kind() == DesktopKind::Default && admin_mode(sid) {
+            if let Some(target) = elevated_foreground(session) {
+                return run_elevated(
+                    session,
+                    sid,
+                    epoch,
+                    switch_generation,
+                    desktop,
+                    target,
+                    commands,
+                    events,
+                    stopping,
+                    receipts,
+                );
+            }
+        }
         let _ = events.try_send(Event::State {
             secure: false,
             kind: Kind::Other,
@@ -787,6 +852,162 @@ fn run(
         available: false,
         epoch,
     });
+    result
+}
+/// Default-desktop input while the foreground is above the admin agent's
+/// integrity (the DWM ghost of a hung window). Input only: no capture, no
+/// consent actions. Each batch re-verifies the foreground; the worker leaves as
+/// soon as it changes and the host falls back to the admin agent.
+#[allow(clippy::too_many_arguments)]
+fn run_elevated(
+    session: u32,
+    sid: &str,
+    epoch: u64,
+    switch_generation: u64,
+    desktop: InputDesktop,
+    target: ElevatedForeground,
+    commands: Receiver<Command>,
+    events: SyncSender<Event>,
+    stopping: Arc<AtomicBool>,
+    receipts: SyncSender<protocol::InputReceipt>,
+) -> Result<()> {
+    let bound = desktop.bind_thread()?;
+    let physical_coordinates = PhysicalCoordinates::enter(epoch)?;
+    let identity = bound.security_context()?;
+    ensure!(
+        identity.token_is_local_system
+            && identity.token_session_id == session
+            && identity.thread_desktop.eq_ignore_ascii_case("default"),
+        "invalid elevated-foreground input binding"
+    );
+    tracing::info!(
+        epoch,
+        foreground_pid = target.pid,
+        foreground_exe = %target.exe,
+        foreground_class = %target.class,
+        foreground_integrity = %format_args!("{:#x}", target.integrity),
+        "helper input route on: foreground above admin-agent integrity"
+    );
+    let mut held = Held::default();
+    let mut frames = RateLimiter::new(2000., 2000., Instant::now());
+    let mut records = RateLimiter::new(8192., 8192., Instant::now());
+    let mut state_at = Instant::now();
+    let result = (|| {
+        loop {
+            if stopping.load(Ordering::Acquire)
+                || DESKTOP_SWITCHES.load(Ordering::Acquire) != switch_generation
+                || trust::console() != session
+                || !InputDesktop::open().is_ok_and(|d| d.kind() == DesktopKind::Default)
+                || !admin_mode(sid)
+                || elevated_foreground(session).is_none()
+            {
+                break;
+            }
+            if Instant::now() >= state_at {
+                state_at = Instant::now() + Duration::from_millis(100);
+                let _ = events.try_send(Event::State {
+                    secure: false,
+                    kind: Kind::ElevatedForeground,
+                    admin: true,
+                    available: true,
+                    epoch,
+                });
+            }
+            let mut stop = false;
+            for _ in 0..32 {
+                let c = match commands.try_recv() {
+                    Ok(c) => c,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        stop = true;
+                        break;
+                    }
+                };
+                match c {
+                    Command::Input { id, records: r } => {
+                        let now = Instant::now();
+                        let received = r.len() as u16;
+                        let receipt = if r.len() > 1024 || r.iter().any(|r| r.validate().is_err()) {
+                            protocol::InputReceipt::rejected(id, received, "invalid-records")
+                        } else if !admin_mode(sid) {
+                            stop = true;
+                            protocol::InputReceipt::rejected(id, received, "policy-off")
+                        } else if !frames.take(1., now) || !records.take(r.len() as f64, now) {
+                            protocol::InputReceipt::rejected_after_policy(
+                                id,
+                                received,
+                                "input-rate-limit",
+                            )
+                        } else if elevated_foreground(session).is_none() {
+                            stop = true;
+                            protocol::InputReceipt::rejected_after_policy(
+                                id,
+                                received,
+                                "foreground-not-elevated",
+                            )
+                        } else {
+                            // Records arrive virtual-desk normalized, as for the
+                            // admin agent: no capture-region mapping.
+                            let (applied, error_code) = inject(&r);
+                            let applied = applied.min(r.len());
+                            for record in &r[..applied] {
+                                held.observe(record);
+                            }
+                            protocol::InputReceipt {
+                                id,
+                                received,
+                                accepted: received,
+                                applied: applied as u16,
+                                error_code,
+                                reason: if applied == r.len() {
+                                    "ok"
+                                } else {
+                                    "partial-send-input"
+                                }
+                                .into(),
+                            }
+                        };
+                        receipts
+                            .try_send(receipt)
+                            .map_err(|_| anyhow::anyhow!("input receipt queue unavailable"))?;
+                        if stop {
+                            break;
+                        }
+                    }
+                    Command::Deny(id) => {
+                        let _ = events.try_send(Event::Denied {
+                            id,
+                            ok: false,
+                            reason: "secure-desktop-unavailable".into(),
+                        });
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    })();
+    // A button or key pressed through this route must not stay down once the
+    // foreground changes (the press itself usually activates another window).
+    held.release();
+    tracing::info!(
+        epoch,
+        foreground_pid = target.pid,
+        foreground_exe = %target.exe,
+        "helper input route off: foreground no longer above admin-agent integrity"
+    );
+    let _ = events.try_send(Event::State {
+        secure: false,
+        kind: Kind::Other,
+        admin: false,
+        available: false,
+        epoch,
+    });
+    drop(physical_coordinates);
+    drop(bound);
     result
 }
 #[cfg(test)]
