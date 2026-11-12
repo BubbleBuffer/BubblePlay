@@ -3,8 +3,11 @@ package de.bubblebuffer.bubbleplay.ui
 import android.app.Activity
 import android.content.Intent
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
+import android.text.Editable
+import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.View
 import android.view.ViewGroup
@@ -55,6 +58,8 @@ class PairActivity : Activity() {
     private lateinit var progressBar: ProgressBar
     private lateinit var earlierLine: TextView
     private lateinit var scannedNote: TextView
+    private lateinit var linkRelayLine: TextView
+    private lateinit var progressRelayLine: TextView
     private lateinit var paired: LinearLayout
     private lateinit var pairedLine: TextView
     private val worker = Executors.newSingleThreadExecutor()
@@ -145,8 +150,17 @@ class PairActivity : Activity() {
         form.addView(status)
         scannedNote = views.note(R.string.pair_from_link).apply { visibility = View.GONE }
         form.addView(scannedNote)
+        linkRelayLine = relaySummary().apply { visibility = View.GONE }
+        form.addView(linkRelayLine)
         relayField = views.field(R.string.pair_relay_hint).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            addTextChangedListener(object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                    linkRelayLine.text = getString(R.string.pair_relay_host, Uri.parse(s.toString().trim()).host.orEmpty())
+                }
+                override fun afterTextChanged(s: Editable?) = Unit
+            })
         }
         pcIdField = monoField(R.string.pair_pcid_hint)
         codeField = monoField(R.string.pair_code_hint)
@@ -165,6 +179,8 @@ class PairActivity : Activity() {
         column.addView(form)
 
         progress = tallColumn().apply { visibility = View.GONE }
+        progressRelayLine = relaySummary()
+        progress.addView(progressRelayLine)
         stageLine = TextView(this).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
             setTextColor(KeyPalette.MILK)
@@ -294,6 +310,8 @@ class PairActivity : Activity() {
             return
         }
         scannedNote.visibility = View.VISIBLE
+        linkRelayLine.text = getString(R.string.pair_relay_host, Uri.parse(link.relay).host)
+        linkRelayLine.visibility = View.VISIBLE
         relayField.setText(link.relay)
         pcIdField.setText(link.pcId)
         codeField.setText(PairingCode.display(link.code))
@@ -314,6 +332,7 @@ class PairActivity : Activity() {
                     return
                 }
                 val name = PairForm.name(nameField.text.toString(), pcId)
+                progressRelayLine.text = getString(R.string.pair_relay_host, Uri.parse(relay).host)
                 client = PairingClient(key, PairLink(relay, pcId, code), name, listener).also { it.start() }
                 showProgress()
             }
@@ -395,5 +414,10 @@ class PairActivity : Activity() {
     private fun monoField(hint: Int): EditText = views.field(hint).apply {
         typeface = Typeface.MONOSPACE
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+    }
+
+    private fun relaySummary() = views.body("").apply {
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+        setTypeface(typeface, Typeface.BOLD)
     }
 }

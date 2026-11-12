@@ -20,6 +20,14 @@ worker/private/
 worker/.live/
 
 # Local env / secrets
+*.jks
+*.keystore
+*.pem
+*.p12
+*.pfx
+keystore.properties
+**/.dev.vars
+**/wrangler.deploy.toml
 .env
 *.local
 worker/.dev.vars

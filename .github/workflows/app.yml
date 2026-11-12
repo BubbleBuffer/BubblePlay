@@ -44,7 +44,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: app-${{ github.ref }}
@@ -102,19 +102,6 @@ jobs:
           else
             flutter test
           fi
-      - name: Commit golden pictures
-        # Artifacts can hit the account quota, so the pictures are also pushed back to the branch.
-        if: ${{ inputs.update_goldens }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git config user.name "BubblePlay CI"
-          git config user.email "ci@users.noreply.github.com"
-          git add app/test/screens/goldens
-          if git diff --cached --quiet; then echo "goldens unchanged"; else
-            git commit -m "App: golden pictures rendered on build01"
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ github.ref_name }}"
-          fi
       - name: Upload golden pictures
         if: ${{ inputs.update_goldens }}
         continue-on-error: true
@@ -148,3 +135,36 @@ jobs:
           path: app/test/**/failures/
           if-no-files-found: ignore
           retention-days: 7
+
+  commit-goldens:
+    if: ${{ inputs.update_goldens }}
+    needs: flutter
+    runs-on: [self-hosted, build01]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Flutter SDK
+        run: |
+          dir="$HOME/flutter-$FLUTTER_VERSION"
+          test -x "$dir/bin/flutter"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
+      - name: Render golden pictures
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter test --update-goldens
+      - name: Commit golden pictures
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "BubblePlay CI"
+          git config user.email "ci@users.noreply.github.com"
+          git add app/test/screens/goldens
+          if git diff --cached --quiet; then echo "goldens unchanged"; else
+            git commit -m "App: golden pictures rendered on build01"
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ github.ref_name }}"
+          fi

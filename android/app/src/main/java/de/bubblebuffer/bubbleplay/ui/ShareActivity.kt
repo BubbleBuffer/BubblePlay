@@ -6,6 +6,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import de.bubblebuffer.bubbleplay.R
 import de.bubblebuffer.bubbleplay.files.ShareParse
@@ -42,7 +43,9 @@ class ShareActivity : Activity() {
         else intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
         val clip = intent.clipData?.let { c -> (0 until c.itemCount).map { c.getItemAt(it).uri } }.orEmpty()
         return ShareParse.collect(intent.action, if (intent.action == Intent.ACTION_SEND) stream else null,
-            if (intent.action == Intent.ACTION_SEND_MULTIPLE) streams else null, clip)
+            if (intent.action == Intent.ACTION_SEND_MULTIPLE) streams else null, clip,
+            applicationId = packageName, uriParts = { it.scheme to it.authority },
+            onRejected = { Log.w("BubblePlayShare", "share dropped: $it") })
     }
 }
 

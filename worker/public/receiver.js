@@ -733,7 +733,7 @@ function qualityHudText() {
 }
 setInterval(() => {
   if (cursorReconciler?.feedbackAt !== null && cursorReconciler?.feedbackAt !== undefined) hudState.cursorAge = Math.round(performance.now()-cursorReconciler.feedbackAt);
-  hud.innerHTML =
+  hud.textContent =
     `ws ${hudState.ws} | ice ${hudState.ice} | route ${hudState.route} | control ${hudState.control} motion ${hudState.motion}\n` +
     `zoom ${hudState.zoom}× | pointer ${hudState.pointer} ${hudState.cursorSeq} ${hudState.cursorAge}ms | motion ${hudState.motionSent}/${hudState.motionCoalesced}/${hudState.motionDropped} | touch ${hudState.touch}\n` +
     `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +

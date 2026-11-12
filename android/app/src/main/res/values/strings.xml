@@ -322,6 +322,7 @@
     <string name="pair_proving">Checking the code with the PC…</string>
     <string name="pair_waiting">Check that the PC shows the same number, then choose Allow on the PC.</string>
     <string name="pair_from_link">From a scanned code</string>
+    <string name="pair_relay_host">Relay: %1$s</string>
     <string name="pair_number_label">Comparison number</string>
     <string name="pair_confirm_pc">Confirm on the PC.</string>
     <string name="pair_earlier">Earlier stage: %1$s</string>

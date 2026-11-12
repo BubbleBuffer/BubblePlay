@@ -2,6 +2,9 @@
 
 BubblePlay for Windows and Android
 
+Android keeps its device key and saved PCs out of cloud backups and device-to-device transfers.
+Release APKs are unsigned at build time; `flutter-apk` sends them to linux01 for signing with the BubblePlay release key before publication.
+
 ## Getting Started
 
 This project is a starting point for a Flutter application.
