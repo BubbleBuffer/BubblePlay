@@ -777,7 +777,7 @@ impl CursorKindTracker {
 }
 
 #[derive(Debug, PartialEq)]
-enum Command {
+pub(crate) enum Command {
     Key(u16, bool),
     Rel(i16, i16),
     Abs(u16, u16),
@@ -893,7 +893,7 @@ pub enum HeldKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ClipboardChunk {
+pub(crate) struct ClipboardChunk {
     paste: bool,
     id: u16,
     index: u16,
@@ -901,7 +901,7 @@ struct ClipboardChunk {
     bytes: Vec<u8>,
 }
 
-fn decode(data: &[u8]) -> Option<Command> {
+pub(crate) fn decode(data: &[u8]) -> Option<Command> {
     match *data.first()? {
         TYPE_KEY_DOWN if data.len() == 3 => {
             Some(Command::Key(u16::from_le_bytes([data[1], data[2]]), false))
