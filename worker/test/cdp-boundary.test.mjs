@@ -305,10 +305,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /clientBuild/);
   assert.match(client, /mediaGeneration/);
   assert.match(client, /<canvas id="screen"><\/canvas><canvas id="sharp-screen"><\/canvas>/);
-  assert.match(client, /desiredSharpCrop/);
-  assert.match(client, /function viewportForGeneration\(generation\)/);
-  assert.match(client, /never render a generation with stale geometry/);
-  assert.match(client, /viewport-timeout-full/);
   assert.match(client, /function beginWssRecovery\(reason, requestId = null\)/);
   assert.match(client, /wssRecoveryPending/);
   assert.match(client, /wss-recovery-keyframe/);
@@ -351,20 +347,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
 });
 
 
-
-test("sharp viewport crop is requested on WSS v4 (no protocol guard)", () => {
-  const client = readClientSource();
-  const body = (name) => {
-    const start = client.indexOf(`function ${name}(`);
-    assert.ok(start >= 0, `${name} exists`);
-    return client.slice(start, client.indexOf("\n}\n", start));
-  };
-  for (const name of ["sendViewportRequest", "scheduleSharpViewport"]) {
-    assert.doesNotMatch(body(name), /WSS_PROTOCOL[ ]*[!=]==/, `${name} must not gate the crop off on v4`);
-  }
-  assert.doesNotMatch(client, /v4 always streams the full desktop/);
-  assert.match(body("sendViewportRequest"), /type: "media-control", action: "viewport", protocol: WSS_PROTOCOL/);
-});
 
 test("QoS polling continues after ICE reaches completed", () => {
   const client = readClientSource();

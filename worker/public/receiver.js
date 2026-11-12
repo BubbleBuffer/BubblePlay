@@ -20,7 +20,8 @@ import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
-import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
+import { cropGain } from "/sharp-viewport.js";
+import { createSharpSession } from "/sharp-session.js";
 import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
@@ -191,18 +192,7 @@ let fileDropPresentedViewportRevision = null;
 // rtpGate: on WebRTC, how presentation of the admitted generation is proven
 // (rtcAdmissionGate in monitor-selection.js); null keeps the legacy rule.
 const firstFrameHandshake = { requestId: null, reason: "", transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, rtpGate: null, failureReason: "", timer: null };
-let viewportRevision = 0;
-let viewportTimer = null;
-let viewportLast = null;
-let viewportState = { enabled: false, revision: 0, generation: 0 };
-let viewportPending = null;
-let viewportDesired = null;
-let viewportTransitionTimer = null;
-let viewportLastSentAt = -Infinity;
-let viewportConsecutiveTimeouts = 0;
-let sharpDisabledForSession = false;
 let renderedSharpView = null;
-let viewportTelemetry = { state: "full", revision: 0, generation: 0, crop: "1920x1080@0,0" };
 const clientBuild = "native-file-drop-2026-10-05";
 
 function secureDesktopText() {
@@ -740,7 +730,7 @@ setInterval(() => {
     `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
     `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
     `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps\n` +
-    `${clientBuild} | ${fullFrameDiagnostic ? "full-frame" : "sharp-zoom"} | media g${hudState.mediaGeneration} | view ${viewportTelemetry.state} r${viewportTelemetry.revision} ${viewportTelemetry.crop}\n` +
+    `${clientBuild} | ${fullFrameDiagnostic ? "full-frame" : "sharp-zoom"} | media g${hudState.mediaGeneration} | view ${sharpSession.telemetry.state} r${sharpSession.telemetry.revision} ${sharpSession.telemetry.crop}\n` +
     qualityHudText();
   if (diagnosticsOutput && diagnosticsVisible) diagnosticsOutput.textContent = diagnosticsReport();
   renderConnectionStatus();
@@ -1251,7 +1241,7 @@ async function handleEndpointSignal(socket, generation, msg) {
       applyBenchStatus(msg);
       break;
     case "media-view":
-      handleMediaView(msg);
+      sharpSession.onMediaView(msg);
       break;
     case "desktop-state":
       handleDesktopState(msg);
@@ -1518,14 +1508,7 @@ function stopWssMedia() {
   wssRecoveryPending = false;
   wssRecoveryState = "awaiting-keyframe";
   wssLastRecoveryAt = -Infinity;
-  viewportState = { enabled: false, revision: viewportRevision, generation: 0 };
-  viewportPending = null;
-  viewportDesired = null;
-  viewportLast = null;
-  clearTimeout(viewportTimer); viewportTimer = null;
-  clearTimeout(viewportTransitionTimer); viewportTransitionTimer = null;
-  viewportConsecutiveTimeouts = 0;
-  sharpDisabledForSession = false;
+  sharpSession.reset();
   renderedSharpView = null;
   sharpScreen.classList.remove("active");
 }
@@ -1944,7 +1927,7 @@ async function maybeStartWssHost() {
     codec, streamMode: streamModeValue(), reason: "client-start",
     quality: qualityPreset === "auto" ? "high" : qualityPreset, ...(audioDecodable ? { audio: 1 } : {}) });
   startFirstFrameHandshake("wss-host-start");
-  scheduleSharpViewport(fullFrameDiagnostic ? "diagnostic-full-frame" : "wss-start");
+  sharpSession.schedule(fullFrameDiagnostic ? "diagnostic-full-frame" : "wss-start");
 }
 
 function requestWssKeyframe(reason, requestId = null) {
@@ -2191,7 +2174,7 @@ function postWssFrameToWorker(frame) {
     hevcCodec: activeWssHevcCodec(),
     hybridMode: activeWssHybridModeName(),
     desktopAvailable,
-    view: viewportForGeneration(frame.generation),
+    view: sharpSession.cropForGeneration(frame.generation),
     frameTrace: frame.frameTrace,
   }, [bytes.buffer]);
 }
@@ -2622,7 +2605,7 @@ if (diagnosticsEnabled) {
       viewport.setZoom(1, center);
       viewport.setZoom(value, center);
       renderViewport();
-      scheduleSharpViewport("diagnostic-fixed-zoom");
+      sharpSession.schedule("diagnostic-fixed-zoom");
       return true;
     },
     panFixedViewport(dx, dy) {
@@ -2734,7 +2717,7 @@ if (diagnosticsEnabled) {
           decoderPath: wssWorker?.ready ? "worker" : "main",
         },
         audio: audioSnapshot(),
-        viewport: viewportHealthSnapshot(),
+        viewport: sharpSession.health(renderedSharpView, viewport.zoom, pointerMode),
         signaling: {
           registered: signalingRegistered,
           registeredAtMs: signalingRegisteredAtMs,
@@ -3628,7 +3611,7 @@ function drawFrame(frame, due = performance.now()) {
     const w = frame.displayWidth, h = frame.displayHeight;
     lastDecodedDimensions = { width: w, height: h };
     const metadata = usingWssMedia ? wssFrameMeta.get(frame) : null;
-    const view = metadata ? viewportForGeneration(metadata.generation) : null;
+    const view = metadata ? sharpSession.cropForGeneration(metadata.generation) : null;
     if (usingWssMedia && (!metadata || !view)) return; // never render a generation with stale geometry
     let hybridTilesDrawn = 0;
     let presentedCanvas = screen;
@@ -3887,11 +3870,11 @@ function resolveNativeFileDrop(event) {
   if (!nativeFileDropAvailable || mobilePointerDevice || pointerMode !== "desktop" ||
       event.pointerType === "touch" || event.sourceCapabilities?.firesTouchEvents || event.target !== inputSurface) return { purpose: "save" };
   if (!fileTransferAvailable() || !connected || !desktopAvailable || desktopAwaitingFrame ||
-      desktopInputState !== "enabled" || !hasPresentedFrame || viewportPending || transitionNeedsKeyframe) return { error: "drop-not-ready" };
+      desktopInputState !== "enabled" || !hasPresentedFrame || sharpSession.isPending || transitionNeedsKeyframe) return { error: "drop-not-ready" };
   // The base full-desktop canvas remains the coordinate plane while a sharp
   // crop is overlaid. A committed crop without its matching rendered overlay
   // is transitional geometry and must not become a native drop target.
-  if (viewportState.enabled && (!renderedSharpView || renderedSharpView.revision !== viewportState.revision ||
+  if (sharpSession.committed.enabled && (!renderedSharpView || renderedSharpView.revision !== sharpSession.committed.revision ||
       renderedSharpView.generation !== fileDropPresentedGeneration)) return { error: "drop-not-ready" };
   const media = activeVideo || screenMedia();
   const width = activeVideo ? activeVideo.videoWidth : screenDims().width;
@@ -3903,7 +3886,7 @@ function resolveNativeFileDrop(event) {
   const generation = fileDropPresentedGeneration;
   if (!Number.isInteger(generation) || generation <= 0 || generation > 0xffff_ffff) return { error: "drop-not-ready" };
   return { purpose: "drop", drop: { ...drop, generation,
-    viewportRevision: fileDropPresentedViewportRevision ?? (viewportState.revision || 0) } };
+    viewportRevision: fileDropPresentedViewportRevision ?? (sharpSession.committed.revision || 0) } };
 }
 function updateKeyboardLock() {
   const keyboard = navigator.keyboard;
@@ -4260,7 +4243,7 @@ function setPointerMode(next, persist=true) {
     if (input.cursorSync()) cursorReconciler.noteSent(input.lastCursorSequence);
     if (pointerMode === "desktop") cursorSyncTimer=setTimeout(requestCursorSync,500);
    }
-   scheduleSharpViewport("pointer-mode");
+   sharpSession.schedule("pointer-mode");
    showContextHint();
  }
 function streamModeValue() { return pointerMode === "game" ? "game" : "work"; }
@@ -4276,116 +4259,20 @@ function syncViewport() { const area = streamArea(); viewport.resize(area.width,
 function renderTouchCursor() { cursorAppearance.render({ pointerMode, inputReady, point: remoteCursor.screenPoint(viewport), overlayVisible: touchCursorVisible, mousePointerActive }); }
 function centerCameraOnCursor() { if (shouldCenterCameraOnCursor({ zoom: viewport.zoom, pointerMode, synced: cursorReconciler.synced, locallyAuthoritative: locallyAuthoritativeCursor })) viewport.centerOnNormalized(remoteCursor.snapshot()); }
 function syncViewportAndFollow() { syncViewport(); centerCameraOnCursor(); renderViewport(); }
-function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("cursor-follow"); }
+function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); sharpSession.schedule("cursor-follow"); }
 function showTouchCursor() { touchCursorVisible=shouldShowCursorOverlay({pointerMode, ...cursorReconciler}); renderTouchCursor(); }
 function resetTouchCursor() { clearCursorSyncTimer(); touchCursorVisible=false; gestures.reset(); cursorReconciler.reset(); renderTouchCursor(); }
-function mediaViewCrop(message) {
-  const desktopWidth = Number(message?.desktopWidth) || remoteDesktop.width;
-  const desktopHeight = Number(message?.desktopHeight) || remoteDesktop.height;
-  const width = Number(message?.sourceWidth) || desktopWidth;
-  const height = Number(message?.sourceHeight) || desktopHeight;
-  return { enabled: message?.state !== "full" && (width < desktopWidth || height < desktopHeight),
-    x: Number(message?.sourceX) || 0, y: Number(message?.sourceY) || 0, width, height,
-    desktopWidth, desktopHeight, revision: Number(message?.revision) || 0,
-    generation: Number(message?.generation) || 0, source: message };
-}
-function viewportHealthSnapshot() {
-  const crop = renderedSharpView || activeViewportCrop();
-  const gain = cropGain(crop, lastDecodedDimensions?.width || 1920, lastDecodedDimensions?.height || 1080);
-  return { state: viewportTelemetry.state, revision: viewportTelemetry.revision, generation: viewportTelemetry.generation,
-    crop: viewportTelemetry.crop, zoom: Number(viewport.zoom.toFixed(2)), pointer: pointerMode,
-    pending: viewportPending?.revision || null,
-    transitionMs: viewportPending ? Math.round(performance.now() - viewportPending.sentAt) : 0,
-    gainX: Number(gain.x.toFixed(2)), gainY: Number(gain.y.toFixed(2)), requested: viewportLast };
-}
-function activeViewportCrop() {
-  return viewportState.source ? mediaViewCrop(viewportState.source) : fullDesktopCrop(remoteDesktop.width, remoteDesktop.height);
-}
-function computeDesiredViewport() {
-  if (streamModeValue() === "game" || !sharpZoomEnabled || sharpDisabledForSession) return fullDesktopCrop(remoteDesktop.width, remoteDesktop.height);
-  return desiredSharpCrop({ viewport: viewport.snapshot(), viewportWidth: innerWidth, viewportHeight: innerHeight,
-    content: viewport.content, desktopWidth: remoteDesktop.width, desktopHeight: remoteDesktop.height,
-    wasEnabled: viewportState.enabled || !!viewportPending?.requested?.enabled });
-}
-function q16(value, extent) { return Math.max(0, Math.min(65535, Math.round(value / Math.max(1, extent) * 65535))); }
-function armViewportTransitionTimeout(revision) {
-  clearTimeout(viewportTransitionTimer);
-  viewportTransitionTimer = setTimeout(() => {
-    if (!viewportPending || viewportPending.revision !== revision) return;
-    if (!viewportPending.recoveryRequested) {
-      viewportPending.recoveryRequested = true;
-      beginWssRecovery("viewport-transition-timeout");
-      armViewportTransitionTimeout(revision);
-      return;
-    }
-    viewerLog("warn", "viewport-transition-failed", { revision, requested: viewportPending.requested });
-    viewportConsecutiveTimeouts++;
-    viewportPending = null;
-    if (viewportConsecutiveTimeouts >= 2) sharpDisabledForSession = true;
-    sendViewportRequest(fullDesktopCrop(remoteDesktop.width, remoteDesktop.height), "viewport-timeout-full", true);
-  }, 1_500);
-}
-function sendViewportRequest(crop, reason, force = false) {
-  // The crop travels out of band (media-control viewport / media-view); frames carry only a generation.
-  if (!usingWssMedia || !wssStartedHost || viewportPending) return false;
-  const active = activeViewportCrop();
-  if (!force && !cropNeedsUpdate(active, crop, remoteDesktop.width, remoteDesktop.height)) return false;
-  const revision = viewportRevision = (viewportRevision + 1) >>> 0;
-  viewportLastSentAt = performance.now();
-  viewportLast = { enabled: crop.enabled, x: crop.x, y: crop.y, width: crop.width, height: crop.height };
-  viewportPending = { revision, requested: crop, reason, sentAt: viewportLastSentAt, recoveryRequested: false, generation: 0, source: null };
-  viewportTelemetry = { state: "refining", revision, generation: 0, crop: `${crop.width}x${crop.height}@${crop.x},${crop.y}` };
-  sendControl({ type: "media-control", action: "viewport", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
-    revision, enabled: crop.enabled, xQ16: q16(crop.x, remoteDesktop.width), yQ16: q16(crop.y, remoteDesktop.height),
-    widthQ16: q16(crop.width, remoteDesktop.width), heightQ16: q16(crop.height, remoteDesktop.height), reason });
-  armViewportTransitionTimeout(revision);
-  return true;
-}
-function flushSharpViewport(reason = "sharp-viewport") {
-  viewportTimer = null;
-  viewportDesired = computeDesiredViewport();
-  if (viewportPending) return;
-  sendViewportRequest(viewportDesired, reason);
-}
-function scheduleSharpViewport(reason = "sharp-viewport") {
-  if (!usingWssMedia || !wssStartedHost) return;
-  viewportDesired = computeDesiredViewport();
-  if (viewportPending) return;
-  clearTimeout(viewportTimer);
-  const wait = Math.max(0, 100 - (performance.now() - viewportLastSentAt));
-  viewportTimer = setTimeout(() => flushSharpViewport(reason), wait);
-}
-function handleMediaView(message) {
-  if (!Number.isInteger(message.revision)) return;
-  const minimumRevision = Math.max(viewportState.revision || 0, viewportPending?.revision || 0);
-  if (message.revision < minimumRevision) return;
-  viewportTelemetry = { state: message.state || "?", revision: message.revision, generation: message.generation || 0,
-    crop: `${message.sourceWidth || "?"}x${message.sourceHeight || "?"}@${message.sourceX || 0},${message.sourceY || 0}` };
-  if (message.state === "pending") {
-    if (viewportPending?.revision === message.revision) Object.assign(viewportPending, { source: message, generation: message.generation || 0 });
-    return;
-  }
-  const crop = mediaViewCrop(message);
-  const completed = viewportPending?.revision === message.revision ? viewportPending : null;
-  viewportState = { enabled: crop.enabled, revision: message.revision, generation: message.generation || 0, source: message };
-  if (completed) {
-    viewportPending = null;
-    if (crop.enabled || completed.reason !== "viewport-timeout-full") viewportConsecutiveTimeouts = 0;
-    clearTimeout(viewportTransitionTimer); viewportTransitionTimer = null;
-  }
-  const gain = cropGain(crop, lastDecodedDimensions?.width || 1920, lastDecodedDimensions?.height || 1080);
-  viewportTelemetry = { state: crop.enabled ? `sharp ${gain.x.toFixed(1)}x/${gain.y.toFixed(1)}x` : "full",
-    revision: message.revision, generation: message.generation || 0,
-    crop: `${crop.width}x${crop.height}@${crop.x},${crop.y}` };
-  scheduleSharpViewport("viewport-committed");
-}
-function viewportForGeneration(generation) {
-  if (viewportPending?.source && viewportPending.generation === generation) return mediaViewCrop(viewportPending.source);
-  if (viewportState.source && viewportState.generation === generation) return mediaViewCrop(viewportState.source);
-  if (!viewportPending && viewportState.source) return { ...mediaViewCrop(viewportState.source), generation };
-  if (!viewportPending && !viewportState.enabled) return { ...fullDesktopCrop(remoteDesktop.width, remoteDesktop.height), generation };
-  return null;
-}
+const sharpSession = createSharpSession({
+  enabled: sharpZoomEnabled,
+  desktop: () => remoteDesktop,
+  geometry: () => ({ snapshot: viewport.snapshot(), content: viewport.content, innerWidth, innerHeight }),
+  streamMode: streamModeValue,
+  canSend: () => usingWssMedia && wssStartedHost,
+  send: fields => sendControl({ type: "media-control", action: "viewport", protocol: WSS_PROTOCOL, epoch: mediaEpoch, ...fields }),
+  recover: reason => beginWssRecovery(reason),
+  decoded: () => lastDecodedDimensions,
+  log: viewerLog,
+});
 function layoutSharpCanvas(crop) {
   if (!crop?.enabled) { sharpScreen.classList.remove("active"); renderedSharpView = null; return; }
   const content = viewport.content;
@@ -4400,8 +4287,8 @@ function layoutSharpCanvas(crop) {
   renderedSharpView = crop;
 }
 function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = `${-visual.offsetLeft}px ${-visual.offsetTop}px`; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); renderZoomChip(s.zoom); if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
-function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("zoom"); }
-function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); scheduleSharpViewport("pan"); }
+function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); sharpSession.schedule("zoom"); }
+function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); sharpSession.schedule("pan"); }
 addEventListener("resize", syncViewportAndFollow);
 function setTouchButtons(mask) { touchButtons=mask; if (inputReady) input.buttons(mask); }
 function setTouchButtonsAtCursor(mask) { const point=remoteCursor.absolutePoint(); touchButtons=mask; if (inputReady && input.buttonsAt(point.x,point.y,mask)) cursorReconciler.noteSent(input.lastCursorSequence); updatePointerHud(); }
@@ -4664,7 +4551,7 @@ function renderAbout(update = {}) {
 
 let diagnosticsVisible = diagnosticsEnabled;
 function diagnosticsReport() {
-  const view = viewportHealthSnapshot();
+  const view = sharpSession.health(renderedSharpView, viewport.zoom, pointerMode);
   return [
     "TRANSPORT",
     `state       ${connectionStatusDetail}`,
