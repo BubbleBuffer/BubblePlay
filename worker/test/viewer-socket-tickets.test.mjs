@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { FileTransferClient } from "../public/file-client.js";
 import { b64urlDecode, pcListUrl, registerProof, relayOrigin, viewerHello } from "../public/dk-relay.js";
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
@@ -82,7 +83,7 @@ function signalHarness(identity) {
     BPLog: { log: (...args) => logged.push(args), setContext() {} },
     debugTrace: (...args) => output.push(args), recordSignalingError: (...args) => output.push(args),
     shouldReconnectAfterClose: () => false, restartPeer() {},
-    clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
     noteConnectionLoss() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
     recoveryLossMs: null, recoveryAttempts: 0,
     sendStreamMode: reason => endpoint.push(["stream-mode", reason]), wssSelected: false,

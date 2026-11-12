@@ -1,0 +1,77 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
+import { OFFER_FAILURE_LIMIT } from "../public/recovery.js";
+import { V4_BACKOFF_JITTER_FRACTION, V4_BACKOFF_MAX_MS, V4_BACKOFF_MIN_MS, jitteredBackoffMsV4, nextBackoffMsV4 } from "../public/media-v4.js";
+import { TRANSPORT } from "../public/transport.js";
+
+// Behaviour of receiver.js paths that are not modules yet, run in a vm sandbox as the other receiver tests do.
+const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replaceAll("\r\n", "\n");
+
+function receiverFunctions(...names) {
+  return names.map(name => {
+    const found = source.indexOf(`function ${name}(`);
+    assert.ok(found >= 0, `receiver function ${name}`);
+    const start = source.startsWith("async ", found - 6) ? found - 6 : found;
+    return source.slice(start, source.indexOf("\n}\n", start) + 3);
+  }).join("\n");
+}
+
+function signalingHarness(random) {
+  const sockets = [], timers = [];
+  class Socket {
+    static OPEN = 1; static CONNECTING = 0;
+    constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
+    close() { this.readyState = 3; }
+  }
+  const context = vm.createContext({ WebSocket: Socket, URL, recoveryLossMs: null, recoveryAttempts: 0, noteConnectionLoss() {},
+    inputStatusReason: null, latestInputStatus: null, terminalSignalingFailure: false, reconnectTimer: null, ws: null,
+    signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null, hudState: {}, hud: { classList: { add() {} } },
+    signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, recordSignalingError() {},
+    shouldReconnectAfterClose: () => true, restartPeer() {}, cleanupPeer() {}, handleSignal() {}, clearTimeout() {},
+    armConnectTimeout() {}, connectTimer: null, pendingConnect: null, signalingBackoffMs: 0, everAuthenticated: false,
+    recoveryBudgetStartMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => jitteredBackoffMsV4(ms, random),
+    setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; } });
+  vm.runInContext(receiverFunctions("reconnectSignaling", "noteSessionAuthenticated"), context);
+  vm.runInContext('reconnectSignaling("startup");', context);
+  const lose = async () => {
+    const dead = sockets.at(-1);
+    dead.readyState = 3;
+    dead.onclose({ code: 1006 });
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+    const timer = timers.at(-1);
+    timer.fn();
+    return timer.delay;
+  };
+  return { context, lose };
+}
+
+test("signaling reconnects back off to the cap with jitter and restart from the base after authentication", async () => {
+  const bases = [V4_BACKOFF_MIN_MS, 2 * V4_BACKOFF_MIN_MS, 4 * V4_BACKOFF_MIN_MS, 8 * V4_BACKOFF_MIN_MS, 16 * V4_BACKOFF_MIN_MS, V4_BACKOFF_MAX_MS, V4_BACKOFF_MAX_MS];
+  for (const [random, side] of [[() => 0, 1 - V4_BACKOFF_JITTER_FRACTION], [() => 0.999999, 1 + V4_BACKOFF_JITTER_FRACTION]]) {
+    const h = signalingHarness(random);
+    for (const base of bases) assert.equal(await h.lose(), Math.round(base * side));
+    vm.runInContext("noteSessionAuthenticated()", h.context);
+    assert.equal(await h.lose(), Math.round(V4_BACKOFF_MIN_MS * side));
+  }
+});
+
+function peerHarness(requestedTransport) {
+  const calls = { restarts: [], wss: [], logged: [] };
+  const context = vm.createContext({ requestedTransport, TRANSPORT, OFFER_FAILURE_LIMIT, offerFailures: 0, hudState: {}, hud: { classList: { add() {} } },
+    viewerLog: (level, name) => calls.logged.push(name), restartPeer: reason => calls.restarts.push(reason), switchToWss: reason => calls.wss.push(reason) });
+  vm.runInContext(receiverFunctions("offerFailed"), context);
+  return { context, calls };
+}
+
+test("repeated offer failures stop restarting the peer and hand over to the WSS fallback", () => {
+  const auto = peerHarness(TRANSPORT.AUTO);
+  for (let i = 0; i < OFFER_FAILURE_LIMIT + 2; i++) vm.runInContext('offerFailed(new Error("sdp"))', auto.context);
+  assert.equal(auto.calls.restarts.length, OFFER_FAILURE_LIMIT - 1);
+  assert.equal(auto.calls.wss[0], "offer-failed");
+  const forced = peerHarness(TRANSPORT.WEBRTC);
+  for (let i = 0; i < OFFER_FAILURE_LIMIT; i++) vm.runInContext('offerFailed(new Error("sdp"))', forced.context);
+  assert.deepEqual(forced.calls.wss, []);
+  assert.equal(forced.context.hudState.ice, "offer-failed");
+});

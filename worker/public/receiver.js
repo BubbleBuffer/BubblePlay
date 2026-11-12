@@ -8,6 +8,7 @@ import {
   recycledAuthTimeoutMs,
   connectTimeoutMs,
   MEDIA_CONNECT_TIMEOUT_MS,
+  OFFER_FAILURE_LIMIT,
   shouldRetryOnWake,
   shouldRetryAuthTimeout,
   signalingUnanswered,
@@ -21,7 +22,7 @@ import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, jitteredBackoffMsV4, nextBackoffMsV4, V4_DECODE_BACKLOG_LIMIT_FRAMES, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
   orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes, selectWssDecoderPath,
@@ -765,6 +766,8 @@ let authenticatedSession = null;
 let pendingRtcTracks = [];
 let signalingGeneration = 0;
 let reconnectTimer = null;
+// Backoff of the signaling reconnect: grows with each loss, resets once a session authenticates.
+let signalingBackoffMs = 0;
 let pendingConnect = null;
 let connectTimer = null;
 let terminalSignalingFailure = false;
@@ -940,6 +943,7 @@ function noteConnectionLoss() {
 
 function noteSessionAuthenticated() {
   everAuthenticated = true;
+  signalingBackoffMs = 0;
   recoveryBudgetStartMs = null;
 }
 
@@ -1051,7 +1055,11 @@ function reconnectSignaling(reason) {
     };
   };
   if (reason === "startup") connect();
-  else { pendingConnect = connect; reconnectTimer = setTimeout(connect, 250); }
+  else {
+    signalingBackoffMs = nextBackoffMsV4(signalingBackoffMs);
+    pendingConnect = connect;
+    reconnectTimer = setTimeout(connect, jitteredBackoffMsV4(signalingBackoffMs));
+  }
 }
 
 // A reconnect of an established session abandons a socket that has not opened in time (5, 7.5, then
@@ -1549,7 +1557,7 @@ function scheduleWssV4Reconnect(reason) {
     if (!usingWssMedia) return;
     wssV4.reconnects++;
     openWssV4Socket();
-  }, wssV4.backoffMs);
+  }, jitteredBackoffMsV4(wssV4.backoffMs));
 }
 
 function openWssV4Socket() {
@@ -2312,6 +2320,18 @@ function peerConstructionFailed() {
   hud.classList.add("bad");
 }
 
+let offerFailures = 0;
+
+// A failed offer restarts the peer, up to OFFER_FAILURE_LIMIT in a row (reset by a sent offer). After
+// that auto mode moves to WSS; a forced WebRTC page shows the error instead of looping.
+function offerFailed(error) {
+  offerFailures++;
+  if (offerFailures < OFFER_FAILURE_LIMIT) { restartPeer(`offer:${error?.message || error}`); return; }
+  viewerLog("error", "offer-failed-giving-up", { failures: offerFailures, error: String(error?.message || error) });
+  if (requestedTransport === TRANSPORT.AUTO) switchToWss("offer-failed");
+  else { hudState.ice = "offer-failed"; hud.classList.add("bad"); }
+}
+
 async function startPeer(generation = peerGeneration) {
   if (requestedTransport === TRANSPORT.WSS || usingWssMedia) return;
   if (!authenticatedSession?.controlReady) return;
@@ -2455,11 +2475,12 @@ async function startPeer(generation = peerGeneration) {
     await candidate.setLocalDescription(offer);
     if (!isCurrentPeer(generation, candidate)) return;
     if (sendControl({ type: "offer", sdp: offer.sdp })) {
+      offerFailures = 0;
       rtcOfferSignaled = true;
       startFirstFrameHandshake("offer-sent");
     }
   } catch (e) {
-    if (isCurrentPeer(generation, candidate)) restartPeer(`offer:${e.message || e}`);
+    if (isCurrentPeer(generation, candidate)) offerFailed(e);
   }
 }
 
@@ -3328,6 +3349,9 @@ function attachRtcAudio(track, generation = peerGeneration) {
   });
 }
 
+// The document-level tap that resumes a blocked autoplay. One at a time: a new session replaces it.
+let nativePlayGesture = null;
+
 function startNativeVideo(track, generation = peerGeneration) {
   const video = document.createElement("video");
   video.autoplay = true;
@@ -3419,7 +3443,9 @@ function startNativeVideo(track, generation = peerGeneration) {
   tryPlay();
   // Mobile browsers (iOS especially) may refuse autoplay until a user
   // gesture; resume on the first tap anywhere.
-  document.addEventListener("pointerdown", tryPlay, { once: true });
+  nativePlayGesture?.abort();
+  nativePlayGesture = new AbortController();
+  document.addEventListener("pointerdown", tryPlay, { once: true, signal: nativePlayGesture.signal });
   video.addEventListener("click", tryPlay);
   hudState.dec = "native video";
 }
@@ -3621,9 +3647,9 @@ function feedDecoder(chunk, generation) {
   decoder.sawKeyframe = decoder.sawKeyframe || isKey;
   const decodeLimit = usingWssMedia ? (streamModeValue() === "game" ? 4 : 8) : 2;
   const decodeHardLimit = usingWssMedia ? decodeLimit + 2 : decodeLimit;
-  // v4 never drops a chunk for decoder backpressure: every frame is decoded
-  // and only presentation is skipped while the decoder catches up.
-  if (!latencyGuard.admitDecode(usingWssMedia ? Infinity : decodeHardLimit)) {
+  // v4 decodes every frame and skips only presentation while the decoder catches up, up to a
+  // backlog limit; past it the decoder is wedged and recovery resumes from the next keyframe.
+  if (!latencyGuard.admitDecode(usingWssMedia ? V4_DECODE_BACKLOG_LIMIT_FRAMES : decodeHardLimit)) {
     if (usingWssMedia) { hudState.dropped++; beginWssRecovery("decoder-backpressure"); }
     else dropAndResync("decoder-backpressure");
     return;

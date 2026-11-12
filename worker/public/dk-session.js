@@ -173,7 +173,9 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         if (previewsNegotiated) { try { onPreviewMessage(inner); } catch { /* a picture never breaks a session */ } }
         return;
       }
-      await onMessage(inner);
+      // The message is authentic (it opened and was in order). A handler that throws on malformed
+      // content costs that message, not the session; only integrity failures above end it.
+      try { await onMessage(inner); } catch (error) { blog("warn", "control message dropped", { type: String(inner?.type).slice(0, 40), cause: describe(error) }); }
     } catch (error) { fail("control-failed", undefined, error); }
   }
   return {

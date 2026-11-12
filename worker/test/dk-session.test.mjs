@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, hkdfSync, sign } from "node:crypto";
 import vm from "node:vm";
+import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { createViewerSession, browserDeviceName, sessionRefusal } from "../public/dk-session.js";
 import { createCtlChannel } from "../public/dk-crypto.js";
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
@@ -539,7 +540,7 @@ test("receiver drains a final encrypted refusal before processing socket close o
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, cleanupPeer: () => calls.push("cleanup"),
     recordSignalingError() {}, shouldReconnectAfterClose: (_code, terminal) => !terminal,
     restartPeer: () => calls.push("restart"),
-    clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     handleSignal: async () => { calls.push("decrypt-start"); await decrypting; context.terminalSignalingFailure = true; calls.push("refusal"); },
   });
   const fn = source.slice(source.indexOf("function reconnectSignaling("), source.indexOf("\nfunction signalingSocketUrl("));
@@ -619,6 +620,18 @@ test("a ctl sealed for the previous session, arriving before auth-host, is dropp
   await h.authenticate();
   assert.equal(h.events.authenticated, 1);
   assert.deepEqual(h.events.failures, []);
+  h.session.close();
+});
+
+test("an authentic control message that its handler cannot process is dropped; the session survives", async () => {
+  const delivered = [];
+  const h = await harness({ onMessage: message => { if (message.type === "malformed") throw new TypeError("bad shape"); delivered.push(message.type); } });
+  await h.authenticate();
+  await h.session.receive(await h.pcCtl.sealJson({ type: "malformed" }));
+  await h.session.receive(await h.pcCtl.sealJson({ type: "after" }));
+  assert.deepEqual(h.events.failures, []);
+  assert.equal(h.session.controlReady, true);
+  assert.deepEqual(delivered, ["after"]);
   h.session.close();
 });
 
