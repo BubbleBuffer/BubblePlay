@@ -6,6 +6,7 @@ use worker::wasm_bindgen::JsValue;
 use worker::{Error, Method, Request, RequestInit, Result};
 
 use crate::live::{Reported, now_ms};
+use crate::pc_store::REPORT_STORED_STATUS;
 use crate::store;
 use crate::{INTERNAL_PREFIX, RELAY_BINDING, RELAY_NAME};
 
@@ -132,6 +133,7 @@ impl crate::PcRelay {
                 return;
             };
             match live.reported {
+                _ if live.report_pending => true,
                 None => true,
                 Some(sent) => {
                     sent.online != report.online
@@ -142,7 +144,8 @@ impl crate::PcRelay {
         if !due {
             return;
         }
-        let acknowledged = matches!(self.post_report(&report).await, Ok(204));
+        let answer = self.post_report(&report).await;
+        let acknowledged = matches!(answer, Ok(REPORT_STORED_STATUS));
         if let Some(live) = self.live.borrow_mut().as_mut() {
             if acknowledged {
                 live.reported = Some(Reported {
@@ -150,8 +153,22 @@ impl crate::PcRelay {
                     at_ms: now,
                 });
                 live.report_pending = false;
+                live.report_failures = 0;
             } else {
+                if live.report_failures == 0 {
+                    // Logged on the first failure of a run only; the retries are backed off.
+                    match answer {
+                        Ok(status) => worker::console_error!(
+                            "the directory refused a report with status {}",
+                            status
+                        ),
+                        Err(error) => {
+                            worker::console_error!("the directory could not be reached: {}", error)
+                        }
+                    }
+                }
                 live.report_pending = true;
+                live.report_failures = live.report_failures.saturating_add(1);
             }
         }
     }
