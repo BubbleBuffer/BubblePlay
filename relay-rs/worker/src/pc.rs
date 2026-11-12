@@ -24,27 +24,19 @@ use worker::{
 
 use crate::config::{self, Settings};
 use crate::http;
-use crate::live::{PcLive, Reported, auto_response_ms, now_ms};
+use crate::live::{PcLive, auto_response_ms, now_ms};
+use crate::pc_store::{PCS_KEY, PersistError};
 use crate::rng::WebCrypto;
 use crate::routes::{client_ip, query_values, route_for_path};
 use crate::store;
 use crate::{PING, PONG};
 
-const PCS_KEY: &str = "pcs";
 const TAG_PREFIX: &str = "conn:";
 const DELETE_PATH: &str = "/__internal/pc/delete";
 
 /// The PC store could not be written (or the directory refused the PC). The batch stops and the
 /// origin socket was closed 1011.
 struct StoreFailed;
-
-/// Why a persist failed.
-enum PersistError {
-    /// The directory holds its maximum of PCs and this one is new.
-    Cap,
-    /// The directory or the object's storage could not be written.
-    Store,
-}
 
 /// What a wake produces: the live state, and the actions rehydrate returned for it.
 struct Woken {
@@ -465,61 +457,6 @@ impl crate::PcRelay {
         }
     }
 
-    /// Writes the table to this object's storage after the directory accepted it, so the
-    /// directory never lags a record the object has promised to keep.
-    async fn persist_current_pcs(&self) -> std::result::Result<(), PersistError> {
-        let text = {
-            let guard = self.live.borrow();
-            match guard.as_ref() {
-                Some(live) => store::encode_pcs(live.core.pcs()),
-                None => Err("the relay is not running".to_owned()),
-            }
-        }
-        .map_err(|_| PersistError::Store)?;
-        if let Some(report) = self.current_report() {
-            match self.post_report(&report).await {
-                Ok(204) => {
-                    if let Some(live) = self.live.borrow_mut().as_mut() {
-                        live.reported = Some(Reported {
-                            online: report.online,
-                            at_ms: now_ms(),
-                        });
-                        live.report_pending = false;
-                    }
-                }
-                Ok(409) => return Err(PersistError::Cap),
-                _ => return Err(PersistError::Store),
-            }
-        }
-        self.write_pcs(text).await.map_err(|_| PersistError::Store)
-    }
-
-    /// Retries the PC write while the store is unhealthy. The alarm asks for this every second.
-    async fn retry_store(&self) {
-        let healthy = self
-            .live
-            .borrow()
-            .as_ref()
-            .is_none_or(|live| live.pcs_healthy);
-        if healthy {
-            return;
-        }
-        if self.persist_current_pcs().await.is_ok() {
-            self.set_store_health(true);
-        }
-    }
-
-    pub(crate) fn set_store_health(&self, healthy: bool) {
-        if let Some(live) = self.live.borrow_mut().as_mut() {
-            live.pcs_healthy = healthy;
-            live.core.set_store_healthy(healthy);
-        }
-    }
-
-    pub(crate) async fn write_pcs(&self, text: String) -> Result<()> {
-        self.state.storage().put(PCS_KEY, text).await
-    }
-
     /// Makes the alarm match the earliest deadline. Only changes the alarm when it must.
     async fn rearm(&self) -> Result<()> {
         let change = {
@@ -561,6 +498,7 @@ async fn wake_state(
         .await
         .map_err(|_| "the PC store could not be read".to_owned())?;
     let pcs = store::decode_pcs(pcs_text.as_deref())?;
+    let pcs_stored = !pcs.records.is_empty();
     let (core, actions) = CoreRelay::rehydrate(settings.core, pcs, snapshots, now_ms());
     Ok(Woken {
         live: PcLive {
@@ -569,6 +507,8 @@ async fn wake_state(
             pcs_healthy: true,
             reported: None,
             report_pending: false,
+            report_failures: 0,
+            stored: pcs_stored,
             legacy_checked: false,
             armed: None,
         },
