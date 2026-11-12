@@ -24,7 +24,7 @@ WSS v4 sends one encoded access unit per binary message, with a 28-byte header d
 
 The browser WebCodecs receiver identifies H.264 or HEVC from Annex B keyframe NAL headers and immediately reconfigures on a codec change, decoding that same keyframe even when the WSS header still names the previous codec. WebRTC offers H.264 after HEVC when HEVC is preferred, so an H.264-only host can answer.
 
-Shared fixtures are the cross-language contract; update them and the affected implementations together:
+Shared fixtures are the cross-language contract; update them and the affected implementations together: `node tools/contracts/check-consumers.mjs` fails when a fixture has no consumer test in an implementation that speaks it; known gaps, with reasons, are listed in `tools/contracts/consumers.json`.
 
 | Fixture | Contract |
 | --- | --- |
@@ -35,6 +35,7 @@ Shared fixtures are the cross-language contract; update them and the affected im
 | [`file-transfer-contract.json`](../../fixtures/file-transfer-contract.json) | File packets, validation limits and socket behavior |
 | [`follow-window-contract.json`](../../fixtures/follow-window-contract.json) | Monitor-follow capability and controls |
 | [`audio-contract.json`](../../fixtures/audio-contract.json) | PC sound packets, opt-in and capability ([audio](audio.md)) |
+| [`media-control-contract.json`](../../fixtures/media-control-contract.json) | Viewer start, first-frame and keyframe-request messages |
 | [`session-timing-contract.json`](../../fixtures/session-timing-contract.json) | Heartbeats, dead-detection limits, reconnect backoff and auth waits per implementation ([session timing](session-timing.md)) |
 
 See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is approved (2026-10-13) for access before sign-in and waits for [device IDs and keys](device-keys.md), approved 2026-10-13: per-device key files, pairing, routing by ID and the ntfy site gate. The Rust relay's tests also read [browser-generated packet fixtures](../../relay-rs/core/tests/data/worker-contract.json); the Go relay that used them was deleted at CUT-1.
