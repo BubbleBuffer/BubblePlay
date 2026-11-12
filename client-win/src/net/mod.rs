@@ -19,6 +19,8 @@ mod stats;
 pub(crate) mod webrtc;
 
 #[cfg(test)]
+mod cursor_contract_tests;
+#[cfg(test)]
 mod fake_relay;
 #[cfg(test)]
 mod integration_contract_tests;
