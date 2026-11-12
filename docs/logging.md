@@ -108,12 +108,16 @@ When an elevation prompt is on another monitor than the streamed one, the host l
 While a viewer is attached, the host checks the foreground window on the 250 ms foreground tick (`host/src/input_stall.rs`). When the window is hung (`IsHungAppWindow`), DWM's `Ghost` stand-in is foreground, or the cursor has stayed `Wait` for 5 s, it logs one warn line per episode: `foreground app stopped responding while a viewer is attached`. A new episode starts only after a sample with none of the three. Fields:
 
 - `reason` (`hung`, `ghost` or `wait-cursor`), `foreground_exe`, `foreground_class`, `foreground_pid`, `wait_ms`;
-- `behind_ghost_exe`, `behind_ghost_class`, `behind_ghost_pid`: the last non-ghost foreground, which is the app the ghost stands in for;
+- `behind_ghost_exe`, `behind_ghost_class`, `behind_ghost_pid`: the hung window the ghost stands in for, as user32's `HungWindowFromGhostWindow` names it; absent when it cannot be known. (Before 2026-11-12 these named the last non-ghost foreground, which was often an unrelated app such as a terminal or the shell.)
 - `native_queue_attached`: native file drop threads whose input queue is attached to a foreground thread (`AttachThreadInput`) right now;
 - `cursor_hook_busy_ms`, `cursor_hook_last_event_ms`: how long the cursor-wake thread (owner of the host's `WH_MOUSE_LL` hook while a viewer is attached) has been out of its message wait, 0 while it waits, and the time since it last woke; `drop_hook_busy_ms` is the same for the prepared-drop input monitor's hooks;
 - `last_file_drop_step`, `last_clipboard_step`: the last step name, `running` or `done`, and its age. No clipboard or file content is logged.
 
 The line was added after a WhatsApp freeze on 2026-11-09 that a TeamViewer connection ended; the host's logs then showed no attached queue or drop hook, so these fields say on the next occurrence whether the host was involved.
+
+## Input through the secure helper while a ghost is foreground (2026-11-12)
+
+While DWM's System-integrity `Ghost` window is foreground, the admin agent's input is dropped, so the secure helper injects instead ([secure-desktop.md](architecture/secure-desktop.md#ghost-foreground-input-through-the-secure-helper-2026-11-12)). Host log (info), at the first input batch after each switch: `remote input routed through secure helper: foreground above admin-agent integrity` and `remote input routed back from secure helper`, with `foreground_pid`, `foreground_exe`, `foreground_class` and `foreground_integrity` (hex, as the host could read it). Helper log (info), with `epoch`: `helper input route on: foreground above admin-agent integrity` with the helper-verified `foreground_pid`, `foreground_exe`, `foreground_class` and `foreground_integrity`, and `helper input route off: foreground no longer above admin-agent integrity` with `foreground_pid` and `foreground_exe`. A batch refused because the foreground changed is counted under receipt reason `foreground-not-elevated`.
 
 ## Edge drop (2026-11-11)
 
