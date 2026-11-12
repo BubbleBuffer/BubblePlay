@@ -38,6 +38,8 @@ When the first frame is shown again each client logs one info line with the tota
 ## Browser: stuck socket and lost timer (2026-11-06)
 
 - **Connect timeout.** While recovering a session that authenticated before, a signaling socket that has not opened in time is abandoned and a new one is tried: 5 s, 7.5 s, then 10 s per attempt (`connectTimeoutMs`). The old socket's handlers are detached before it is closed, so a late event cannot act on it. A first connection is not timed, since it may wait on the site gate. A reconnect is not held there: a WebSocket upgrade is allowed or refused at once (the gate holds only navigations), so the cut-off cannot interrupt an approval.
+- **Media socket connect timeout (2026-11-12).** The WSS media socket is abandoned and retried on the media backoff when it has not reached `hello-ok` within `MEDIA_CONNECT_TIMEOUT_MS` (10 s, `recovery.js`, the same wait the native clients use). A first connection is timed too, unlike the signaling socket.
+- **WebRTC cannot start (2026-11-12).** When `new RTCPeerConnection` throws (after one retry on the STUN fallback), an auto-mode page switches to WSS at once; a page forced to `transport=webrtc` shows `ice-config-error`.
 - **Wake.** While a reconnect is pending (its 250 ms timer is set), `visibilitychange` to visible, `pageshow` and `online` run it at once (`shouldRetryOnWake`), unless a socket is already connecting or the session ended. A frozen or throttled page could otherwise leave the retry timer unfired for minutes. There is no polling timer.
 - Real refusals stay terminal. The abandon and wake lines are logged ([logging](../logging.md)).
 - The Windows client bounds the `/ws` open by its 10 s handshake limit.

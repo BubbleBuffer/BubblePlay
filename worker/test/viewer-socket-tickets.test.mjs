@@ -302,7 +302,7 @@ test("media hello requires authenticated media and a current ticket; obsolete so
   const h = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, usingWssMedia: true, mediaEpoch: epoch,
     wssV4: {}, signalingTicket: null, authenticatedSession: null,
     mediaSocketUrl: () => `wss://relay.test/media-ws?epoch=${epoch}&pc=pc-one`,
-    performance: { now: () => 1 } });
+    performance: { now: () => 1 }, setTimeout: () => 0, clearTimeout() {}, MEDIA_CONNECT_TIMEOUT_MS: 1, viewerLog() {} });
   vm.runInContext(receiverFunction("openWssV4Socket"), h);
   h.openWssV4Socket(); assert.equal(sockets.length, 0);
   h.signalingTicket = ticket;

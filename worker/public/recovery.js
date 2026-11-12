@@ -129,6 +129,11 @@ export function shouldRetryAuthTimeout({ reason, established, budgetStartMs, now
 export const CONNECT_TIMEOUT_MS = 5_000;
 export const CONNECT_TIMEOUT_MAX_MS = 10_000;
 
+// The media socket gets one fixed wait from construction to hello-ok, then is abandoned and
+// retried on the media backoff. Without it a black-holed network leaves the socket connecting for
+// the browser default (minutes). Native clients wait the same 10 s.
+export const MEDIA_CONNECT_TIMEOUT_MS = CONNECT_TIMEOUT_MAX_MS;
+
 /** Wait for a signaling socket to open on attempt `attempt` (0 = the first since the loss): 5 s, 7.5 s, then 10 s. Null when not recovering. */
 export function connectTimeoutMs({ recovering, attempt }) {
   if (recovering !== true) return null;
