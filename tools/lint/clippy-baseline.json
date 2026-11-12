@@ -1,0 +1,185 @@
+{
+  "client-win/src/audio/engine.rs": {
+    "clippy::let_underscore_must_use": 7,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/audio/mod.rs": {
+    "clippy::let_underscore_must_use": 1,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/audio/wasapi.rs": {
+    "clippy::let_underscore_must_use": 3
+  },
+  "client-win/src/input/chords.rs": {
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/input/hook.rs": {
+    "clippy::let_underscore_must_use": 9,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/input/live_tests.rs": {
+    "clippy::let_underscore_must_use": 9,
+    "clippy::cognitive_complexity": 1,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/input/mod.rs": {
+    "clippy::let_underscore_must_use": 9,
+    "clippy::cognitive_complexity": 1,
+    "clippy::too_many_lines": 1,
+    "clippy::unwrap_used": 1
+  },
+  "client-win/src/media/mf.rs": {
+    "clippy::let_underscore_must_use": 6,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/media/runtime.rs": {
+    "clippy::let_underscore_must_use": 1
+  },
+  "client-win/src/media/tests.rs": {
+    "clippy::let_underscore_must_use": 1,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/media/video.rs": {
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/mock.rs": {
+    "clippy::too_many_lines": 2,
+    "clippy::expect_used": 1
+  },
+  "client-win/src/net/ctl_hook.rs": {
+    "clippy::let_underscore_must_use": 3
+  },
+  "client-win/src/net/fake_relay.rs": {
+    "clippy::let_underscore_must_use": 17,
+    "clippy::cognitive_complexity": 1,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/net/input.rs": {
+    "clippy::unwrap_used": 1
+  },
+  "client-win/src/net/integration_contract_tests.rs": {
+    "clippy::cognitive_complexity": 1,
+    "clippy::too_many_lines": 2,
+    "clippy::let_underscore_must_use": 3
+  },
+  "client-win/src/net/session.rs": {
+    "clippy::too_many_lines": 3,
+    "clippy::unwrap_used": 17,
+    "clippy::expect_used": 5,
+    "clippy::let_underscore_must_use": 3
+  },
+  "client-win/src/net/session_tests.rs": {
+    "clippy::cognitive_complexity": 1,
+    "clippy::too_many_lines": 2,
+    "clippy::let_underscore_must_use": 2
+  },
+  "client-win/src/net/stats.rs": {
+    "clippy::expect_used": 1,
+    "clippy::unwrap_used": 4
+  },
+  "client-win/src/net/webrtc/depacketize.rs": {
+    "clippy::cognitive_complexity": 1,
+    "clippy::let_underscore_must_use": 1
+  },
+  "client-win/src/net/webrtc/ingress.rs": {
+    "clippy::unwrap_used": 1
+  },
+  "client-win/src/net/webrtc/offer.rs": {
+    "clippy::expect_used": 1
+  },
+  "client-win/src/net/webrtc/peer.rs": {
+    "clippy::expect_used": 1
+  },
+  "client-win/src/session/audio_dev.rs": {
+    "clippy::let_underscore_must_use": 5,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/session/headless.rs": {
+    "clippy::let_underscore_must_use": 1,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/session/input_dev.rs": {
+    "clippy::let_underscore_must_use": 7,
+    "clippy::too_many_lines": 1,
+    "clippy::unwrap_used": 1
+  },
+  "client-win/src/session/mod.rs": {
+    "clippy::let_underscore_must_use": 2,
+    "clippy::unwrap_used": 16,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/session/options.rs": {
+    "clippy::too_many_lines": 2
+  },
+  "client-win/src/session/relay_e2e_tests.rs": {
+    "clippy::too_many_lines": 2,
+    "clippy::let_underscore_must_use": 2
+  },
+  "client-win/src/session/step6_e2e.rs": {
+    "clippy::let_underscore_must_use": 2,
+    "clippy::cognitive_complexity": 1,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/shell/d3d.rs": {
+    "clippy::let_underscore_must_use": 1
+  },
+  "client-win/src/shell/input.rs": {
+    "clippy::cognitive_complexity": 1,
+    "clippy::too_many_lines": 1,
+    "clippy::let_underscore_must_use": 6
+  },
+  "client-win/src/shell/window.rs": {
+    "clippy::let_underscore_must_use": 18,
+    "clippy::expect_used": 1,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/store/console.rs": {
+    "clippy::let_underscore_must_use": 7
+  },
+  "client-win/src/store/mod.rs": {
+    "clippy::let_underscore_must_use": 2
+  },
+  "client-win/src/stream/decode.rs": {
+    "clippy::too_many_lines": 1,
+    "clippy::let_underscore_must_use": 5,
+    "clippy::expect_used": 1
+  },
+  "client-win/src/stream/player.rs": {
+    "clippy::let_underscore_must_use": 8,
+    "clippy::too_many_lines": 2
+  },
+  "client-win/src/ui/flow.rs": {
+    "clippy::too_many_lines": 9
+  },
+  "client-win/src/ui/home.rs": {
+    "clippy::too_many_lines": 5
+  },
+  "client-win/src/ui/mod.rs": {
+    "clippy::expect_used": 1
+  },
+  "client-win/src/ui/session.rs": {
+    "clippy::too_many_lines": 3
+  },
+  "client-win/src/ui/settings.rs": {
+    "clippy::too_many_lines": 1
+  },
+  "client-win/src/ui/widgets.rs": {
+    "clippy::too_many_lines": 2
+  },
+  "client-win/tests/stream_latency.rs": {
+    "clippy::unwrap_used": 10,
+    "clippy::expect_used": 8,
+    "clippy::let_underscore_must_use": 3,
+    "clippy::too_many_lines": 1
+  },
+  "client-win/tests/stream_target.rs": {
+    "clippy::unwrap_used": 4
+  },
+  "client-win/tests/support/relay_pc.rs": {
+    "clippy::let_underscore_must_use": 2
+  },
+  "client-win/tests/ui_layout.rs": {
+    "clippy::expect_used": 5,
+    "clippy::too_many_lines": 1
+  }
+}
