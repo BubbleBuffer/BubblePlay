@@ -7,6 +7,7 @@
 // different PCs never share an object, a connection cap or a CPU budget.
 mod assets;
 mod config;
+mod directory;
 mod front;
 mod http;
 mod live;

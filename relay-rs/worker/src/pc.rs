@@ -10,16 +10,15 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use bp_relay_core::directory::{PcReport, REPORT_EVERY_MS};
 use bp_relay_core::relay::{
-    Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, Upgraded, UpgradeRequest, reasons,
+    Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest, Upgraded, reasons,
 };
 use serde_json::json;
 use worker::js_sys;
 use worker::wasm_bindgen::JsValue;
 use worker::worker_sys::WebSocketRequestResponsePair;
 use worker::{
-    Error, Method, Request, RequestInit, Response, Result, ScheduledTime, Storage, WebSocket,
+    Error, Method, Request, Response, Result, ScheduledTime, Storage, WebSocket,
     WebSocketIncomingMessage, WebSocketPair,
 };
 
@@ -29,7 +28,7 @@ use crate::live::{PcLive, Reported, auto_response_ms, now_ms};
 use crate::rng::WebCrypto;
 use crate::routes::{client_ip, query_values, route_for_path};
 use crate::store;
-use crate::{INTERNAL_PREFIX, PING, PONG, RELAY_BINDING, RELAY_NAME};
+use crate::{PING, PONG};
 
 const PCS_KEY: &str = "pcs";
 const TAG_PREFIX: &str = "conn:";
@@ -466,152 +465,6 @@ impl crate::PcRelay {
         }
     }
 
-    /// The report for this object's PC, if it holds a record. `online` is the host's presence now.
-    fn current_report(&self) -> Option<PcReport> {
-        let guard = self.live.borrow();
-        let live = guard.as_ref()?;
-        let row = live.core.listing().into_iter().next()?;
-        Some(PcReport {
-            id: row.id,
-            public: row.public,
-            first_seen: row.first_seen,
-            last_seen: row.last_seen,
-            admitted: row.admitted,
-            online: row.online,
-        })
-    }
-
-    /// Once per object start: when this object holds no PC and the upgrade names a device id, asks
-    /// the front object for that PC record from the single-object relay table, adopts it and
-    /// saves it. The directory report that follows makes the front object drop it from the old
-    /// table, so an existing PC keeps working after the split without registering again. The
-    /// record is saved here before the old copy goes.
-    async fn claim_legacy(&self, pc: Option<&str>) {
-        let name = bp_relay_core::directory::session_object_name(pc);
-        let Some(id) = name.strip_prefix("pc-") else {
-            return;
-        };
-        let wanted = {
-            let mut guard = self.live.borrow_mut();
-            let Some(live) = guard.as_mut() else {
-                return;
-            };
-            let wanted = !live.legacy_checked && live.core.pcs().is_empty();
-            live.legacy_checked = true;
-            wanted
-        };
-        if !wanted {
-            return;
-        }
-        let Some(text) = self.fetch_legacy(id).await else {
-            return;
-        };
-        let Ok(table) = store::decode_pcs(Some(&text)) else {
-            worker::console_error!("a legacy PC record could not be read");
-            return;
-        };
-        let saved = {
-            let mut guard = self.live.borrow_mut();
-            let Some(live) = guard.as_mut() else {
-                return;
-            };
-            live.core.adopt_pcs(table);
-            store::encode_pcs(live.core.pcs())
-        };
-        let written = match saved {
-            Ok(text) => self.write_pcs(text).await.is_ok(),
-            Err(_) => false,
-        };
-        if written {
-            self.sync_directory().await;
-        } else {
-            self.set_store_health(false);
-        }
-    }
-
-    /// The old record of one PC from the front object: its table text, or None (not there, or the
-    /// front object did not answer 200).
-    async fn fetch_legacy(&self, id: &str) -> Option<String> {
-        let stub = self
-            .env
-            .durable_object(RELAY_BINDING)
-            .ok()?
-            .id_from_name(RELAY_NAME)
-            .ok()?
-            .get_stub()
-            .ok()?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_body(Some(JsValue::from_str(id)));
-        let request = Request::new_with_init(
-            &format!("https://relay.internal{INTERNAL_PREFIX}dir/claim"),
-            &init,
-        )
-        .ok()?;
-        let mut response = stub.fetch_with_request(request).await.ok()?;
-        if response.status_code() != 200 {
-            return None;
-        }
-        response.text().await.ok()
-    }
-
-    /// Posts a report to the front object. The status is the answer's: 204 stored, 409 the
-    /// directory is full, 400 or 5xx otherwise.
-    async fn post_report(&self, report: &PcReport) -> Result<u16> {
-        let body = serde_json::to_string(report).map_err(|e| Error::RustError(e.to_string()))?;
-        let stub = self
-            .env
-            .durable_object(RELAY_BINDING)?
-            .id_from_name(RELAY_NAME)?
-            .get_stub()?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_body(Some(JsValue::from_str(&body)));
-        let request = Request::new_with_init(
-            &format!("https://relay.internal{INTERNAL_PREFIX}dir/report"),
-            &init,
-        )?;
-        Ok(stub.fetch_with_request(request).await?.status_code())
-    }
-
-    /// Tells the directory about this PC when its record or presence changed since the last
-    /// acknowledged report, and repeats the online report every REPORT_EVERY_MS. A failed report
-    /// is retried by the alarm.
-    async fn sync_directory(&self) {
-        let Some(report) = self.current_report() else {
-            return;
-        };
-        let now = now_ms();
-        let due = {
-            let guard = self.live.borrow();
-            let Some(live) = guard.as_ref() else {
-                return;
-            };
-            match live.reported {
-                None => true,
-                Some(sent) => {
-                    sent.online != report.online
-                        || (report.online && now.saturating_sub(sent.at_ms) >= REPORT_EVERY_MS)
-                }
-            }
-        };
-        if !due {
-            return;
-        }
-        let acknowledged = matches!(self.post_report(&report).await, Ok(204));
-        if let Some(live) = self.live.borrow_mut().as_mut() {
-            if acknowledged {
-                live.reported = Some(Reported {
-                    online: report.online,
-                    at_ms: now,
-                });
-                live.report_pending = false;
-            } else {
-                live.report_pending = true;
-            }
-        }
-    }
-
     /// Writes the table to this object's storage after the directory accepted it, so the
     /// directory never lags a record the object has promised to keep.
     async fn persist_current_pcs(&self) -> std::result::Result<(), PersistError> {
@@ -656,14 +509,14 @@ impl crate::PcRelay {
         }
     }
 
-    fn set_store_health(&self, healthy: bool) {
+    pub(crate) fn set_store_health(&self, healthy: bool) {
         if let Some(live) = self.live.borrow_mut().as_mut() {
             live.pcs_healthy = healthy;
             live.core.set_store_healthy(healthy);
         }
     }
 
-    async fn write_pcs(&self, text: String) -> Result<()> {
+    pub(crate) async fn write_pcs(&self, text: String) -> Result<()> {
         self.state.storage().put(PCS_KEY, text).await
     }
 
