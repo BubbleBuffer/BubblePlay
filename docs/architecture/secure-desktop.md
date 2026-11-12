@@ -97,6 +97,50 @@ backends, without real input, focus changes or access to the user's clipboard.
 The owner's exact application, Windows wait/close dialog and live Alt+Tab still
 need VM qualification.
 
+### Ghost foreground: input through the secure helper (2026-11-12)
+
+About 5 s after a top-level window stops pumping, DWM replaces it with a `Ghost`
+window owned by `dwm.exe` at System integrity (0x4000). UIPI then drops all
+input from the elevated admin agent (High, 0x3000) and from the host (Medium):
+`SendInput` still reports success, but nothing reaches even the low-level
+hooks, so the viewer cannot click any other window to recover. Measured in CI by
+`host/tests/hung_foreground_input.rs` before this change: control clicks
+arrived, the click on a healthy window while the ghost was foreground did not.
+
+With Admin mode on, the LocalSystem secure helper (System integrity, already
+running in the console session on `winsta0\default`) injects normal-desktop
+input in that one case:
+
+- Helper protocol v3 adds `Kind::ElevatedForeground` (`elevated-foreground`).
+  Only a host that negotiated v3 gets the new mode; v2 hosts are unchanged.
+- The helper verifies the foreground itself, never the host's claim
+  (`protocol::elevated_foreground_matches`): class `Ghost`, owner image
+  `%SystemRoot%\System32\dwm.exe` in the console session, owner integrity above
+  High. Any other window, including other System-integrity ones, stays on the
+  admin-agent path. Admin mode must be on for the console user, as for secure input.
+- The worker binds to the Default input desktop, checks that it is LocalSystem in
+  the console session on `Default`, and reports `State{secure:false,
+  kind:elevated-foreground}` every 100 ms; caps are `["input"]` only (no pixels,
+  no deny). It re-verifies the foreground before every batch (rejection
+  `foreground-not-elevated`), rate-limits like the secure worker, and injects
+  the records unchanged (virtual-desk normalized, as for the admin agent). When
+  the foreground changes it leaves, releases any button or key it pressed and
+  reports `other`; the host falls back to the admin agent.
+- Host: `InputSink` routes a normal-desktop batch to the helper only when Admin
+  mode is on and the helper's last state is `elevated-foreground` with input.
+  Submission is the same non-blocking `try_send` as the secure route; nothing on
+  the session thread waits for the helper. If the helper refuses, the batch
+  takes the admin-agent path. Capture is untouched (the host keeps DDA).
+- Same pipe, authentication, identity and version checks as before; no new
+  service, binary or uiAccess.
+
+CI (`Host checks`, windows-latest) installs the helper with
+`host/scripts/ci-install-secure-helper.ps1` (protected Program Files copy, SYSTEM
+task, Admin mode bound to the runner account) and the test sends the recovery
+click as viewer packets through `InputSink` -> `SecureHelperLink` -> the real
+helper. It also checks that the stall report names the hung window behind the
+ghost (user32 `HungWindowFromGhostWindow`).
+
 ## Milestone A validation and owner test
 
 - `cargo test` in `host/`: passed (all binaries, library and integration tests; two existing library tests ignored).
