@@ -37,6 +37,14 @@ pub use bubbleplay_host::admin_agent::protocol::{AGENT_MUTEX, AGENT_STOP_EVENT, 
 /// On-demand task that starts the elevated admin input agent
 /// (`%ProgramFiles%\BubblePlay\agent\bubbleplay_admin_agent.exe`).
 pub const AGENT_TASK: &str = r"\BubblePlay\AdminAgent";
+/// Folder and name halves of `AGENT_TASK`, for the PowerShell task query.
+pub const TASK_FOLDER: &str = r"\BubblePlay\";
+pub const AGENT_TASK_NAME: &str = "AdminAgent";
+/// Files of the per-user install, shared with `setup-tray.ps1` and `update-tray.ps1`
+/// (`fixtures/install-names-contract.json`).
+pub const HOST_EXE: &str = "bubbleplay-host.exe";
+pub const HOST_CONFIG_FILE: &str = "host.json";
+pub const UPDATE_STATE_FILE: &str = "update-state.json";
 pub const SECURE_HELPER_TASK: &str = r"\BubblePlay\SecureDesktop";
 pub const ADMIN_MODE_OFF_TASK: &str = r"\BubblePlay\AdminModeOff";
 pub const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -397,8 +405,8 @@ pub fn sha256_file(path: &Path) -> Option<String> {
 pub fn host_exe_beside(current_exe: &Path) -> PathBuf {
     current_exe
         .parent()
-        .map(|dir| dir.join("bubbleplay-host.exe"))
-        .unwrap_or_else(|| PathBuf::from("bubbleplay-host.exe"))
+        .map(|dir| dir.join(HOST_EXE))
+        .unwrap_or_else(|| PathBuf::from(HOST_EXE))
 }
 
 /// Open a folder in Explorer.
@@ -418,5 +426,31 @@ pub fn open_folder(path: &Path) {
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_value(name: &str) -> String {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/install-names-contract.json")).unwrap();
+        fixture["values"][name]["value"].as_str().unwrap_or_else(|| panic!("fixture lacks {name}")).to_owned()
+    }
+
+    /// The names the install scripts register must be the names the tray starts and queries.
+    #[test]
+    fn install_names_match_the_shared_fixture() {
+        let folder = fixture_value("taskFolder");
+        assert_eq!(TASK_FOLDER, folder);
+        assert_eq!(AGENT_TASK_NAME, fixture_value("agentTask"));
+        assert_eq!(AGENT_TASK, format!("{folder}{}", fixture_value("agentTask")));
+        assert_eq!(SECURE_HELPER_TASK, format!("{folder}{}", fixture_value("secureDesktopTask")));
+        assert_eq!(ADMIN_MODE_OFF_TASK, format!("{folder}{}", fixture_value("adminModeOffTask")));
+        assert_eq!(RUN_VALUE, fixture_value("runValue"));
+        assert_eq!(HOST_EXE, fixture_value("hostExe"));
+        assert_eq!(HOST_CONFIG_FILE, fixture_value("hostConfigFile"));
+        assert_eq!(UPDATE_STATE_FILE, fixture_value("updateStateFile"));
     }
 }

@@ -195,7 +195,7 @@ fn supervisor_config(
     }
     Ok(SupervisorConfig {
         host_exe: host_exe_beside(&exe),
-        host_config: data.join("host.json"),
+        host_config: data.join(platform::HOST_CONFIG_FILE),
         events,
         extra_env,
     })
@@ -1029,7 +1029,7 @@ impl App {
     }
 
     fn update_state_path(&self) -> PathBuf {
-        self.data.join("update-state.json")
+        self.data.join(platform::UPDATE_STATE_FILE)
     }
 
     fn host_paths(&self) -> Option<(PathBuf, PathBuf, PathBuf)> {
@@ -1038,7 +1038,7 @@ impl App {
         let previous_dir = host.parent()?.join("previous");
         Some((
             host,
-            previous_dir.join("bubbleplay-host.exe"),
+            previous_dir.join(platform::HOST_EXE),
             previous_dir.join("bubbleplay-host.failed.exe"),
         ))
     }
@@ -1418,7 +1418,7 @@ impl App {
         if self.key_ui_running {
             return;
         }
-        let key_path = device_key_file::path_beside(&self.data.join("host.json"));
+        let key_path = device_key_file::path_beside(&self.data.join(platform::HOST_CONFIG_FILE));
         let hwnd = self.hwnd.0 as isize;
         let started = key_ui::start(flow, key_path, move |replaced| {
             // SAFETY: posting to our own window; a failed post only loses the notification.
