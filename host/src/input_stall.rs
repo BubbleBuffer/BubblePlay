@@ -161,6 +161,9 @@ pub struct ForegroundObservation {
     pub hung: bool,
     /// The host's last classified cursor was `Wait`.
     pub cursor_wait: bool,
+    /// For a DWM `Ghost` foreground: pid and class of the hung window it stands in for, as
+    /// user32 reports it. `None` when that cannot be known.
+    pub ghost_for: Option<(u32, String)>,
 }
 
 impl ForegroundObservation {
@@ -192,7 +195,7 @@ impl StallReason {
 pub struct StallEpisode {
     pub reason: StallReason,
     pub foreground: ForegroundObservation,
-    /// The last foreground that was not a ghost, when the foreground is one: the app it stands in for.
+    /// The hung window a ghost foreground stands in for, when user32 can name it.
     pub behind_ghost: Option<(u32, String)>,
     pub wait_ms: u64,
 }
@@ -203,7 +206,6 @@ pub struct StallEpisode {
 pub struct StallWatch {
     wait_since: Option<Instant>,
     reported: bool,
-    last_app: Option<(u32, String)>,
 }
 
 impl StallWatch {
@@ -215,9 +217,6 @@ impl StallWatch {
 
     pub fn observe(&mut self, now: Instant, sample: ForegroundObservation) -> Option<StallEpisode> {
         let ghost = sample.ghost();
-        if !ghost && sample.pid != 0 {
-            self.last_app = Some((sample.pid, sample.class.clone()));
-        }
         if sample.cursor_wait {
             self.wait_since.get_or_insert(now);
         } else {
@@ -246,7 +245,11 @@ impl StallWatch {
         }
         Some(StallEpisode {
             reason,
-            behind_ghost: if ghost { self.last_app.clone() } else { None },
+            behind_ghost: if ghost {
+                sample.ghost_for.clone()
+            } else {
+                None
+            },
             foreground: sample,
             wait_ms: wait.as_millis() as u64,
         })
@@ -269,16 +272,51 @@ pub fn observe_foreground(cursor_wait: bool) -> ForegroundObservation {
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(window, Some(&raw mut pid));
-        let mut class = [0u16; 64];
-        let len = GetClassNameW(window, &mut class).max(0) as usize;
+        let class_of = |window| {
+            let mut class = [0u16; 64];
+            let len = GetClassNameW(window, &mut class).max(0) as usize;
+            String::from_utf16_lossy(&class[..len])
+        };
+        let class = class_of(window);
+        let ghost_for = (class == crate::follow_window::GHOST_CLASS)
+            .then(|| hung_window_from_ghost(window))
+            .flatten()
+            .map(|hung| {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hung, Some(&raw mut pid));
+                (pid, class_of(hung))
+            });
         ForegroundObservation {
             window: window.0 as isize,
             pid,
-            class: String::from_utf16_lossy(&class[..len]),
+            class,
             hung: IsHungAppWindow(window).as_bool(),
             cursor_wait,
+            ghost_for,
         }
     }
+}
+
+/// user32's `HungWindowFromGhostWindow` (exported by name, undocumented): the hung top-level
+/// window a DWM ghost replaces. A server-side lookup; it sends no message to either window.
+fn hung_window_from_ghost(
+    ghost: windows::Win32::Foundation::HWND,
+) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::core::{s, w};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    type Lookup = unsafe extern "system" fn(HWND) -> HWND;
+    static LOOKUP: OnceLock<Option<Lookup>> = OnceLock::new();
+    let lookup = (*LOOKUP.get_or_init(|| unsafe {
+        let user32 = GetModuleHandleW(w!("user32.dll")).ok()?;
+        let proc = GetProcAddress(user32, s!("HungWindowFromGhostWindow"))?;
+        Some(std::mem::transmute::<
+            unsafe extern "system" fn() -> isize,
+            Lookup,
+        >(proc))
+    }))?;
+    let hung = unsafe { lookup(ghost) };
+    (!hung.is_invalid()).then_some(hung)
 }
 
 /// Log `episode` with the host's own input state. One warn line.
@@ -356,16 +394,27 @@ mod tests {
     }
 
     #[test]
-    fn ghost_foreground_names_the_app_behind_it() {
+    fn ghost_foreground_names_the_hung_window_not_the_previous_foreground() {
+        // The previous foreground is often an unrelated app (a terminal, the shell); only the
+        // window user32 maps the ghost to may be named.
         let mut watch = StallWatch::default();
         let t = Instant::now();
-        watch.observe(t, app(16544, "WinUIDesktopWin32WindowClass"));
-        let episode = watch
+        watch.observe(t, app(4242, "CASCADIA_HOSTING_WINDOW_CLASS"));
+        let unknown = watch
             .observe(t + Duration::from_secs(1), app(1552, "Ghost"))
             .expect("ghost reported");
-        assert_eq!(episode.reason, StallReason::Ghost);
+        assert_eq!(unknown.reason, StallReason::Ghost);
+        assert_eq!(unknown.behind_ghost, None);
+        watch.reset();
+        let ghost = ForegroundObservation {
+            ghost_for: Some((16544, "WinUIDesktopWin32WindowClass".into())),
+            ..app(1552, "Ghost")
+        };
+        let named = watch
+            .observe(t + Duration::from_secs(2), ghost)
+            .expect("ghost reported");
         assert_eq!(
-            episode.behind_ghost,
+            named.behind_ghost,
             Some((16544, "WinUIDesktopWin32WindowClass".into()))
         );
     }
