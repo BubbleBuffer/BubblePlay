@@ -129,6 +129,10 @@ export function shouldRetryAuthTimeout({ reason, established, budgetStartMs, now
 export const CONNECT_TIMEOUT_MS = 5_000;
 export const CONNECT_TIMEOUT_MAX_MS = 10_000;
 
+// Consecutive failed offers (createOffer, setLocalDescription) before the peer stops restarting
+// itself. The next step is the transport's own fallback, not another immediate restart.
+export const OFFER_FAILURE_LIMIT = 3;
+
 /** Wait for a signaling socket to open on attempt `attempt` (0 = the first since the loss): 5 s, 7.5 s, then 10 s. Null when not recovering. */
 export function connectTimeoutMs({ recovering, attempt }) {
   if (recovering !== true) return null;

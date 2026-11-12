@@ -22,6 +22,13 @@ export const V4_HEARTBEAT_MS = 15_000;
 export const V4_BACKOFF_MIN_MS = 250;
 export const V4_BACKOFF_MAX_MS = 5_000;
 export const V4_KEYFRAME_REQUEST_INTERVAL_MS = 250;
+// Retries wait the backoff plus or minus this fraction, so clients that lost the relay together
+// do not return together.
+export const V4_BACKOFF_JITTER_FRACTION = 0.2;
+// Frames queued in a decoder before it counts as wedged: the viewer drops to the next keyframe.
+// The host keeps at most 12 frames in flight (wss_v4.rs in-flight window), so a healthy decoder
+// stays far below this.
+export const V4_DECODE_BACKLOG_LIMIT_FRAMES = 30;
 const KNOWN_FLAGS = V4_FLAG_KEY | V4_FLAG_REFINE;
 const REASON = /^[A-Za-z0-9_.:-]{1,64}$/;
 
@@ -169,6 +176,11 @@ export function keyframeMessageV4(reason) {
 export function nextBackoffMsV4(previousMs) {
   if (!Number.isFinite(previousMs) || previousMs < V4_BACKOFF_MIN_MS) return V4_BACKOFF_MIN_MS;
   return Math.min(V4_BACKOFF_MAX_MS, previousMs * 2);
+}
+
+/** The wait before a retry: `backoffMs` spread by the jitter fraction. `random` returns [0, 1). */
+export function jitteredBackoffMsV4(backoffMs, random = Math.random) {
+  return Math.round(backoffMs * (1 + (random() * 2 - 1) * V4_BACKOFF_JITTER_FRACTION));
 }
 
 /**

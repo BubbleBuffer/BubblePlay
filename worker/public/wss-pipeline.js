@@ -10,7 +10,7 @@
 // injected, so worker/test can drive it with fakes. All results go out through
 // `post(message)`; the main thread (wss-worker-client.js + receiver.js) owns
 // recovery state, the HUD and ACKs (ACKs stay on receipt there).
-import { detectAnnexBCodec, shouldPresentDecodedV4 } from "./media-v4.js";
+import { V4_DECODE_BACKLOG_LIMIT_FRAMES, detectAnnexBCodec, shouldPresentDecodedV4 } from "./media-v4.js";
 import { decodeTimestampPatternBits } from "./latency.js";
 import { CODEC, drawBaseThenHybrid, HevcTileCache, HybridTileCache, prepareHybridWssFrame } from "./media.js";
 
@@ -167,6 +167,12 @@ export function createWssPipeline({
     if (decoder.state !== "configured") return false;
     if (!isKey && !sawKeyframe) {
       post({ type: "drop", recover: "delta-before-keyframe" });
+      return false;
+    }
+    if (decoder.decodeQueueSize >= V4_DECODE_BACKLOG_LIMIT_FRAMES) {
+      // Wedged or starved decoder: stop queueing, wait for a keyframe after the main thread resyncs.
+      sawKeyframe = false;
+      post({ type: "drop", recover: "decoder-backpressure" });
       return false;
     }
     sawKeyframe = sawKeyframe || isKey;

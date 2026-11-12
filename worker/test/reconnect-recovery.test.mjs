@@ -152,7 +152,7 @@ function signalingHarness({ recovering }) {
     signalingRegistered: false, signalingPc: null, signalingTicket: null, sessionIdentity: {}, params: {},
     hud: { classList: { add() {} } },
     WebSocket: FakeSocket, URL, Promise, Math, Number, Array,
-    connectTimeoutMs, shouldRetryOnWake, shouldReconnectAfterClose,
+    connectTimeoutMs, shouldRetryOnWake, shouldReconnectAfterClose, signalingBackoffMs: 0, nextBackoffMsV4: () => 250, jitteredBackoffMsV4: ms => ms, // reconnect delay is not under test here
     setTimeout: (fn, delay) => { const id = nextId++; timers.push({ id, at: clock + delay, fn }); return id; },
     clearTimeout: id => { timers = timers.filter(t => t.id !== id); },
     signalingSocketUrl: () => "wss://relay.test/ws?pc=pc",
