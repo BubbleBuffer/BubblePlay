@@ -338,6 +338,16 @@ impl SecureHelperLink {
     pub fn state(&self) -> Option<SecureState> {
         lock(&self.snapshot).state.clone()
     }
+    /// The helper verified that the normal-desktop foreground is above the
+    /// admin agent's integrity and accepts input for it (protocol v3).
+    pub fn elevated_input_ready(&self) -> bool {
+        lock(&self.snapshot).state.as_ref().is_some_and(|state| {
+            !state.secure
+                && state.kind == protocol::Kind::ElevatedForeground.name()
+                && state.available
+                && state.caps.contains(&"input")
+        })
+    }
     pub fn take_frame(&mut self) -> Option<BgraFrame> {
         lock(&self.snapshot).frame.take()
     }
@@ -369,7 +379,10 @@ impl SecureHelperLink {
             s.counters.reject(count, "not_ready");
             return Err(LinkError::Unavailable);
         };
-        if !state.secure {
+        // Normal-desktop input is accepted only for the helper-verified
+        // elevated foreground, and never for probes.
+        let elevated = !probe && state.kind == protocol::Kind::ElevatedForeground.name();
+        if !state.secure && !elevated {
             s.counters.reject(count, "not_secure");
             return Err(LinkError::Unavailable);
         }
