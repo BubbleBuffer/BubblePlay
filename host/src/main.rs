@@ -14,6 +14,7 @@ mod host_session;
 use host_session::*;
 mod host_benchmark;
 use host_benchmark::*;
+mod encode_retry;
 mod producer_wait;
 mod session_watchdog;
 mod viewer_display;
@@ -1297,6 +1298,7 @@ fn run_serve(
     let mut pending_candidates = VecDeque::new();
     let mut next_admission = Instant::now();
     let mut next_idr = Instant::now();
+    let mut encode_retry = encode_retry::EncodeRetryGate::new(Instant::now());
     let mut next_ping = Instant::now() + SIGNALING_HEARTBEAT_INTERVAL;
     // v4: per-tile quality debt, no-op repaint skipping and tile refines.
     let mut tile_tracker: Option<TileQualityTracker> = None;
@@ -1740,11 +1742,14 @@ fn run_serve(
             && local_recovery_probe_due(capture_available, wait_now, next_local_recovery_probe);
         capture.set_capture_demand(capture_demand || recovery_due)?;
         if capture_demand || recovery_due {
-            capture.request_event_frame_at(if urgent_capture || recovery_due {
-                wait_now
-            } else {
-                admission_wake.max(wait_now)
-            })?;
+            capture.request_event_frame_at(
+                if urgent_capture || recovery_due {
+                    wait_now
+                } else {
+                    admission_wake.max(wait_now)
+                }
+                .max(encode_retry.not_before()),
+            )?;
         }
         if let Ok(wake) = &cursor_wake {
             wake.set_active(capture_demand);
@@ -1786,7 +1791,7 @@ fn run_serve(
                     ice_connected || wss_peer_live,
                     latest_idr.is_none(),
                 )) {
-                    deadlines.push(deadline);
+                    deadlines.push(deadline.max(encode_retry.not_before()));
                 }
                 if foreground_sample_live(
                     viewer_attached,
@@ -4367,6 +4372,7 @@ fn run_serve(
             && viewer_attached
             && local_recovery_probe_due(capture_available, now, next_local_recovery_probe);
         if signaling.application_ready()
+            && encode_retry.ready(now)
             && (local_recovery_probe
                 || capture_admission_ready(
                     capture_available,
@@ -4981,6 +4987,7 @@ fn run_serve(
                                     latest_idr = None;
                                     pending_transition_idr = None;
                                     next_idr = now;
+                                    encode_retry.failed(now);
                                     continue 'session;
                                 }
                             }
@@ -5095,6 +5102,7 @@ fn run_serve(
                                         latest_idr = None;
                                         pending_transition_idr = None;
                                         next_idr = now;
+                                        encode_retry.failed(now);
                                         continue 'session;
                                     }
                                 }
@@ -5393,6 +5401,7 @@ fn run_serve(
                                 latest_idr = None;
                                 pending_transition_idr = None;
                                 next_idr = now;
+                                encode_retry.failed(now);
                                 continue 'session;
                             }
                         }
@@ -5775,6 +5784,7 @@ fn run_serve(
                                     latest_idr = None;
                                     pending_transition_idr = None;
                                     next_idr = now;
+                                    encode_retry.failed(now);
                                     continue 'session;
                                 }
                                 warn!(
@@ -5829,6 +5839,7 @@ fn run_serve(
                                                 latest_idr = None;
                                                 pending_transition_idr = None;
                                                 next_idr = now;
+                                                encode_retry.failed(now);
                                                 continue 'session;
                                             }
                                         }
@@ -5883,6 +5894,7 @@ fn run_serve(
                                         latest_idr = None;
                                         pending_transition_idr = None;
                                         next_idr = now;
+                                        encode_retry.failed(now);
                                         continue 'session;
                                     }
                                 }
@@ -5918,6 +5930,7 @@ fn run_serve(
                             );
                         }
                     }
+                    encode_retry.succeeded();
                     ensure_rtc_encoder_codec(
                         discovered_backend,
                         wss_media.is_some(),
@@ -6610,6 +6623,7 @@ fn run_serve(
                                     );
                                     quiescent_diff_analyzer = None;
                                 }
+                                encode_retry.failed(now);
                                 continue 'session;
                             }
                         }
