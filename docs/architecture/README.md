@@ -30,7 +30,7 @@ Shared fixtures are the cross-language contract; update them and the affected im
 | --- | --- |
 | [`wss-v4-contract.json`](../../fixtures/wss-v4-contract.json) | Current WSS framing, ACK and keyframe messages |
 | [`wss-contract.json`](../../fixtures/wss-contract.json) | Retained transport framing contracts |
-| [`input-contract.json`](../../fixtures/input-contract.json) | Input packets and scan codes |
+| [`input-contract.json`](../../fixtures/input-contract.json) | Input packets (byte vectors for types 0 to 13) and scan codes |
 | [`cursor-types.json`](../../fixtures/cursor-types.json) | Reliable semantic cursor kinds; position packets remain separate |
 | [`file-transfer-contract.json`](../../fixtures/file-transfer-contract.json) | File packets, validation limits and socket behavior |
 | [`follow-window-contract.json`](../../fixtures/follow-window-contract.json) | Monitor-follow capability and controls |
