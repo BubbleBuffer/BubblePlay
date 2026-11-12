@@ -62,7 +62,10 @@ pub enum HostEvent {
 pub fn line_event(line: &[u8]) -> Option<HostEvent> {
     use bubbleplay_host::admin_agent::client::{VIEWER_ENDED_MARKER, VIEWER_STARTED_MARKER};
     [
-        (bubbleplay_host::signaling::REGISTERED_MARKER, HostEvent::Registered),
+        (
+            bubbleplay_host::signaling::REGISTERED_MARKER,
+            HostEvent::Registered,
+        ),
         (VIEWER_STARTED_MARKER, HostEvent::ViewerStarted),
         (VIEWER_ENDED_MARKER, HostEvent::ViewerEnded),
     ]
