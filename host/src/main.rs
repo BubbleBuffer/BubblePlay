@@ -5123,7 +5123,7 @@ fn run_serve(
                             && !profile.encoder.main10
                             && wss_media.is_some()
                     });
-                    let feedback_roi_enabled = encoder_caps.roi_qp_map
+                    let mut feedback_roi_enabled = encoder_caps.roi_qp_map
                         && encoder_caps.refine_feedback
                         && active_benchmark_profile.is_some_and(|profile| {
                             profile.schema_version == 2
@@ -5331,7 +5331,9 @@ fn run_serve(
                         if reconstruction_feedback_analyzer.is_none()
                             || feedback_roi_planner.is_none()
                         {
-                            continue 'session;
+                            // Feedback ROI is unavailable for this key; encode
+                            // without it rather than freezing the stream.
+                            feedback_roi_enabled = false;
                         }
                     }
                     let feedback_sequence = media_sequence.wrapping_add(1);
