@@ -8,6 +8,7 @@ Each implementation has one test that reads its section and fails when the code 
 | --- | --- |
 | Browser | `worker/test/timing-contract.test.mjs` |
 | Kotlin | `android/app/src/test/java/de/bubblebuffer/bubbleplay/net/TimingContractTest.kt` |
+| client-win | `client-win/src/net/timing_contract_tests.rs` |
 | Relay | `relay-rs/core/tests/contract_timing.rs` |
 
 A key in a section's `unpinned` object has no reader yet; its value names what blocks it (a literal in a source file another change is editing, or a private constant). The delay schedules in `schedules` are the table-driven check for backoff, recycled-session auth waits and the reconnect socket-open timeout: attempt n gives one delay in every implementation that uses the schedule.

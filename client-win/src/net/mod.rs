@@ -24,6 +24,8 @@ mod fake_relay;
 mod integration_contract_tests;
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+mod timing_contract_tests;
 
 pub use config::{Codec, NetConfig, TransportChoice, ViewerAuth, AUTO_ICE_CHECKING_TIMEOUT};
 /// Only the session tests build a monitor error by name.
