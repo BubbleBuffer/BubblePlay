@@ -23,7 +23,7 @@ import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, jitteredBackoffMsV4, nextBackoffMsV4, V4_DECODE_BACKLOG_LIMIT_FRAMES, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_KEYFRAME_REQUEST_INTERVAL_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, jitteredBackoffMsV4, nextBackoffMsV4, V4_DECODE_BACKLOG_LIMIT_FRAMES, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
   orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes, selectWssDecoderPath,
@@ -1972,7 +1972,7 @@ async function maybeStartWssHost() {
 
 function requestWssKeyframe(reason, requestId = null) {
   const now = performance.now();
-  if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < 250) return false;
+  if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < V4_KEYFRAME_REQUEST_INTERVAL_MS) return false;
   requestWssKeyframe.lastAt = now;
   viewerLog("warn", "wss-keyframe-request", { reason, requestId });
   if (usingWssMedia && !requestId) return sendWssV4(keyframeMessageV4(reason));
@@ -4059,7 +4059,6 @@ const secureCompositionCommit = createCompositionCommitGate(text => {
   if (!inputReady || desktopKind !== "secure") { resetKeyboardDraft(); return; }
   handleSecureKeyboardInput({ data: text, inputType: "insertCompositionText" });
 });
-const modifierVks = new Map([["Ctrl", 0x11], ["Alt", 0x12], ["Shift", 0x10], ["Win", 0x5B]]);
 // Keys popover (touch), after the Android app: navigation and editing keys,
 // then function keys. Arrows live in their own popover.
 const specialKeys = [
@@ -4839,4 +4838,3 @@ renderKeyboardModifiers();
 renderKeyboardButton();
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-function clamp16(v) { return clamp(v, -32768, 32767); }

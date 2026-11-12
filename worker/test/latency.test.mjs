@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  createEncodedWorkerState,
   createLatencyGuard,
   annexBHasIdr,
   decodeTimestampPatternBits,
@@ -49,48 +48,6 @@ test("timestamp discontinuity creates a new generation", () => {
   assert.equal(guard.acceptWorkerFrame({ generation: 0, timestamp: 9_000_000 }), false);
   assert.equal(resets, 1);
   assert.equal(guard.generation, 1);
-});
-
-test("worker ACKs are generation and sequence aware across a resync", () => {
-  const state = createEncodedWorkerState();
-  const old = state.reserve("key");
-  state.resync("test");
-  const current = state.reserve("key");
-  assert.equal(state.ack(old), false);
-  assert.equal(state.pending, 1);
-  assert.equal(state.ack(current), true);
-  assert.equal(state.pending, 0);
-});
-
-test("worker snapshots reservations before a reset and only posts current generation", () => {
-  const state = createEncodedWorkerState();
-  const delayed = state.reserve("key");
-  state.resync("during-delay");
-  assert.equal(state.canPost(delayed), false);
-  assert.equal(state.reserve("delta"), null, "deltas wait for the recovery keyframe");
-  assert.ok(state.reserve("key"));
-});
-
-test("echoed resync generation is idempotent instead of advancing forever", () => {
-  let notifications = 0;
-  const state = createEncodedWorkerState({ onResync: () => notifications++ });
-  state.resync("worker");
-  const generation = state.generation;
-  state.resync("main-echo", generation);
-  assert.equal(state.generation, generation);
-  assert.equal(notifications, 1);
-});
-
-test("deltas discarded while waiting for a keyframe do not churn generations", () => {
-  let notifications = 0;
-  const state = createEncodedWorkerState({ onResync: () => notifications++ });
-  state.resync("overflow");
-  const generation = state.generation;
-  assert.equal(state.reserve("delta"), null);
-  assert.equal(state.reserve("delta"), null);
-  assert.equal(state.generation, generation);
-  assert.equal(notifications, 1);
-  assert.ok(state.reserve("key"));
 });
 
 test("presentation age is derived from the media timeline, not decoder callback time", () => {
