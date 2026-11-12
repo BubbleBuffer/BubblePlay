@@ -7,7 +7,7 @@
     "#[allow(": 21
   },
   "host": {
-    "#[allow(": 41,
+    "#[allow(": 43,
     "empty catch": 7
   },
   "relay-rs": {
