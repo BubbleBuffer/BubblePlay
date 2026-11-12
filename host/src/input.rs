@@ -1469,6 +1469,11 @@ pub struct InputSink {
     /// Pixel offset added to absolute moves (and clamped to the desktop) while a window drag that
     /// crossed monitors is in progress; see `begin_drag_offset`.
     drag_offset: Option<(i32, i32)>,
+    /// An edge drop released the left button while the client still holds it: the client's left
+    /// counts as released (a later packet with left still set, e.g. a right-click, must not
+    /// press it again) and the drag offset stays, until the client sends a left-up or
+    /// release-all, not until the move loop ends.
+    left_released_by_drop: bool,
     diagnostics_foreground_pid: Option<u32>,
     development_agent: bool,
     #[cfg(test)]
@@ -3299,6 +3304,58 @@ mod tests {
         sink.set_absolute_region(DesktopRegion::new(0, 0, 1920, 1080));
         assert_eq!(sink.drag_offset, None);
     }
+
+    #[test]
+    fn edge_drop_release_is_sent_once_and_the_offset_waits_for_the_client_button() {
+        let mut sink = InputSink::new();
+        sink.test_injections = Some(Vec::new());
+        sink.set_absolute_region(DesktopRegion::new(1920, 0, 2560, 1440));
+        sink.handle(&[super::TYPE_BUTTONS, 1]);
+        sink.begin_drag_offset(Some((u16::MAX, 20_000)), (3200, 720));
+        let left_ups = |sink: &InputSink| {
+            sink.test_injections
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(
+                    |r| matches!(r, super::Record::Mouse { flags, .. } if *flags == super::MOUSEEVENTF_LEFTUP.0),
+                )
+                .count()
+        };
+        // A release Windows refuses leaves left held: no drop bookkeeping, and the retry works.
+        sink.test_refuse = true;
+        assert!(!sink.release_left_for_drop().succeeded());
+        sink.test_refuse = false;
+        sink.clear_drag_offset();
+        assert_eq!(sink.drag_offset, None);
+        assert_eq!(left_ups(&sink), 0);
+        sink.begin_drag_offset(Some((u16::MAX, 20_000)), (3200, 720));
+        assert!(sink.release_left_for_drop().succeeded());
+        assert_eq!(sink.release_left_for_drop(), InputApplication::default()); // already released
+        assert_eq!(left_ups(&sink), 1);
+        // The move loop ends right after the release: the offset stays.
+        sink.clear_drag_offset();
+        assert!(sink.drag_offset.is_some());
+        // A right-click while the client still holds left must not press left again.
+        sink.handle(&[super::TYPE_BUTTONS, 3]);
+        let left_downs = sink
+            .test_injections
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, super::Record::Mouse { flags, .. } if *flags == super::MOUSEEVENTF_LEFTDOWN.0))
+            .count();
+        assert_eq!(left_downs, 1); // only the original press
+        assert!(sink.drag_offset.is_some());
+        // The client's own left-up is a no-op for left on the host and ends the offset.
+        sink.handle(&[super::TYPE_BUTTONS, 0]);
+        assert_eq!(left_ups(&sink), 1);
+        assert_eq!(sink.drag_offset, None);
+        // Without a drop, the end of the move loop still clears it.
+        sink.begin_drag_offset(Some((0, 0)), (3200, 720));
+        sink.clear_drag_offset();
+        assert_eq!(sink.drag_offset, None);
+    }
 }
 
 impl Default for InputSink {
@@ -3330,6 +3387,7 @@ impl InputSink {
             input_flow: Default::default(),
             geometry_valid: true,
             drag_offset: None,
+            left_released_by_drop: false,
             diagnostics_foreground_pid: None,
             development_agent: false,
             #[cfg(test)]
@@ -3488,8 +3546,29 @@ impl InputSink {
         };
     }
 
+    /// The end of the move loop. Not while an edge drop waits for the client's own release.
     pub fn clear_drag_offset(&mut self) {
-        self.drag_offset = None;
+        if !self.left_released_by_drop {
+            self.drag_offset = None;
+        }
+    }
+
+    /// End an edge-switch drag: release the left button on the host if it is held (once; the
+    /// result says whether Windows took it), but
+    /// keep the drag offset until the client's next button packet, so the cursor stays where the
+    /// drop put it while the user still holds the real button.
+    pub fn release_left_for_drop(&mut self) -> InputApplication {
+        if self.state.buttons & 1 == 0 {
+            return InputApplication::default();
+        }
+        let released = self.send_button_releases(1);
+        if released.succeeded() {
+            self.state.buttons &= !1;
+            self.left_released_by_drop = true;
+        }
+        // A release Windows did not receive leaves left held: it stays in the release plan, so
+        // the caller can retry and release-all still sends it.
+        released
     }
 
     pub fn absolute_region(&self) -> DesktopRegion {
@@ -4149,6 +4228,16 @@ impl InputSink {
 
     /// Bitmask diff -> press/release events for each button.
     fn buttons(&mut self, mask: u8) -> InputApplication {
+        let mut mask = mask;
+        if self.left_released_by_drop {
+            if mask & 1 == 0 {
+                // The client let go of left itself.
+                self.left_released_by_drop = false;
+                self.drag_offset = None;
+            } else {
+                mask &= !1; // still held on the client: stays released on the host
+            }
+        }
         let previous = self.state.buttons;
         let changed = mask ^ previous;
         self.state.buttons = mask;
@@ -4259,6 +4348,7 @@ impl InputSink {
             sync.reset();
         }
         self.drag_offset = None;
+        self.left_released_by_drop = false;
         let (keys, buttons) = self.state.take_release_plan();
         let mut application = InputApplication::default();
         for key in keys {

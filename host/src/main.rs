@@ -22,6 +22,7 @@ use viewer_display::{DisplayWakePolicy, ViewerDisplayHold};
 use bubbleplay_host::activity::Activity;
 use bubbleplay_host::benchmark;
 use bubbleplay_host::capture;
+use bubbleplay_host::edge_drop::{self, PendingDrop};
 use bubbleplay_host::encode;
 use bubbleplay_host::feedback_roi;
 use bubbleplay_host::file_service::{FileService, FileServiceConfig};
@@ -1500,6 +1501,8 @@ fn run_serve(
     // monitor list is read once per loop.
     let mut edge_monitors: Option<Vec<capture::MonitorInfo>> = None;
     let mut next_edge_sample = Instant::now();
+    // An edge switch warped the cursor; the left button release is still owed (edge_drop.rs).
+    let mut pending_drop: Option<(PendingDrop, Instant, String)> = None;
     // One live monitor switch, shared by the manual Monitors pick and
     // "Follow active window". A macro because the switch resets most of the
     // session locals below; it must stay defined after all of them.
@@ -1795,6 +1798,9 @@ fn run_serve(
                     if edge_monitors.is_some() {
                         deadlines.push(next_edge_sample);
                     }
+                }
+                if let Some((_, next, _)) = &pending_drop {
+                    deadlines.push(*next);
                 }
                 if file_service.is_some() {
                     deadlines.push(next_file_rate_update);
@@ -2594,6 +2600,37 @@ fn run_serve(
             }
             None
         };
+        // The release owed by an edge-switch drop (edge_drop.rs): on the first tick after the
+        // warp that sees the window moved or the move loop gone, at the latest at the deadline.
+        // Outside the follow block, so nothing can skip it.
+        if let Some((drop, next, monitor)) = pending_drop.as_ref() {
+            let now = Instant::now();
+            if now >= *next {
+                let window = follow_window::sample_move()
+                    .and_then(|moving| edge_drop::window_rect(moving.window));
+                let mut done = false;
+                if let Some(by) = drop.step(now, window) {
+                    if input_sink.release_left_for_drop().succeeded() {
+                        info!(
+                            monitor = %monitor,
+                            released_by = by.as_str(),
+                            "follow active window: edge drop released the left button"
+                        );
+                        done = true;
+                    } else if drop.expired(now) {
+                        warn!(
+                            "follow active window: edge drop release refused; release-all keeps it"
+                        );
+                        done = true;
+                    }
+                }
+                if done {
+                    pending_drop = None;
+                } else if let Some(pending) = pending_drop.as_mut() {
+                    pending.1 = now + follow_window::EDGE_SAMPLE_INTERVAL;
+                }
+            }
+        }
         if let Some(follow) = follow_state.as_mut() {
             let now = Instant::now();
             let viewer_live = capture_available
@@ -2629,7 +2666,7 @@ fn run_serve(
                     // The move loop is over: absolute moves land where the client points again.
                     input_sink.clear_drag_offset();
                 }
-                if let Some((from, to, selector, cursor)) = carry {
+                if let Some((_, to, selector, cursor)) = carry {
                     dialog_follow.changed_elsewhere();
                     follow.switched(now);
                     info!(
@@ -2643,16 +2680,29 @@ fn run_serve(
                     // Cross onto the new monitor while the button is still held, so the
                     // dragged window comes along. A cursor already past the edge is on the
                     // new monitor: leave it there.
-                    if from.contains(cursor)
-                        && capture.monitor_selector().eq_ignore_ascii_case(&selector)
-                    {
-                        let (x, y) = follow_window::translate_cursor(cursor, from, to);
-                        if follow_window::set_cursor(x, y) {
-                            // An absolute client's next move would snap the cursor back to
-                            // its own pointer: offset its moves until the drag ends.
-                            input_sink.begin_drag_offset(client_pointer, (x, y));
-                        } else {
-                            warn!("follow active window: edge hold could not move the cursor");
+                    if capture.monitor_selector().eq_ignore_ascii_case(&selector) {
+                        // Drop the window centred on the new monitor, grab point under the
+                        // cursor, and release the button on a later tick (edge_drop.rs).
+                        let window = moving.and_then(|m| edge_drop::window_rect(m.window));
+                        let still_moving = follow_window::sample_move().is_some();
+                        if let Some((drop, point, warped)) =
+                            PendingDrop::start(now, still_moving, cursor, window, to, |(x, y)| {
+                                follow_window::set_cursor(x, y)
+                            })
+                        {
+                            if warped {
+                                // An absolute client's next move would snap the cursor back
+                                // to its own pointer: offset its moves until its left-up.
+                                input_sink.begin_drag_offset(client_pointer, point);
+                            } else {
+                                warn!("follow active window: edge drop could not move the cursor");
+                            }
+                            // The release is owed even if the warp failed.
+                            pending_drop = Some((
+                                drop,
+                                now + follow_window::EDGE_SAMPLE_INTERVAL,
+                                selector.clone(),
+                            ));
                         }
                     }
                 }

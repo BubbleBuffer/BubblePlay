@@ -17,7 +17,6 @@ import {
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
-import { createDragLock } from "/drag-lock.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
 import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
@@ -287,7 +286,6 @@ function handleDesktopState(message) {
     inputTransitionHold = true;
     if (motionFrame !== null) cancelAnimationFrame(motionFrame);
     motionFrame = null;
-    if (transitionPlan.action === "handshake") dragLock.monitorSwitch({ pointerMode });
     renderDesktopState();
     if (transitionPlan.action === "handshake") startFirstFrameHandshake("monitor-transition", true);
     return;
@@ -832,7 +830,7 @@ function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, 
 // Reconcile against the cursor sequence, not the last wheel: wheel-only sends never move the pointer.
 function queueTouchAbsolute(x, y) { const before = input.lastCursorSequence; input.absolute(x, y); const sent = input.flushMotion(); if (input.lastCursorSequence !== before) cursorReconciler?.noteSent(input.lastCursorSequence); retryMotionTail(); updateMotionHud(); return sent; }
 function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
-function releaseInput(send = true) { dragLock.stop(); inputTransitionHold = false; input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
+function releaseInput(send = true) { inputTransitionHold = false; input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (motionFrame !== null) cancelAnimationFrame(motionFrame); motionFrame = null; renderKeyboardModifiers?.(); }
 let connected = false;
 let offerSent = false;
 let peerGeneration = 0;
@@ -3726,28 +3724,7 @@ async function requestPointerLock() {
     } catch { locked = false; }
   }
 }
-// A window drag that crossed monitors keeps its pointer moving past the screen edge
-// by locking the pointer for the rest of the drag (drag-lock.js). It is not Game mode's
-// lock: `locked`, the mode label and keyboard capture ignore it.
-let dragLockPrevMouseActive = false, dragLockExitPending = false;
-const dragLock = createDragLock({
-  now: () => performance.now(),
-  requestLock: () => inputSurface.requestPointerLock(),
-  exitLock: () => { if (document.pointerLockElement === inputSurface) { dragLockExitPending = true; document.exitPointerLock?.(); } },
-  releaseButtons: () => releaseInput(),
-  log: detail => viewerLog("info", "drag-lock", detail),
-  onLockedChange: held => {
-    if (held) { dragLockPrevMouseActive = mousePointerActive; mousePointerActive = false; touchCursorVisible = true; }
-    else { mousePointerActive = dragLockPrevMouseActive; showTouchCursor(); }
-    renderTouchCursor();
-  },
-});
-document.addEventListener("pointerlockerror", () => dragLock.lockError("pointerlockerror"));
 document.addEventListener("pointerlockchange", () => {
-  if (pointerMode === "desktop") {
-    if (dragLockExitPending && document.pointerLockElement !== inputSurface) { dragLockExitPending = false; return; }
-    if (dragLock.phase !== "idle") { dragLock.lockChanged(document.pointerLockElement === inputSurface); return; }
-  }
   locked = document.pointerLockElement === inputSurface;
   updatePointerHud();
   if (!locked) releaseInput();
@@ -3757,9 +3734,8 @@ document.addEventListener("click", (event) => {
 });
 document.addEventListener("mousemove", (e) => {
   if (!inputReady || !connected) return;
-  if ((pointerMode === "game" && locked) || dragLock.locked()) {
-    // Relative deltas (unadjusted in Game mode; plain, so the speed matches, in a drag).
-    if (dragLock.locked()) touchCursorVisible = true; // the drawn cursor is the only one while locked
+  if (pointerMode === "game" && locked) {
+    // Relative (unadjusted) deltas.
     updateRemoteCursor(cursor => cursor.moveScreen(e.movementX, e.movementY, viewport));
     queueMotion(e.movementX, e.movementY);
   } else {
@@ -3774,29 +3750,22 @@ document.addEventListener("mousemove", (e) => {
     locallyAuthoritativeCursor = true; mousePointerActive = true; queueAbsolute(x * 65535, y * 65535); showTouchCursor();
   }
 });
-const mouseTouchLike = e => Boolean(e.sourceCapabilities?.firesTouchEvents) || mobilePointerDevice || performance.now() - lastNonMousePointerAt <= 1500;
 document.addEventListener("mousedown", (e) => {
-  dragLock.down({ button: e.button, pointerMode, touchLike: mouseTouchLike(e) });
   if (!inputReady) return;
   if (e.target !== inputSurface) return;
   inputSurface.focus({ preventScroll: true });
   // The initial capture gesture is local-only; never turn it into a remote click.
   if (pointerMode === "game" && !locked && connected) { requestPointerLock(); e.preventDefault(); return; }
   buttons |= BM[e.button] || (e.button === 3 ? 8 : e.button === 4 ? 16 : 0);
-  // While the drag lock is held the host cursor already is where the drawn one is, so
-  // buttons carry no position (a position would get the host's drag offset added twice).
-  if (pointerMode === "desktop" && !dragLock.locked()) setTouchButtonsAtCursor(buttons); else input.buttons(buttons);
+  if (pointerMode === "desktop") setTouchButtonsAtCursor(buttons); else input.buttons(buttons);
   e.preventDefault();
 });
 document.addEventListener("mouseup", (e) => {
-  const dragLocked = dragLock.locked();
-  if (inputReady && e.target === inputSurface) {
-    buttons &= ~(BM[e.button] || (e.button === 3 ? 8 : e.button === 4 ? 16 : 0));
-    if (pointerMode === "desktop" && !dragLocked) setTouchButtonsAtCursor(buttons); else input.buttons(buttons);
-    e.preventDefault();
-  }
-  // After the release is sent. Leaving the lock never needs another mouse-up.
-  dragLock.up({ button: e.button });
+  if (!inputReady) return;
+  if (e.target !== inputSurface) return;
+  buttons &= ~(BM[e.button] || (e.button === 3 ? 8 : e.button === 4 ? 16 : 0));
+  if (pointerMode === "desktop") setTouchButtonsAtCursor(buttons); else input.buttons(buttons);
+  e.preventDefault();
 });
 document.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("wheel", (e) => {

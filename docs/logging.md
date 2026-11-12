@@ -114,3 +114,7 @@ While a viewer is attached, the host checks the foreground window on the 250 ms 
 - `last_file_drop_step`, `last_clipboard_step`: the last step name, `running` or `done`, and its age. No clipboard or file content is logged.
 
 The line was added after a WhatsApp freeze on 2026-11-09 that a TeamViewer connection ended; the host's logs then showed no attached queue or drop hook, so these fields say on the next occurrence whether the host was involved.
+
+## Edge drop (2026-11-11)
+
+After an edge-switch window drag the host warps the cursor and releases the left button (`docs/architecture/follow-active-window.md`). Info line `follow active window: edge drop released the left button` with `monitor` (the target monitor selector) and `released_by` (`tick` when a later 50 ms sample saw the window moved or the move loop gone, `deadline` when the 250 ms limit forced it). A warn line `edge drop could not move the cursor` means the warp failed; the release still follows. The browser no longer writes a `drag-lock` line.

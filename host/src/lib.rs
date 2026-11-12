@@ -21,6 +21,7 @@ pub mod dialog_monitor;
 pub mod dk_host;
 pub mod dk_session;
 pub mod dpapi;
+pub mod edge_drop;
 pub mod encode;
 pub(crate) mod encoder_reconfigure;
 pub mod feedback_roi;
