@@ -833,16 +833,6 @@ impl DamageMetadata {
     }
 }
 
-/// GDI-backed capture source used on the Winlogon/UAC desktop where desktop
-/// duplication is intentionally unavailable. It owns a standalone D3D11
-/// device so cold-boot capture does not depend on a previous DDA session.
-pub struct SecureCapture {
-    device: ID3D11Device,
-    width: u32,
-    height: u32,
-    monitor_device_name: String,
-}
-
 /// Uploads helper BGRA pixels on the interactive host's encoder device.
 /// The helper never creates an encoder or supplies a D3D device to the host.
 pub struct SecureFrameUpload {
@@ -947,53 +937,6 @@ fn validate_bgra_upload(width: u32, height: u32, stride: u32, len: usize) -> Res
     Ok(())
 }
 
-impl SecureCapture {
-    pub fn primary() -> Result<Self> {
-        let monitor = Monitor::primary().context("find primary monitor for secure capture")?;
-        let width = monitor.width().context("secure monitor width")?;
-        let height = monitor.height().context("secure monitor height")?;
-        let monitor_device_name = monitor.device_name().unwrap_or_default();
-        let mut device = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                None,
-            )
-        }
-        .context("D3D11CreateDevice(secure capture)")?;
-        let device = device.context("secure D3D11 device was not returned")?;
-        gpu_gate::protect_device(&device)?;
-        Ok(Self {
-            device,
-            width,
-            height,
-            monitor_device_name,
-        })
-    }
-
-    pub fn capture(&self) -> Result<CapturedFrame<'_>> {
-        let texture = capture_gdi_texture(
-            &self.device,
-            self.width,
-            self.height,
-            &self.monitor_device_name,
-        )?;
-        Ok(CapturedFrame::SecureSnapshot {
-            device: &self.device,
-            texture,
-            width: self.width,
-            height: self.height,
-        })
-    }
-}
-
 fn gdi_texture_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
     D3D11_TEXTURE2D_DESC {
         Width: width,
@@ -1010,15 +953,6 @@ fn gdi_texture_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
         CPUAccessFlags: 0,
         MiscFlags: D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32,
     }
-}
-
-fn capture_gdi_texture(
-    device: &ID3D11Device,
-    width: u32,
-    height: u32,
-    monitor_device_name: &str,
-) -> Result<ID3D11Texture2D> {
-    GdiSnapshot::new(device, width, height, monitor_device_name)?.capture(device)
 }
 
 /// Texture, surface and display DC survive idle-IDR retries. The DXGI target
@@ -1077,45 +1011,67 @@ impl GdiSnapshot {
     }
 
     fn capture(&self, device: &ID3D11Device) -> Result<ID3D11Texture2D> {
-        // The surface DC and BitBlt write the device's GDI-compatible texture.
         let gate = gpu_gate::for_device(device);
-        let _gpu = gate.lock();
-        let copy_result = (|| -> Result<()> {
-            let target_dc = unsafe { self.surface.GetDC(true) }.context("IDXGISurface1::GetDC")?;
-            let blit = unsafe {
-                BitBlt(
-                    target_dc,
-                    0,
-                    0,
-                    self.width as i32,
-                    self.height as i32,
-                    Some(self.source_dc),
-                    0,
-                    0,
-                    SRCCOPY | CAPTUREBLT,
-                )
-            };
-            let release = unsafe { self.surface.ReleaseDC(None) };
-            blit.context("BitBlt desktop into GDI texture")?;
-            release.context("IDXGISurface1::ReleaseDC")?;
-            Ok(())
-        })();
-        match copy_result {
-            Ok(()) => Ok(self.texture.clone()),
-            Err(direct_error) => {
-                warn!(
-                    ?direct_error,
-                    "direct GDI/DXGI capture failed; using CPU DIB fallback"
-                );
+        copy_with_dib_fallback(
+            &gate,
+            || self.copy_direct(),
+            || {
                 capture_gdi_via_dib(
                     device,
                     &self.texture,
                     self.source_dc,
                     self.width,
                     self.height,
-                )?;
-                Ok(self.texture.clone())
-            }
+                )
+            },
+        )?;
+        Ok(self.texture.clone())
+    }
+
+    /// The surface DC and BitBlt write the device's GDI-compatible texture.
+    /// The caller holds the device gate.
+    fn copy_direct(&self) -> Result<()> {
+        let target_dc = unsafe { self.surface.GetDC(true) }.context("IDXGISurface1::GetDC")?;
+        let blit = unsafe {
+            BitBlt(
+                target_dc,
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                Some(self.source_dc),
+                0,
+                0,
+                SRCCOPY | CAPTUREBLT,
+            )
+        };
+        let release = unsafe { self.surface.ReleaseDC(None) };
+        blit.context("BitBlt desktop into GDI texture")?;
+        release.context("IDXGISurface1::ReleaseDC")?;
+        Ok(())
+    }
+}
+
+/// Runs `direct` under the device gate. When it fails, the gate is released
+/// before `fallback` runs: the fallback takes the same gate for its upload,
+/// and the gate panics on same-thread re-entry.
+fn copy_with_dib_fallback(
+    gate: &gpu_gate::GpuGate,
+    direct: impl FnOnce() -> Result<()>,
+    fallback: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let direct_result = {
+        let _gpu = gate.lock();
+        direct()
+    };
+    match direct_result {
+        Ok(()) => Ok(()),
+        Err(direct_error) => {
+            warn!(
+                ?direct_error,
+                "direct GDI/DXGI capture failed; using CPU DIB fallback"
+            );
+            fallback()
         }
     }
 }
@@ -2186,6 +2142,24 @@ pub fn texture_ptr(frame: &CapturedFrame<'_>) -> *mut c_void {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dib_fallback_runs_after_the_direct_copy_released_the_device_gate() {
+        let gate = crate::gpu_gate::for_device_key(0x7001);
+        let mut fallback_ran = false;
+        let result = super::copy_with_dib_fallback(
+            &gate,
+            || anyhow::bail!("GetDC rejected"),
+            || {
+                // The real fallback locks this gate; re-entry would panic.
+                let _gpu = gate.lock();
+                fallback_ran = true;
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert!(fallback_ran);
+    }
+
     #[test]
     fn desktop_checks_are_bounded_and_recovery_bypasses_cache() {
         let now = std::time::Instant::now();

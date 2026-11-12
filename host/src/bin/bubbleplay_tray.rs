@@ -101,10 +101,8 @@ const WM_KEY_UI_DONE: u32 = WM_APP + 5;
 const WM_FEEDBACK_DONE: u32 = WM_APP + 6;
 const TIMER_ID: usize = 1;
 
-/// Time the secure helper gets to answer after its task was started.
-const AGENT_START_GRACE: Duration = Duration::from_secs(15);
 /// How often the secure helper is re-probed (version + trust).
-const AGENT_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+const SECURE_HELPER_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Left behind by the removed elevated-host runner.
 const STALE_HEARTBEAT_FILE: &str = "elevated-runner.json";
 
@@ -529,7 +527,7 @@ impl App {
             || self.secure_helper == SecureHelperStatus::Starting
             || self
                 .helper_last_probe
-                .is_none_or(|at| at.elapsed() >= AGENT_PROBE_INTERVAL);
+                .is_none_or(|at| at.elapsed() >= SECURE_HELPER_PROBE_INTERVAL);
         if !due {
             return;
         }
@@ -547,7 +545,7 @@ impl App {
             Err(LinkError::Unavailable)
                 if self
                     .helper_started
-                    .is_some_and(|at| at.elapsed() < AGENT_START_GRACE) =>
+                    .is_some_and(|at| at.elapsed() < logic::TASK_START_GRACE) =>
             {
                 if first_probe {
                     tracing::info!("secure helper probe unavailable; waiting for task startup");
