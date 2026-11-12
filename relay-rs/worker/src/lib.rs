@@ -12,6 +12,7 @@ mod http;
 mod live;
 mod ntfy;
 mod pc;
+mod pc_sockets;
 mod rng;
 mod routes;
 mod store;
