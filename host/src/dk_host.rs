@@ -87,7 +87,7 @@ pub struct HostProtocol {
 }
 
 /// How long an early `auth-hello` waits for its `peer-joined`.
-const EARLY_HELLO_WINDOW: Duration = Duration::from_secs(3);
+pub const EARLY_HELLO_WINDOW: Duration = Duration::from_secs(3);
 
 impl HostProtocol {
     /// A damaged trust file is an error, never an empty replacement list. The UI receives the
