@@ -240,6 +240,33 @@ jobs:
           }
       - name: Host tests and cargo check
         run: node tools/check.mjs host
+      - name: Admin agent e2e (basic-user token)
+        # The hosted runner account is an elevated administrator and the dev agent refuses to run
+        # elevated, so `Host tests` skips these tests. Run them again with a restricted token;
+        # BUBBLEPLAY_E2E_REQUIRE_UNELEVATED turns a skip into a failure.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $built = cargo test --locked --offline --manifest-path host/Cargo.toml --test admin_agent_e2e --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'building admin_agent_e2e failed' }
+          $exe = ($built | ForEach-Object { try { $_ | ConvertFrom-Json } catch { } } |
+            Where-Object { $_.executable -and $_.target.name -eq 'admin_agent_e2e' } | Select-Object -Last 1).executable
+          if (-not $exe) { throw 'admin_agent_e2e executable not found' }
+          $log = Join-Path $env:RUNNER_TEMP 'admin-agent-e2e.log'
+          $code = Join-Path $env:RUNNER_TEMP 'admin-agent-e2e.code'
+          $script = Join-Path $env:RUNNER_TEMP 'admin-agent-e2e.cmd'
+          Remove-Item $log, $code -ErrorAction SilentlyContinue
+          Set-Content -Path $script -Encoding ascii -Value @(
+            '@echo off',
+            'set BUBBLEPLAY_E2E_REQUIRE_UNELEVATED=1',
+            "`"$exe`" --test-threads=1 > `"$log`" 2>&1",
+            "echo %ERRORLEVEL% > `"$code`"")
+          runas /trustlevel:0x20000 "cmd /c $script"
+          $deadline = (Get-Date).AddMinutes(5)
+          while (-not (Test-Path $code) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          if (Test-Path $log) { Get-Content $log }
+          if (-not (Test-Path $code)) { throw 'admin_agent_e2e did not finish in 5 minutes' }
+          if ((Get-Content $code).Trim() -ne '0') { throw "admin_agent_e2e failed with exit code $((Get-Content $code).Trim())" }
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
       - name: Rustfmt
