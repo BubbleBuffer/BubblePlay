@@ -40,6 +40,7 @@ use serde_json::Value;
 use crate::activity::Activity;
 use crate::audio::AudioFrame;
 use crate::frame_damage::DamageRect;
+use crate::link_capacity::ack_order::{ack_retires, seq_reached};
 use crate::link_capacity::{Capacity, CapacityEstimator};
 use tracing::{debug, info, warn};
 use tungstenite::stream::MaybeTlsStream;
@@ -287,10 +288,6 @@ pub fn parse_inbound(text: &str) -> Option<V4Inbound> {
     }
 }
 
-fn seq_reached(candidate: u32, target: u32) -> bool {
-    candidate.wrapping_sub(target) < 0x8000_0000
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Send,
@@ -465,7 +462,7 @@ impl SendPolicy {
         }
         let mut outcome = None;
         while let Some(front) = self.inflight.front().copied() {
-            if front.generation == generation && !seq_reached(seq, front.seq) {
+            if !ack_retires(generation, seq, front.generation, front.seq) {
                 break;
             }
             self.inflight.pop_front();
