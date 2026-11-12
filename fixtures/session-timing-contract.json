@@ -99,10 +99,10 @@
     }
   },
   "relay": {
-    "files": "relay-rs/core/src/relay/types.rs, relay-rs/server/src/runtime.rs",
+    "files": "relay-rs/core/src/relay/preauth.rs (HELLO_TIMEOUT_MS, PROOF_TIMEOUT_MS), relay-rs/server/src/runtime.rs",
     "values": {
-      "helloMs": 10000,
-      "challengeMs": 30000,
+      "helloMs": 5000,
+      "challengeMs": 10000,
       "idleMs": 90000,
       "sendTimeoutMs": 10000,
       "answersEveryPing": true
