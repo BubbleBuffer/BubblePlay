@@ -1,3 +1,4 @@
+import { describeConnectionStatus } from "/connection-status.js";
 import { RemoteClipboardWriter, sameClipboardImage, pasteHostClipboard } from "/remote-clipboard.js";
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
@@ -682,31 +683,14 @@ function toggleFollowWindow() {
 // ---- status HUD ------------------------------------------------------------
 const hudState = { ws: "…", ice: "…", route: "…", dc: "…", control: "…", motion: "…", pointer: "desktop", cursorSeq: "…/…", cursorAge: "…", motionSent: 0, motionCoalesced: 0, motionDropped: 0, zoom: 1, touch: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: 0, dimensions: "…", mediaGeneration: "…" };
 function renderConnectionStatus() {
-  let state = "connecting";
-  let label = "Connecting…";
-  if (terminalSignalingFailure) { state = "error"; label = "Session unavailable"; }
-  else if (!desktopAvailable) { state = "error"; label = "Desktop unavailable"; }
-  else if (usingWssMedia) {
-    // v4 never reports "waiting for stream" for a static desktop: no frames
-    // is the expected steady state while nothing on screen changes.
-    const v4 = wssV4Status();
-    state = v4 === "connected" || v4 === "paused-static" ? "connected" : "connecting";
-    label = v4 === "connected" ? "Connected · WSS" : v4 === "paused-static" ? "Connected · WSS (static)" :
-      v4 === "reconnecting" ? "Reconnecting media…" : v4 === "starting" ? "Starting stream…" : "Connecting…";
-  }
-  else if (inputReady && usingWssMedia) { state = "connected"; label = "Connected · WSS"; }
-  else if (inputReady && (hudState.ice === "connected" || hudState.ice === "completed" || hudState.ice === "connected/connected")) { state = "connected"; label = "Connected · WebRTC"; }
-  else if (hudState.ws.startsWith("reconnecting") || hudState.ws === "closed") { label = "Reconnecting…"; }
-  else if (hudState.ws === "error") { state = "error"; label = "Connection error"; }
-  connectionStatusDetail = label.replace(" · ", " via ");
-  // The strip shows a short state; transport and round trip go in the tooltip.
-  const warning = desktopAvailable && desktopKind === "default" && !terminalSignalingFailure
-    ? inputStatusReason === "admin-required" ? "This window needs Admin mode — turn it on at the PC"
-      : inputStatusReason === "admin-unavailable" ? "Admin mode helper isn't responding" : "" : "";
-  const shortLabel = warning || label.split(" · ")[0];
-  const detail = [warning, connectionStatusDetail,
-    hudState.rtt !== "…" ? `round trip ${hudState.rtt} ms` : null,
-    monitorList.find(m => m.selected)?.name || null].filter(Boolean).join(" · ");
+  const { state, shortLabel, detail, connectionDetail, warning } = describeConnectionStatus({
+    terminalSignalingFailure, desktopAvailable, usingWssMedia,
+    wssStatus: usingWssMedia ? wssV4Status() : null,
+    inputReady, ice: hudState.ice, ws: hudState.ws, desktopKind, inputStatusReason,
+    rttMs: hudState.rtt === "…" ? null : hudState.rtt,
+    monitorName: monitorList.find(m => m.selected)?.name || null,
+  });
+  connectionStatusDetail = connectionDetail;
   if (connectionStatus.dataset.state !== state) connectionStatus.dataset.state = state;
   if (connectionStatusLabel.textContent !== shortLabel) connectionStatusLabel.textContent = shortLabel;
   if (connectionStatus.title !== detail) connectionStatus.title = detail;

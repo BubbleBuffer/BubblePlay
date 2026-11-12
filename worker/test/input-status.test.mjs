@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { describeConnectionStatus } from "../public/connection-status.js";
 
 const receipt = { type: "input-status", protocol: 1, generation: 4,
   receivedPackets: 12, acceptedPackets: 11, failedPackets: 1, droppedPackets: 1,
@@ -21,7 +22,7 @@ test("browser shows and clears Admin warnings without changing input readiness",
     usingWssMedia: false, inputReady: true, hudState: { ice: "connected", ws: "open", rtt: "…" },
     monitorList: [], connectionStatus: { dataset: {}, title: "" }, connectionStatusLabel: { textContent: "" },
     document: { getElementById: id => id === "connection-retry" ? retry : { classList: { toggle: (key, value) => classes.set(key, value) } } },
-    viewerLog: (...args) => logs.push(args),
+    viewerLog: (...args) => logs.push(args), describeConnectionStatus,
   });
   vm.runInContext(renderer + `\nfunction receive(msg) { switch(msg.type) { case "input-status": { ${handler} } } }`, context);
   const receive = fields => { context.msg = { ...receipt, ...fields }; vm.runInContext("receive(msg)", context); };

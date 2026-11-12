@@ -107,7 +107,6 @@ test("receiver wires v4: media-socket keyframes, in-order decode, reconnect back
   assert.match(source, /wssV4\.backoffMs = nextBackoffMsV4\(wssV4\.backoffMs\);/);
   assert.match(source, /latencyGuard\.admitDecode\(usingWssMedia \? Infinity : decodeHardLimit\)/);
   assert.match(source, /shouldPresentDecodedV4\(/);
-  assert.match(source, /Connected · WSS \(static\)/);
   assert.match(source, /recycleSignaling\("signaling-silent"\);[\s\S]{0,200}sendRelay\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
   // The media heartbeat pings on its own clock: the viewer's acks (lastSendAt) must not postpone it.
   assert.match(source, /mediaHeartbeatStep\(wssV4, now, \{ heartbeatMs: V4_HEARTBEAT_MS \}\)/);
