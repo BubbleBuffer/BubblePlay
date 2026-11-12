@@ -8,8 +8,12 @@ use bubbleplay_host::secure_helper::trust::HELPER_EXE;
 
 fn fixture_value(name: &str) -> String {
     let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("../../fixtures/install-names-contract.json")).expect("fixture parses");
-    fixture["values"][name]["value"].as_str().unwrap_or_else(|| panic!("fixture lacks {name}")).to_owned()
+        serde_json::from_str(include_str!("../../fixtures/install-names-contract.json"))
+            .expect("fixture parses");
+    fixture["values"][name]["value"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fixture lacks {name}"))
+        .to_owned()
 }
 
 #[test]

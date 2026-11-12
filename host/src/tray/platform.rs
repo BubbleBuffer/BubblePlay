@@ -296,8 +296,8 @@ pub fn agent_task_result() -> String {
     let system = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let exe = PathBuf::from(system).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
     match Command::new(exe)
-        .args(["-NoProfile", "-NonInteractive", "-Command",
-            r"$ErrorActionPreference='Stop'; (Get-ScheduledTaskInfo -TaskPath '\BubblePlay\' -TaskName 'AdminAgent').LastTaskResult"])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &format!(
+            "$ErrorActionPreference='Stop'; (Get-ScheduledTaskInfo -TaskPath '{TASK_FOLDER}' -TaskName '{AGENT_TASK_NAME}').LastTaskResult")])
         .stdin(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
         .output()
@@ -434,9 +434,14 @@ mod tests {
     use super::*;
 
     fn fixture_value(name: &str) -> String {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../../fixtures/install-names-contract.json")).unwrap();
-        fixture["values"][name]["value"].as_str().unwrap_or_else(|| panic!("fixture lacks {name}")).to_owned()
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/install-names-contract.json"
+        ))
+        .unwrap();
+        fixture["values"][name]["value"]
+            .as_str()
+            .unwrap_or_else(|| panic!("fixture lacks {name}"))
+            .to_owned()
     }
 
     /// The names the install scripts register must be the names the tray starts and queries.
@@ -445,9 +450,18 @@ mod tests {
         let folder = fixture_value("taskFolder");
         assert_eq!(TASK_FOLDER, folder);
         assert_eq!(AGENT_TASK_NAME, fixture_value("agentTask"));
-        assert_eq!(AGENT_TASK, format!("{folder}{}", fixture_value("agentTask")));
-        assert_eq!(SECURE_HELPER_TASK, format!("{folder}{}", fixture_value("secureDesktopTask")));
-        assert_eq!(ADMIN_MODE_OFF_TASK, format!("{folder}{}", fixture_value("adminModeOffTask")));
+        assert_eq!(
+            AGENT_TASK,
+            format!("{folder}{}", fixture_value("agentTask"))
+        );
+        assert_eq!(
+            SECURE_HELPER_TASK,
+            format!("{folder}{}", fixture_value("secureDesktopTask"))
+        );
+        assert_eq!(
+            ADMIN_MODE_OFF_TASK,
+            format!("{folder}{}", fixture_value("adminModeOffTask"))
+        );
         assert_eq!(RUN_VALUE, fixture_value("runValue"));
         assert_eq!(HOST_EXE, fixture_value("hostExe"));
         assert_eq!(HOST_CONFIG_FILE, fixture_value("hostConfigFile"));
