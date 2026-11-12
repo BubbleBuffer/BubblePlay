@@ -15,6 +15,7 @@ import {
   splitRecovery,
   rtcPeerEndAction,
 } from "/recovery.js";
+import { createCompositionCommitGate } from "/composition-gate.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
@@ -3966,38 +3967,6 @@ const keyboardInput = document.getElementById("keyboard-input");
 const keyboardStatus = document.getElementById("keyboard-status");
 let keyboardShadow = "";
 let keyboardComposing = false;
-// BEGIN secure-composition-gate
-function createCompositionCommitGate(commit, schedule = setTimeout, cancel = clearTimeout) {
-  let pending = null;
-  return {
-    stage(text) {
-      this.reset();
-      const value = String(text ?? "");
-      if (!value) return false;
-      const transaction = { value, timer: null };
-      transaction.timer = schedule(() => {
-        if (pending !== transaction) return;
-        pending = null;
-        commit(transaction.value);
-      }, 50);
-      pending = transaction;
-      return true;
-    },
-    consume(text) {
-      if (!pending) return false;
-      const transaction = pending;
-      pending = null;
-      cancel(transaction.timer);
-      commit(String(text ?? "") || transaction.value);
-      return true;
-    },
-    reset() {
-      if (pending) cancel(pending.timer);
-      pending = null;
-    },
-  };
-}
-// END secure-composition-gate
 const secureCompositionCommit = createCompositionCommitGate(text => {
   if (!inputReady || desktopKind !== "secure") { resetKeyboardDraft(); return; }
   handleSecureKeyboardInput({ data: text, inputType: "insertCompositionText" });

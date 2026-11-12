@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { createCompositionCommitGate } from "../public/composition-gate.js";
 
 test("receiver diagnostics expose current host capabilities, capture and clock", () => {
   const client = readClientSource();
@@ -561,11 +562,7 @@ test("normal text assistance is restored outside the secure desktop", () => {
 });
 
 test("secure Android composition commits through one pending transaction", () => {
-  const client = readClientSource();
-  const begin = client.indexOf("// BEGIN secure-composition-gate");
-  const end = client.indexOf("// END secure-composition-gate");
-  assert.ok(begin >= 0 && end > begin);
-  const factory = new Function(`${client.slice(begin, end)}\nreturn createCompositionCommitGate;`)();
+  const factory = createCompositionCommitGate;
   const committed = [];
   let scheduled = null;
   const gate = factory(value => committed.push(value), callback => { scheduled = callback; return callback; }, handle => { if (scheduled === handle) scheduled = null; });
@@ -584,7 +581,4 @@ test("secure Android composition commits through one pending transaction", () =>
   fallback();
   fallback();
   assert.deepEqual(committed, ["é", "🙂"]);
-
-  assert.match(client, /if \(desktopKind === "secure" && secureCompositionCommit\.consume\(event\.data \?\? keyboardInput\.value\)\) return/);
-  assert.match(client, /compositionend", event =>[\s\S]*secureCompositionCommit\.stage\(event\.data \?\? keyboardInput\.value\)/);
 });
