@@ -8,6 +8,8 @@
 mod assets;
 mod config;
 mod front;
+mod front_admin;
+mod front_directory;
 mod http;
 mod live;
 mod ntfy;
