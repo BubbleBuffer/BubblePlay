@@ -1,0 +1,74 @@
+{
+  "spec": "docs/architecture/close-codes.md",
+  "note": "Every WebSocket close the relay, the browser and the host send, and what each implementation does on receiving a code, as of 2026-11-12 (relay with the pre-auth cap). Nothing here is a decided value: today one code, 1008, carries every refusal, including the benign peer-replaced. A reason is the exact close reason string; an empty string means no reason. Only the reasons in relayReasons are constants in the relay code; the other reasons are literals there.",
+  "relayReasons": {
+    "INVALID_HELLO": "invalid hello",
+    "INVALID_PACKET": "invalid packet",
+    "INVALID_PROOF": "invalid proof",
+    "NOT_PAIRED": "not paired",
+    "PAIRING_CODE": "pairing code not accepted",
+    "RATE_LIMITED": "rate limited",
+    "NOT_AUTHORIZED": "not authorized",
+    "TIMED_OUT": "timed out",
+    "ACCESS_REMOVED": "access removed",
+    "NOT_APPROVED": "not approved",
+    "SESSION_NOT_RESTORED": "session not restored",
+    "PEER_REMOVED": "peer removed",
+    "TOO_MANY_PENDING": "too many pending connections"
+  },
+  "closes": [
+    { "id": "bye", "code": 1000, "reason": "bye", "sentBy": "relay", "sockets": ["signaling"], "cause": "the peer sent bye" },
+    { "id": "version-probe-complete", "code": 1000, "reason": "version-probe-complete", "sentBy": "relay", "sockets": ["host-version"], "cause": "the version probe got its hello-ok" },
+    { "id": "hello-timeout", "code": 1008, "reason": "timed out", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "no hello within the hello deadline, or a viewer's proof past the proof deadline" },
+    { "id": "host-proof-timeout", "code": 1008, "reason": "invalid hello", "sentBy": "relay", "sockets": ["signaling"], "cause": "a host's register-proof past the proof deadline" },
+    { "id": "invalid-hello", "code": 1008, "reason": "invalid hello", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "malformed or unexpected hello or proof, bad role, token or identity, oversize or non-text before the session is live, signaling ticket or epoch refused" },
+    { "id": "invalid-proof", "code": 1008, "reason": "invalid proof", "sentBy": "relay", "sockets": ["signaling"], "cause": "the viewer's identity proof did not verify" },
+    { "id": "not-paired", "code": 1008, "reason": "not paired", "sentBy": "relay", "sockets": ["signaling"], "cause": "the viewer is not on the PC's admission list and offered no pairing code" },
+    { "id": "pairing-code", "code": 1008, "reason": "pairing code not accepted", "sentBy": "relay", "sockets": ["signaling"], "cause": "wrong pairing code or no pairing window open" },
+    { "id": "rate-limited", "code": 1008, "reason": "rate limited", "sentBy": "relay", "sockets": ["signaling"], "cause": "too many failed pairing attempts" },
+    { "id": "not-authorized", "code": 1008, "reason": "not authorized", "sentBy": "relay", "sockets": ["media", "file"], "cause": "a data socket's ticket or epoch was not accepted" },
+    { "id": "invalid-packet", "code": 1008, "reason": "invalid packet", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "a live socket sent a packet the relay does not accept, or a data socket's epoch is no longer current" },
+    { "id": "access-removed", "code": 1008, "reason": "access removed", "sentBy": "relay", "sockets": ["signaling"], "cause": "the host's admit list no longer contains this connected viewer" },
+    { "id": "peer-replaced", "code": 1008, "reason": "peer replaced", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "a newer socket of the same role, PC and epoch connected" },
+    { "id": "peer-removed", "code": 1008, "reason": "peer removed", "sentBy": "relay", "sockets": ["signaling"], "cause": "the admin deleted the PC" },
+    { "id": "not-approved", "code": 1008, "reason": "not approved", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "the site gate did not approve this browser socket (accepted, then closed)" },
+    { "id": "session-not-restored", "code": 1008, "reason": "session not restored", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "the socket could not be restored after the relay woke from hibernation" },
+    { "id": "idle", "code": 1001, "reason": "peer disconnected", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "idle past the idle deadline, or a message over the read limit after the hello" },
+    { "id": "viewer-departed", "code": 1001, "reason": "viewer departed", "sentBy": "relay", "sockets": ["media", "file"], "cause": "the viewer's signaling socket left" },
+    { "id": "file-peer-left", "code": 1001, "reason": "file-peer-left", "sentBy": "relay", "sockets": ["file"], "cause": "the other end of the file pair left" },
+    { "id": "stale-epoch", "code": 1001, "reason": "stale epoch", "sentBy": "relay", "sockets": ["media", "file"], "cause": "the host registered a new media epoch" },
+    { "id": "store-unhealthy", "code": 1011, "reason": "", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "the PC table could not be persisted" },
+    { "id": "slow-peer", "code": 1013, "reason": "slow peer", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "the send queue overflowed (native server only)" },
+    { "id": "pre-auth-evicted", "code": 1013, "reason": "too many pending connections", "sentBy": "relay", "sockets": ["signaling", "media", "file"], "cause": "a socket that had not finished its hello or proof was dropped to make room" },
+    { "id": "browser-session-ended", "code": 1000, "reason": "session-ended", "sentBy": "browser", "sockets": ["signaling"], "cause": "the viewer ended the session" },
+    { "id": "browser-media-silent", "code": 4000, "reason": "silent", "sentBy": "browser", "sockets": ["media"], "cause": "no answer to a media ping within the dead limit; no other implementation defines or handles 4000" },
+    { "id": "host-closes-without-code", "code": 1005, "reason": "", "sentBy": "host", "sockets": ["signaling", "media", "file"], "cause": "the host closes its sockets with no code" }
+  ],
+  "clientActions": {
+    "note": "What the receiver of a close does. terminal: the session ends and is not retried. retry: reconnect with that implementation's own backoff. restart-attempt: the whole connection attempt (both sockets) restarts. end-run: the host's serve run ends and the serve loop retries with its backoff.",
+    "policy1008": {
+      "browser": { "signaling": "terminal", "media": "retry" },
+      "kotlin": { "signaling": "terminal", "media": "retry" },
+      "clientWin": { "signaling": "terminal", "media": "restart-attempt" },
+      "host": { "signaling": "end-run", "media": "retry until the refusal limit, then refused; ends for good when the reason contains stale or retired (a text match on the reason)" }
+    },
+    "otherCodes": {
+      "codes": [1000, 1001, 1005, 1006, 1011, 1013],
+      "browser": { "signaling": "retry", "media": "retry" },
+      "kotlin": { "signaling": "retry", "media": "retry" },
+      "clientWin": { "signaling": "retry", "media": "restart-attempt" },
+      "host": { "signaling": "end-run", "media": "retry" }
+    }
+  },
+  "userMessages": {
+    "note": "What the viewer shows on a terminal 1008, whatever the reason. admitted: the session had finished the handshake.",
+    "browser": { "admitted": "", "notAdmitted": "Not admitted, with the relay's reason appended" },
+    "kotlin": { "admittedKey": "session_device_removed", "notAdmittedKey": "session_relay_refused" },
+    "clientWin": { "anyKey": "NotAdmitted" }
+  },
+  "unpinned": {
+    "clientWin": "classify() in session.rs is private to the session module; no test outside it can call it",
+    "host": "close_verdict() in wss_v4.rs is private; its own unit test covers the 1008 and stale cases",
+    "relayEmission": "the sans-IO relay is driven only by its own harness; reasons are pinned as constants, not by driving every refusal path"
+  }
+}
