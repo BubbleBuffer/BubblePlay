@@ -24,7 +24,7 @@ pub fn example_config_text(token: &str, admin_token: &str) -> String {
         "state_dir": "/data",
         "token": token,
         "admin_token": admin_token,
-        "max_connections": 32,
+        "max_connections": crate::config::DEFAULT_MAX_CONNECTIONS,
         "approval_ttl_s": 90,
         "trusted_proxy_cidrs": [],
     });

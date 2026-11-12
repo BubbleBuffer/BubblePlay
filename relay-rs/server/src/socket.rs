@@ -10,7 +10,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bp_relay_core::limits::MEDIA_LIMIT;
-use bp_relay_core::relay::{ConnId, Reject, Route, UpgradeRequest};
+use bp_relay_core::relay::{ConnId, Reject, Route, UpgradeRequest, Upgraded};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, watch};
@@ -41,7 +41,10 @@ pub fn accept(
 ) -> Response {
     let result = state.relay().upgrade(req, client, now_ms());
     let id = match result {
-        Ok(id) => id,
+        Ok(Upgraded { id, evicted }) => {
+            state.run_sync(evicted);
+            id
+        }
         Err(Reject) => return StatusCode::NOT_FOUND.into_response(),
     };
     let wiring = state.register(id);

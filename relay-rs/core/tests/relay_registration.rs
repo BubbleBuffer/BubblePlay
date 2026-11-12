@@ -5,6 +5,7 @@
 mod relay_harness;
 
 use bp_device_key::{DeviceId, Role as KeyRole, verify_relay_proof};
+use bp_relay_core::relay::{HELLO_TIMEOUT_MS, PROOF_TIMEOUT_MS};
 use bp_relay_core::{Action, AdminError, Route};
 use relay_harness::*;
 use serde_json::json;
@@ -157,11 +158,11 @@ fn unhealthy_store_refuses_registration_and_listing() {
 }
 
 #[test]
-fn hello_times_out_after_ten_seconds() {
+fn hello_times_out_at_the_hello_deadline() {
     let mut h = Harness::new();
     let a = identity(1);
     let id = h.upgrade(req(Route::HostWs, Some(&a.id().to_string()), None, false));
-    assert!(h.advance(9_999).is_empty());
+    assert!(h.advance(HELLO_TIMEOUT_MS - 1).is_empty());
     assert_eq!(
         closed(&h.advance(1), id),
         Some((1008, "timed out".to_owned()))
@@ -169,12 +170,12 @@ fn hello_times_out_after_ten_seconds() {
 }
 
 #[test]
-fn challenge_must_be_answered_within_thirty_seconds() {
+fn challenge_must_be_answered_before_the_proof_deadline() {
     let mut h = Harness::new();
     let a = identity(1);
     let (id, actions) = h.host_hello(&a, Some(TOKEN));
     assert!(challenge_nonce(&actions, id).is_some());
-    assert!(h.advance(29_999).is_empty());
+    assert!(h.advance(PROOF_TIMEOUT_MS - 1).is_empty());
     assert_eq!(closed(&h.advance(1), id), refused());
 }
 
@@ -303,23 +304,6 @@ fn upgrade_refuses_bad_pc_epoch_and_unauthorised_viewers() {
     assert!(
         h.try_upgrade(req(Route::HostVersionWs, None, None, false))
             .is_ok()
-    );
-}
-
-#[test]
-fn max_connections_refuses_extra_upgrades() {
-    let mut h = Harness::with(|c| c.max_connections = 2);
-    assert!(
-        h.try_upgrade(req(Route::HostVersionWs, None, None, false))
-            .is_ok()
-    );
-    assert!(
-        h.try_upgrade(req(Route::HostVersionWs, None, None, false))
-            .is_ok()
-    );
-    assert!(
-        h.try_upgrade(req(Route::HostVersionWs, None, None, false))
-            .is_err()
     );
 }
 

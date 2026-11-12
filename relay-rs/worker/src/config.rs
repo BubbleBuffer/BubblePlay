@@ -5,7 +5,7 @@ use bp_device_key::relay_origin;
 use bp_relay_core::gate::{
     GATE_HOLD_MS, GateConfig, MAX_APPROVAL_TTL_SECS, MIN_APPROVAL_TTL_SECS, NtfyConfig,
 };
-use bp_relay_core::relay::{CoreConfig, TurnConfig};
+use bp_relay_core::relay::{CoreConfig, DEFAULT_MAX_CONNECTIONS, TurnConfig};
 use worker::url::Host;
 use worker::{Env, Url};
 
@@ -20,7 +20,6 @@ pub struct Settings {
     pub gate_hold_ms: Option<u64>,
 }
 
-const DEFAULT_MAX_CONNECTIONS: usize = 32;
 const DEFAULT_APPROVAL_TTL_S: u64 = 90;
 const DEFAULT_TURN_TTL_S: u64 = 21_600;
 const TURN_TTL_RANGE: std::ops::RangeInclusive<u64> = 300..=86_400;

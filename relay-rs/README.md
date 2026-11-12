@@ -62,7 +62,7 @@ are an error. Every validation error names the field it is about.
 | `state_dir` | `/data` | Where `pcs.json` and `gate.json` live. |
 | `token` | required | The first-registration ticket. `BP_RELAY_TOKEN` overrides it. |
 | `admin_token` | required | Bearer token for `/healthz` from outside loopback. `BP_RELAY_ADMIN_TOKEN` overrides it. |
-| `max_connections` | `32` | At least 1. Enforced by the relay core, which is not wired in yet. |
+| `max_connections` | `32` | At least 1. Enforced by the relay core. Pending sockets are capped separately (see below). |
 | `approval_ttl_s` | `90` | Must be 30 to 120 seconds. |
 | `trusted_proxy_cidrs` | `[]` | CIDR ranges of reverse proxies. `X-Forwarded-For` is read only when the direct peer is in one of them. |
 | `turn` | none | Optional. `host`, `secret` (at least 32 bytes) and `ttl_s` (default `21600`, 300 to 86400). |
@@ -156,7 +156,8 @@ Media and file sockets are not affected by this list.
 - The admin listing at `/__gate/manage/pcs` reports the count of admitted viewers per PC (`admitted`), never the IDs.
 - `last_seen` is derived, not stored: the PC table keeps `registered_ms` only, and on load `last_seen` is set equal to `registered_ms`. The admin listing shows a PC's last contact as its registration time until it connects again after a restart.
 - Queued frames drain before a close: a socket's frames already in its queue are sent before its close frame, including the 1008 and 1001 closes. The drain shares `CLOSE_TIMEOUT` (2 s). A socket being removed or replaced can therefore receive frames queued just before the close.
-- A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (10 s), and `tick` then closes it 1008 "timed out" and forgets it. A socket still in its hello or viewer proof at its deadline is closed the same way, and a host that misses its proof deadline is closed 1008 "invalid hello".
+- A failed-upgrade connection is reaped by `tick`: the core accepts an upgrade before the WebSocket handshake finishes. If the handshake fails, the connection stays until its hello deadline (5 s, `HELLO_TIMEOUT_MS`), and `tick` then closes it 1008 "timed out" and forgets it. A socket still in its hello or viewer proof at its deadline is closed the same way (the proof deadline is 10 s, `PROOF_TIMEOUT_MS`), and a host that misses its proof deadline is closed 1008 "invalid hello".
+- Pending sockets are capped apart from the connection cap: 4 per client prefix and 8 per PC object (`PRE_AUTH_MAX_PER_PREFIX`, `PRE_AUTH_MAX_TOTAL`). A socket past either limit, or one that arrives when the object is at `max_connections`, drops the oldest pending socket (of the same prefix, or of the busiest prefix) with close code 1013 "too many pending connections" instead of being refused. Sockets that finished their handshake are never dropped for this, so unauthenticated clients cannot fill the cap. The connection cap refuses an upgrade only when every slot holds a socket that finished its hello.
 - Admin DELETE of an unknown PC returns 404 (`NotFound`) and persists nothing. Deleting a registered PC persists first and returns 204.
 
 ## M3 notes (Cloudflare build)
