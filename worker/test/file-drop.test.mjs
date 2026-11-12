@@ -1,3 +1,4 @@
+import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -55,7 +56,7 @@ test("rejected presentation cannot replace native drop's accepted generation or 
     const context={firstFrameHandshake:{presented:false,requireAdmission:true,admitted:true,generation:9,...handshake},
       fileDropPresentedGeneration:7,fileDropPresentedViewportRevision:3,usingWssMedia:true,wssStartupRecoveries:1,
       hasPresentedFrame:false,desktopAwaitingFrame:true,inputTransitionHold:false,suppressDesktopTransitionOverlay:true,
-      monitorPreviews:{onFirstFrame(){}},noteRecovered(){},document:{body:{classList:{add(){}}}},debugTrace(){},clearFirstFrameWatchdog(){},renderDesktopState(){},showContextHint(){}};
+      monitorPreviews:{onFirstFrame(){}},recovery:recoveryStub(),document:{body:{classList:{add(){}}}},debugTrace(){},clearFirstFrameWatchdog(){},renderDesktopState(){},showContextHint(){}};
     context.result=runInNewContext(`${source}\nmarkFirstFramePresented(${generation},${revision})`,context);
     return context;
   };

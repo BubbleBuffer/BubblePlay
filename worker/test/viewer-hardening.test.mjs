@@ -1,4 +1,5 @@
 import test from "node:test";
+import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -25,13 +26,13 @@ function signalingHarness(random) {
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
     close() { this.readyState = 3; }
   }
-  const context = vm.createContext({ WebSocket: Socket, URL, recoveryLossMs: null, recoveryAttempts: 0, noteConnectionLoss() {},
+  const context = vm.createContext({ WebSocket: Socket, URL, recovery: recoveryStub(),
     inputStatusReason: null, latestInputStatus: null, terminalSignalingFailure: false, reconnectTimer: null, ws: null,
     signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null, hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, recordSignalingError() {},
     shouldReconnectAfterClose: () => true, restartPeer() {}, cleanupPeer() {}, handleSignal() {}, clearTimeout() {},
-    armConnectTimeout() {}, connectTimer: null, pendingConnect: null, signalingBackoffMs: 0, everAuthenticated: false,
-    recoveryBudgetStartMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => jitteredBackoffMsV4(ms, random),
+    armConnectTimeout() {}, connectTimer: null, pendingConnect: null, signalingBackoffMs: 0,
+    nextBackoffMsV4, jitteredBackoffMsV4: ms => jitteredBackoffMsV4(ms, random),
     setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; } });
   vm.runInContext(receiverFunctions("reconnectSignaling", "noteSessionAuthenticated"), context);
   vm.runInContext('reconnectSignaling("startup");', context);
