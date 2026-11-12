@@ -38,6 +38,8 @@
 //! jumping into the queue it just left. A probe that reaches the profile
 //! maximum is released by the owner ([`CapacityEstimator::release`]).
 
+pub(crate) mod ack_order;
+use ack_order::ack_retires;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -266,7 +268,7 @@ impl CapacityEstimator {
         self.last_ack = Some(now);
         let mut acked = None;
         while let Some(front) = self.sent.front().copied() {
-            if front.generation == generation && !seq_reached(seq, front.seq) {
+            if !ack_retires(generation, seq, front.generation, front.seq) {
                 break;
             }
             self.sent.pop_front();
@@ -523,10 +525,6 @@ impl CapacityEstimator {
     pub fn rate_cap(&self) -> Option<Capacity> {
         self.capacity_bps.map(|bps| Capacity { bps })
     }
-}
-
-fn seq_reached(candidate: u32, target: u32) -> bool {
-    candidate.wrapping_sub(target) < 0x8000_0000
 }
 
 #[cfg(test)]
