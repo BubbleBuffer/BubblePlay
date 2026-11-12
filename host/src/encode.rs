@@ -133,524 +133,9 @@ use crate::frame_damage::{
 use crate::gpu_gate::{self, GpuGate};
 
 #[cfg(test)]
-mod codec_policy_tests {
-    use super::{
-        annex_b_is_random_access, apply_initialization_options, evaluate_roi_map,
-        resource_registration_action, AqMode, EncoderOptions, FrameDamage, Multipass, Preset,
-        RateControlMode, ResourceMode, ResourceRegistrationAction, RoiMapReason, RoiMode, Tuning,
-        VideoCodec,
-    };
-    use crate::frame_damage::{DamageRect, HevcQpDeltaMap};
-    use nvidia_video_codec_sdk::sys::nvEncodeAPI::NV_ENC_INITIALIZE_PARAMS;
-
-    #[test]
-    fn fresh_sessions_prefer_hevc_and_keep_h264_as_fallback() {
-        assert_eq!(VideoCodec::preferred(), VideoCodec::Hevc);
-        assert_eq!(VideoCodec::Hevc.name(), "hevc");
-        assert_eq!(VideoCodec::H264.name(), "h264");
-        assert_eq!(VideoCodec::Hevc.fallback(), Some(VideoCodec::H264));
-        assert_eq!(VideoCodec::H264.fallback(), None);
-    }
-
-    #[test]
-    fn annex_b_random_access_detection_uses_codec_nal_types() {
-        assert!(annex_b_is_random_access(VideoCodec::H264, &[0, 0, 1, 5, 0]));
-        assert!(!annex_b_is_random_access(
-            VideoCodec::H264,
-            &[0, 0, 1, 1, 0]
-        ));
-        assert!(annex_b_is_random_access(
-            VideoCodec::Hevc,
-            &[0, 0, 0, 1, 38, 0]
-        ));
-        assert!(!annex_b_is_random_access(
-            VideoCodec::Hevc,
-            &[0, 0, 0, 1, 2, 0]
-        ));
-    }
-
-    #[test]
-    fn v4_infinite_gop_disables_periodic_idr_for_both_codecs() {
-        assert_eq!(super::gop_frames(30, 2, false), 60);
-        assert_eq!(super::gop_frames(60, 4, false), 240);
-        assert_eq!(
-            super::gop_frames(30, 2, true),
-            super::NVENC_INFINITE_GOPLENGTH
-        );
-        for codec in [VideoCodec::Hevc, VideoCodec::H264] {
-            let mut cfg: super::NV_ENC_CONFIG = unsafe { super::zeroed() };
-            super::apply_gop(&mut cfg, codec, super::gop_frames(30, 2, true));
-            assert_eq!(cfg.gopLength, super::NVENC_INFINITE_GOPLENGTH);
-            let idr = unsafe {
-                match codec {
-                    VideoCodec::Hevc => cfg.encodeCodecConfig.hevcConfig.idrPeriod,
-                    VideoCodec::H264 => cfg.encodeCodecConfig.h264Config.idrPeriod,
-                }
-            };
-            assert_eq!(idr, super::NVENC_INFINITE_GOPLENGTH);
-            super::apply_gop(&mut cfg, codec, super::gop_frames(30, 2, false));
-            assert_eq!(cfg.gopLength, 60);
-        }
-    }
-
-    #[test]
-    fn production_encoder_options_remain_the_existing_low_latency_defaults() {
-        assert_eq!(
-            EncoderOptions::production(Preset::P3),
-            EncoderOptions {
-                preset: Preset::P3,
-                tuning: Tuning::UltraLowLatency,
-                rate_control: RateControlMode::Cbr,
-                multipass: Multipass::Disabled,
-                aq_mode: AqMode::Spatial,
-                aq_strength: 8,
-                vbv_frames: 1,
-                lookahead_depth: 0,
-                weighted_prediction: false,
-                gop_seconds: 2,
-                roi_mode: RoiMode::Off,
-                resource_mode: ResourceMode::PerFrame,
-                async_depth: 0,
-                main10: false,
-            }
-        );
-    }
-
-    #[test]
-    fn feedback_mode_requests_reconstructed_frame_output_without_changing_other_modes() {
-        let mut feedback = EncoderOptions::production(Preset::P3);
-        feedback.roi_mode = RoiMode::Feedback;
-        let mut feedback_init = NV_ENC_INITIALIZE_PARAMS::default();
-        apply_initialization_options(&mut feedback_init, feedback);
-        assert_eq!(feedback_init.enableReconFrameOutput(), 1);
-
-        for roi_mode in [RoiMode::Off, RoiMode::Damage, RoiMode::TextEdge] {
-            let mut options = EncoderOptions::production(Preset::P3);
-            options.roi_mode = roi_mode;
-            let mut init = NV_ENC_INITIALIZE_PARAMS::default();
-            apply_initialization_options(&mut init, options);
-            assert_eq!(init.enableReconFrameOutput(), 0, "mode {roi_mode:?}");
-        }
-    }
-
-    #[test]
-    fn expanded_controls_map_exactly_to_nvenc_configuration() {
-        let options = EncoderOptions {
-            preset: Preset::P7,
-            tuning: Tuning::LowLatency,
-            rate_control: RateControlMode::Cbr,
-            multipass: Multipass::Full,
-            aq_mode: AqMode::Temporal,
-            aq_strength: 15,
-            vbv_frames: 4,
-            lookahead_depth: 2,
-            weighted_prediction: true,
-            gop_seconds: 4,
-            roi_mode: RoiMode::Damage,
-            resource_mode: ResourceMode::Persistent,
-            async_depth: 1,
-            main10: true,
-        };
-        let mut cfg = unsafe { super::zeroed() };
-        super::apply_encoder_options(&mut cfg, 12_000_000, 30, options);
-        assert_eq!(cfg.gopLength, 120);
-        assert_eq!(cfg.rcParams.enableAQ(), 0);
-        assert_eq!(cfg.rcParams.enableTemporalAQ(), 1);
-        assert_eq!(cfg.rcParams.enableLookahead(), 1);
-        assert_eq!(cfg.rcParams.lookaheadDepth, 2);
-        assert_eq!(cfg.rcParams.aqStrength(), 15);
-        assert_eq!(
-            cfg.rcParams.multiPass,
-            super::NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_FULL_RESOLUTION
-        );
-        assert_eq!(cfg.rcParams.vbvBufferSize, 1_600_000);
-
-        let mut init = unsafe { super::zeroed() };
-        super::apply_initialization_options(&mut init, options);
-        assert_eq!(init.enableWeightedPrediction(), 1);
-        assert_eq!(
-            super::qp_map_mode(options, VideoCodec::Hevc),
-            super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA
-        );
-        assert_eq!(
-            super::qp_map_mode(options, VideoCodec::H264),
-            super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA
-        );
-        let mut off = options;
-        off.roi_mode = RoiMode::Off;
-        for codec in [VideoCodec::Hevc, VideoCodec::H264] {
-            assert_eq!(
-                super::qp_map_mode(off, codec),
-                super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DISABLED
-            );
-        }
-        assert_eq!(
-            super::input_buffer_format(options),
-            super::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT
-        );
-    }
-
-    #[test]
-    fn external_budget_vbr_keeps_the_average_target_and_bounds_only_the_peak() {
-        let mut options = EncoderOptions::production(Preset::P3);
-        options.rate_control = RateControlMode::ExternalBudgetVbr {
-            target_quality: 28,
-            peak_bitrate_multiplier: 4,
-        };
-        options.vbv_frames = 4;
-        let mut cfg = unsafe { super::zeroed() };
-        super::apply_encoder_options(&mut cfg, 6_000_000, 30, options);
-        assert_eq!(
-            cfg.rcParams.rateControlMode,
-            super::NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR
-        );
-        assert_eq!(cfg.rcParams.averageBitRate, 6_000_000);
-        assert_eq!(cfg.rcParams.maxBitRate, 24_000_000);
-        assert_eq!(cfg.rcParams.targetQuality, 28);
-        assert_eq!(cfg.rcParams.targetQualityLSB, 0);
-        assert_eq!(cfg.rcParams.vbvBufferSize, 800_000);
-    }
-
-    #[test]
-    fn h264_refine_and_damage_maps_use_the_macroblock_grid() {
-        let mut options = EncoderOptions::production(Preset::P3);
-        options.roi_mode = RoiMode::Refine;
-        assert_eq!(super::qp_map_block(VideoCodec::H264), 16);
-        assert_eq!(super::qp_map_block(VideoCodec::Hevc), 32);
-        let full = DamageRect {
-            left: 0,
-            top: 0,
-            right: 100,
-            bottom: 50,
-        };
-        let damage = |map| FrameDamage {
-            source_width: 100,
-            source_height: 50,
-            crop: full,
-            rects: &[],
-            edge_scores: None,
-            prepared_qp_map: map,
-        };
-        // 100x50 is not a multiple of 16: 7x4 macroblocks, 4x2 CTBs.
-        let mb_map = crate::frame_damage::HevcQpDeltaMap {
-            columns: 7,
-            rows: 4,
-            values: vec![-6; 28],
-        };
-        let applied = evaluate_roi_map(
-            options,
-            VideoCodec::H264,
-            false,
-            100,
-            50,
-            Some(damage(Some(&mb_map))),
-        );
-        assert_eq!(applied.map.as_ref(), Some(&mb_map));
-        // A CTB-grid map is wrong for H.264 and is dropped.
-        let ctb_map = crate::frame_damage::HevcQpDeltaMap {
-            columns: 4,
-            rows: 2,
-            values: vec![-6; 8],
-        };
-        let wrong = evaluate_roi_map(
-            options,
-            VideoCodec::H264,
-            false,
-            100,
-            50,
-            Some(damage(Some(&ctb_map))),
-        );
-        assert!(wrong.map.is_none());
-
-        // Damage mode: the CTB analysis is expanded to macroblocks.
-        options.roi_mode = RoiMode::Damage;
-        let rects = [DamageRect {
-            left: 0,
-            top: 0,
-            right: 10,
-            bottom: 10,
-        }];
-        let frame = FrameDamage {
-            rects: &rects,
-            ..damage(None)
-        };
-        let evaluation = evaluate_roi_map(options, VideoCodec::H264, false, 100, 50, Some(frame));
-        let map = evaluation.map.expect("damage map");
-        assert_eq!((map.columns, map.rows), (7, 4));
-        assert_eq!(map.values.len(), 28);
-        // Only the first CTB changed: macroblocks (0..2, 0..2) are lowered.
-        let lowered: Vec<usize> = (0..28).filter(|i| map.values[*i] < 0).collect();
-        assert_eq!(lowered, vec![0, 1, 7, 8]);
-    }
-
-    #[test]
-    fn refine_mode_applies_only_a_valid_prepared_map_and_never_on_keyframes() {
-        let mut options = EncoderOptions::production(Preset::P3);
-        options.roi_mode = RoiMode::Refine;
-        assert_eq!(
-            super::qp_map_mode(options, VideoCodec::Hevc),
-            super::NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA
-        );
-        let mut init = NV_ENC_INITIALIZE_PARAMS::default();
-        apply_initialization_options(&mut init, options);
-        assert_eq!(init.enableReconFrameOutput(), 0);
-        let full = DamageRect {
-            left: 0,
-            top: 0,
-            right: 128,
-            bottom: 64,
-        };
-        let map = crate::frame_damage::HevcQpDeltaMap {
-            columns: 4,
-            rows: 2,
-            values: vec![-6, 2, 2, 2, 2, 2, 2, 0],
-        };
-        let damage = |map| FrameDamage {
-            source_width: 128,
-            source_height: 64,
-            crop: full,
-            rects: &[],
-            edge_scores: None,
-            prepared_qp_map: map,
-        };
-        let applied = evaluate_roi_map(
-            options,
-            VideoCodec::Hevc,
-            false,
-            128,
-            64,
-            Some(damage(Some(&map))),
-        );
-        assert_eq!(applied.map.as_ref(), Some(&map));
-        assert!(applied.telemetry.is_none());
-        for (codec, idr) in [(VideoCodec::Hevc, true), (VideoCodec::H264, true)] {
-            let skipped = evaluate_roi_map(options, codec, idr, 128, 64, Some(damage(Some(&map))));
-            assert!(skipped.map.is_none() && skipped.telemetry.is_none());
-        }
-        assert!(evaluate_roi_map(
-            options,
-            VideoCodec::Hevc,
-            false,
-            128,
-            64,
-            Some(damage(None))
-        )
-        .map
-        .is_none());
-        assert!(
-            evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, None)
-                .map
-                .is_none()
-        );
-        let wrong_size = evaluate_roi_map(
-            options,
-            VideoCodec::Hevc,
-            false,
-            160,
-            64,
-            Some(damage(Some(&map))),
-        );
-        assert!(wrong_size.map.is_none());
-        let mut out_of_range = map.clone();
-        out_of_range.values[0] = -20;
-        assert!(evaluate_roi_map(
-            options,
-            VideoCodec::Hevc,
-            false,
-            128,
-            64,
-            Some(damage(Some(&out_of_range)))
-        )
-        .map
-        .is_none());
-    }
-
-    #[test]
-    fn damage_roi_reports_each_activity_gate_without_touching_nvenc() {
-        let mut options = EncoderOptions::production(Preset::P3);
-        options.roi_mode = RoiMode::Damage;
-        let full = DamageRect {
-            left: 0,
-            top: 0,
-            right: 128,
-            bottom: 64,
-        };
-        let localized_rects = [DamageRect {
-            left: 32,
-            top: 0,
-            right: 64,
-            bottom: 32,
-        }];
-        let localized = FrameDamage {
-            source_width: 128,
-            source_height: 64,
-            crop: full,
-            rects: &localized_rects,
-            edge_scores: None,
-            prepared_qp_map: None,
-        };
-        assert_eq!(
-            evaluate_roi_map(options, VideoCodec::Hevc, true, 128, 64, Some(localized))
-                .telemetry
-                .unwrap()
-                .reason,
-            RoiMapReason::Idr
-        );
-        assert_eq!(
-            evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, None)
-                .telemetry
-                .unwrap()
-                .reason,
-            RoiMapReason::MissingDamage
-        );
-        let applied = evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(localized));
-        assert!(applied.map.is_some());
-        assert_eq!(applied.telemetry.unwrap().reason, RoiMapReason::Applied);
-
-        let full_rects = [full];
-        let full_damage = FrameDamage {
-            source_width: 128,
-            source_height: 64,
-            crop: full,
-            rects: &full_rects,
-            edge_scores: None,
-            prepared_qp_map: None,
-        };
-        assert_eq!(
-            evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(full_damage))
-                .telemetry
-                .unwrap()
-                .reason,
-            RoiMapReason::CoverageAtLeastHalf
-        );
-    }
-
-    #[test]
-    fn text_edge_roi_requires_features_and_reports_the_weighted_delta_range() {
-        let mut options = EncoderOptions::production(Preset::P3);
-        options.roi_mode = RoiMode::TextEdge;
-        let full = DamageRect {
-            left: 0,
-            top: 0,
-            right: 128,
-            bottom: 64,
-        };
-        let changed_rects = [
-            DamageRect {
-                left: 0,
-                top: 0,
-                right: 32,
-                bottom: 32,
-            },
-            DamageRect {
-                left: 32,
-                top: 0,
-                right: 64,
-                bottom: 32,
-            },
-        ];
-        let missing_features = FrameDamage {
-            source_width: 128,
-            source_height: 64,
-            crop: full,
-            rects: &changed_rects,
-            edge_scores: None,
-            prepared_qp_map: None,
-        };
-        assert_eq!(
-            evaluate_roi_map(
-                options,
-                VideoCodec::Hevc,
-                false,
-                128,
-                64,
-                Some(missing_features),
-            )
-            .telemetry
-            .unwrap()
-            .reason,
-            RoiMapReason::UnsupportedEncoderState
-        );
-
-        let edge_scores = [10, 90, 0, 0, 0, 0, 0, 0];
-        let with_features = FrameDamage {
-            edge_scores: Some(&edge_scores),
-            ..missing_features
-        };
-        let applied = evaluate_roi_map(
-            options,
-            VideoCodec::Hevc,
-            false,
-            128,
-            64,
-            Some(with_features),
-        );
-        assert_eq!(applied.map.unwrap().values, vec![-2, -4, 1, 1, 1, 1, 1, 1]);
-        let telemetry = applied.telemetry.unwrap();
-        assert_eq!(telemetry.reason, RoiMapReason::Applied);
-        assert_eq!(
-            (telemetry.min_delta, telemetry.max_delta),
-            (Some(-4), Some(1))
-        );
-    }
-
-    #[test]
-    fn feedback_roi_submits_the_exact_prepared_map() {
-        let mut options = EncoderOptions::production(Preset::P3);
-        options.roi_mode = RoiMode::Feedback;
-        let full = DamageRect {
-            left: 0,
-            top: 0,
-            right: 128,
-            bottom: 64,
-        };
-        let map = HevcQpDeltaMap {
-            columns: 4,
-            rows: 2,
-            values: vec![-2, 1, 1, 0, 0, 0, 0, 0],
-        };
-        let frame = FrameDamage {
-            source_width: 128,
-            source_height: 64,
-            crop: full,
-            rects: &[],
-            edge_scores: None,
-            prepared_qp_map: Some(&map),
-        };
-
-        let evaluation = evaluate_roi_map(options, VideoCodec::Hevc, false, 128, 64, Some(frame));
-        assert_eq!(evaluation.map.unwrap(), map);
-        let telemetry = evaluation.telemetry.unwrap();
-        assert_eq!(telemetry.reason, RoiMapReason::Applied);
-        assert_eq!((telemetry.changed_ctbs, telemetry.total_ctbs), (1, 8));
-        assert_eq!(
-            (telemetry.min_delta, telemetry.max_delta),
-            (Some(-2), Some(1))
-        );
-    }
-
-    #[test]
-    fn persistent_resources_reuse_only_the_exact_registered_texture() {
-        let first = std::ptr::dangling_mut::<std::ffi::c_void>();
-        let second = 2usize as *mut std::ffi::c_void;
-        assert_eq!(
-            resource_registration_action(ResourceMode::PerFrame, Some(first), first),
-            ResourceRegistrationAction::PerFrame
-        );
-        assert_eq!(
-            resource_registration_action(ResourceMode::Persistent, None, first),
-            ResourceRegistrationAction::RegisterPersistent
-        );
-        assert_eq!(
-            resource_registration_action(ResourceMode::Persistent, Some(first), first),
-            ResourceRegistrationAction::ReusePersistent
-        );
-        assert_eq!(
-            resource_registration_action(ResourceMode::Persistent, Some(first), second),
-            ResourceRegistrationAction::ReplacePersistent
-        );
-    }
-}
+mod codec_policy_tests;
+#[cfg(test)]
+mod roi_tests;
 
 // The crate keeps its GUID table in a private `sys::guid` module; the values
 // below are copied verbatim from there (they mirror the C SDK headers).
@@ -1542,6 +1027,8 @@ impl Nvenc {
         };
         st.result_without_string()
             .context("NvEncOpenEncodeSessionEx")?;
+        // Destroys the session on every early return below, under `_gpu`.
+        let open_session = OpenSession(session);
         info!("NVENC session opened on capture D3D11 device");
 
         if options.roi_mode == RoiMode::Feedback {
@@ -1658,7 +1145,7 @@ impl Nvenc {
             .context("NvEncCreateBitstreamBuffer")?;
 
         Ok(Self {
-            session,
+            session: open_session.release(),
             device,
             _device_ref: device_ref,
             gate: gate.clone(),
@@ -2006,10 +1493,10 @@ impl Nvenc {
         let qp_map_stats = if let Some(map) = qp_map.as_mut() {
             let block = qp_map_block(self.codec);
             let expected = self.width.div_ceil(block) * self.height.div_ceil(block);
-            ensure!(
-                map.columns * map.rows == expected && map.values.len() == expected as usize,
-                "QP delta map dimensions do not match the encoder QP grid"
-            );
+            if map.columns * map.rows != expected || map.values.len() != expected as usize {
+                self.abort_mapped_frame(registered, per_frame_registration, &mut stage_timings);
+                bail!("QP delta map dimensions do not match the encoder QP grid");
+            }
             pic.qpDeltaMap = map.values.as_mut_ptr();
             pic.qpDeltaMapSize = map.values.len() as u32;
             Some(QpMapStats {
@@ -2026,11 +1513,7 @@ impl Nvenc {
         stage_timings.submit_us = submit_started.elapsed().as_micros() as u64;
         let res = st.result_without_string().context("NvEncEncodePicture");
         if let Err(e) = res {
-            self.unmap_recon_output();
-            stage_timings.unmap_us = self.unmap_current();
-            if per_frame_registration {
-                self.unregister_input(registered, &mut stage_timings);
-            }
+            self.abort_mapped_frame(registered, per_frame_registration, &mut stage_timings);
             return Err(e);
         }
 
@@ -2188,6 +1671,20 @@ impl Nvenc {
         Ok(map.mappedResource)
     }
 
+    /// Releases what a frame that failed after mapping still holds.
+    fn abort_mapped_frame(
+        &mut self,
+        registered: *mut c_void,
+        per_frame_registration: bool,
+        timings: &mut EncodeStageTimings,
+    ) {
+        self.unmap_recon_output();
+        timings.unmap_us = self.unmap_current();
+        if per_frame_registration {
+            self.unregister_input(registered, timings);
+        }
+    }
+
     fn unregister_input(&self, registered: *mut c_void, timings: &mut EncodeStageTimings) {
         if registered.is_null() {
             return;
@@ -2276,6 +1773,28 @@ impl Nvenc {
     /// Latest requested frame rate, applied at the next encode boundary.
     pub fn fps(&self) -> u32 {
         self.pending_reconfigure.desired().fps
+    }
+}
+
+/// An opened NVENC session that the constructor has not yet handed to
+/// `Nvenc`. Dropping it destroys the session; the caller holds the device gate.
+struct OpenSession(*mut c_void);
+
+impl OpenSession {
+    fn release(mut self) -> *mut c_void {
+        std::mem::replace(&mut self.0, ptr::null_mut())
+    }
+}
+
+impl Drop for OpenSession {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        let status = unsafe { native_call!(9, (ENCODE_API.destroy_encoder)(self.0)) };
+        if let Err(error) = status.result_without_string() {
+            warn!(?error, "NvEncDestroyEncoder after a failed session setup");
+        }
     }
 }
 

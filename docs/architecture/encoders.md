@@ -172,6 +172,15 @@ The `BP_CPU_*` variables are read when the converter and encoder are built. The 
 | `BP_CPU_MAX_HEIGHT` | unset | Height cap, at least 2. Rounded down to even. |
 | `BP_CPU_MAX_FPS` | unset | Frame-rate cap, at least 1. Never raises the requested rate. |
 
+## Retry after a failed frame
+
+A failed texture preparation, encoder recovery or hybrid envelope in the frame
+loop defers the next attempt through one `EncodeRetryGate`: 100 ms after the
+first failure, doubling to a 5 s cap, reset by the next encoded frame. The loop
+does not capture or rebuild the encoder before the gate opens. An NVENC session
+that fails during construction is destroyed before the error returns, and a
+frame that fails after mapping unmaps and unregisters its resources.
+
 ## Known limits
 
 - **AMD and Intel MFTs are untested.** No physical AMD or Intel machine has run the hardware path. Windows N and a machine without MF are not exercised.
