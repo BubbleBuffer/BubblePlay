@@ -6,16 +6,20 @@
 //! local `cargo test` never touches a user's desktop.
 //!
 //! Window A becomes foreground and then stops pumping. Window B on its own thread stays
-//! healthy. The test injects clicks with plain `SendInput` from this process (the same call
-//! the admin agent makes) and records whether a click on B arrives: before the hang, while A
-//! is hung, and after Windows replaced A with DWM's `Ghost` window. It also times the Win32
-//! calls the host makes on its foreground/cursor/clipboard paths while A is hung.
+//! healthy. Control clicks use plain `SendInput` from this elevated process (the call the admin
+//! agent makes). Once Windows replaced A with DWM's System-integrity `Ghost` window, UIPI drops
+//! that call, so the recovery click on B goes through the host's own input path instead:
+//! `InputSink` packets -> `SecureHelperLink` -> the installed LocalSystem secure helper (CI
+//! installs it with host/scripts/ci-install-secure-helper.ps1), which verifies the ghost
+//! foreground itself and injects on the default desktop. The test also checks that the stall
+//! report names A behind the ghost, and times the Win32 calls the host makes on its
+//! foreground/cursor/clipboard paths while A is hung.
 
 #![cfg(windows)]
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR, PWSTR};
@@ -389,6 +393,23 @@ fn input_reaches_other_windows_while_the_foreground_app_is_hung() {
         "control: SendInput sent {sent}/3, click reached B: {control_b}, reached A: {control_a}, A foreground: {a_foreground}"
     );
 
+    // The host's input path with the real secure helper, connected before the hang as a
+    // running session would be. The helper's own checks (console user, admin policy, protected
+    // image) apply unchanged.
+    let virtual_desktop = unsafe {
+        bubbleplay_host::input::DesktopRegion::new(
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN) as u32,
+            GetSystemMetrics(SM_CYVIRTUALSCREEN) as u32,
+        )
+    };
+    let link = connect_helper(virtual_desktop);
+    let _ = writeln!(report, "secure helper link: {:?}", link.as_ref().err());
+    let link = link.ok().map(|link| Arc::new(Mutex::new(link)));
+    let mut sink = bubbleplay_host::input::InputSink::new().with_secure_helper(link.clone());
+    sink.set_absolute_region(virtual_desktop);
+
     // A stops pumping while it is the foreground window.
     HANG_A.store(true, Ordering::Release);
     unsafe { PostMessageW(Some(hwnd(a)), WM_HANG, WPARAM(0), LPARAM(0)) }.unwrap();
@@ -413,21 +434,57 @@ fn input_reaches_other_windows_while_the_foreground_app_is_hung() {
     );
     let ghost_worst = probe_host_calls(&mut report, "ghost foreground");
 
-    // The session's recovery move: click a healthy window.
+    let observed = bubbleplay_host::input_stall::observe_foreground(false);
+    let ghost_names_a = observed
+        .ghost_for
+        .as_ref()
+        .map(|(pid, class)| (*pid, class.as_str()))
+        == Some((std::process::id(), "BpHungA"));
+    let _ = writeln!(
+        report,
+        "stall report: foreground {:?} ghost for {:?} (A: {ghost_names_a})",
+        observed.class, observed.ghost_for
+    );
+
+    // The session's recovery move: click a healthy window, through the host's input path.
+    sink.refresh_foreground_status(); // Reads the admin policy, as the session tick does.
+    let ready = wait_for(Duration::from_secs(3), || {
+        link.as_ref()
+            .is_some_and(|link| link.lock().unwrap().elevated_input_ready())
+    });
     let b1 = B_DOWN.load(Ordering::Acquire);
     let h1 = HOOK_DOWN.load(Ordering::Acquire);
-    let sent = click(center(hwnd(b)));
+    let target = center(hwnd(b));
+    let axis = |pixel: i32, origin: i32, extent: u32| {
+        (((pixel - origin).max(0) as u64 * 65535) / u64::from(extent.max(2) - 1)) as u16
+    };
+    let x = axis(target.x, virtual_desktop.x, virtual_desktop.width).to_le_bytes();
+    let y = axis(target.y, virtual_desktop.y, virtual_desktop.height).to_le_bytes();
+    sink.handle(&[TYPE_MOUSE_ABS, x[0], x[1], y[0], y[1]]);
+    sink.handle(&[TYPE_BUTTONS, 1]);
+    sink.handle(&[TYPE_BUTTONS, 0]);
     let ghost_b = wait_for(Duration::from_secs(3), || {
         B_DOWN.load(Ordering::Acquire) > b1
     });
     let hook_saw = HOOK_DOWN.load(Ordering::Acquire) > h1;
     let after = unsafe { GetForegroundWindow() };
+    let receipts: Vec<String> = link
+        .as_ref()
+        .map(|link| {
+            let mut link = link.lock().unwrap();
+            std::iter::from_fn(|| link.take_input_receipt())
+                .map(|r| format!("{r:?}"))
+                .collect()
+        })
+        .unwrap_or_default();
     let _ = writeln!(
         report,
-        "while hung/ghosted: SendInput sent {sent}/3, LL hook saw click: {hook_saw}, click reached B: {ghost_b}, foreground after: {:?} (B: {})",
+        "while ghosted, via host -> helper: helper route ready: {ready}, LL hook saw click: {hook_saw}, click reached B: {ghost_b}, foreground after: {:?} (B: {}), receipts: {receipts:?}",
         class_name(after),
         after == hwnd(b)
     );
+    drop(sink);
+    drop(link);
 
     drop(release);
     for window in [a, b] {
@@ -454,8 +511,42 @@ fn input_reaches_other_windows_while_the_foreground_app_is_hung() {
         pre_worst < 200 && ghost_worst < 200,
         "a host-path call blocked on the hung foreground"
     );
+    assert!(ghost, "the hung window was never replaced by a ghost");
+    assert!(
+        ghost_names_a,
+        "the stall report did not name the hung window behind the ghost"
+    );
+    assert!(
+        ready,
+        "the secure helper never offered the elevated-foreground input route"
+    );
     assert!(
         ghost_b,
-        "an injected click on a healthy window was lost while the foreground app was hung (ghost: {ghost})"
+        "a click on a healthy window was lost while the foreground app was hung"
     );
+}
+
+const TYPE_MOUSE_ABS: u8 = 3;
+const TYPE_BUTTONS: u8 = 4;
+
+/// Start the installed helper task and take the Host role, as the probe does.
+fn connect_helper(
+    region: bubbleplay_host::input::DesktopRegion,
+) -> Result<bubbleplay_host::secure_helper::client::SecureHelperLink, String> {
+    let system = std::env::var("SystemRoot").map_err(|e| e.to_string())?;
+    let status = std::process::Command::new(format!(r"{system}\System32\schtasks.exe"))
+        .args(["/run", "/tn", r"\BubblePlay\SecureDesktop"])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if !status.success() {
+        return Err(format!("schtasks /run failed: {status}"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match bubbleplay_host::secure_helper::client::SecureHelperLink::connect_host(region) {
+            Ok(link) => return Ok(link),
+            Err(e) if Instant::now() >= deadline => return Err(format!("{e:?}")),
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
 }
