@@ -168,11 +168,10 @@ fn verify_server(file: &File, allow_dev: bool) -> Result<(), LinkError> {
             "server pid {pid} is in another session"
         )));
     }
-    if !allow_dev && !trust::is_under_program_files(&image) {
-        return Err(LinkError::Untrusted(format!(
-            "server {} is not under Program Files",
-            image.display()
-        )));
+    if !allow_dev {
+        crate::secure_helper::trust::protected_install_file(&image).map_err(|error| {
+            LinkError::Untrusted(format!("server {}: {error}", image.display()))
+        })?;
     }
     Ok(())
 }
@@ -214,6 +213,7 @@ impl Connection {
     /// Connect, verify the server and perform the versioned hello. A hello
     /// that misses its deadline is retried once on a fresh connection.
     pub fn open(pipe: &str, allow_dev: bool, role: Role) -> Result<Self, LinkError> {
+        let allow_dev = allow_dev && !trust::is_process_elevated();
         retry_once_on_timeout(|| Self::open_once(pipe, allow_dev, role))
     }
 

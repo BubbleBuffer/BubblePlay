@@ -442,6 +442,19 @@ impl Agent {
                 let _ = unsafe { DisconnectNamedPipe(instance.0) };
                 continue;
             }
+            // Unelevated --dev instances already require an isolated scope at
+            // startup. Only that existing test path may admit target/ images.
+            if self.elevated {
+                let image_check = image
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("client image unavailable"))
+                    .and_then(bubbleplay_host::secure_helper::trust::protected_client_image);
+                if let Err(error) = image_check {
+                    tracing::warn!(client_pid, ?image, %error, "refusing unprotected admin agent client");
+                    let _ = unsafe { DisconnectNamedPipe(instance.0) };
+                    continue;
+                }
+            }
             if self.active.load(Ordering::SeqCst) >= (MAX_INSTANCES - 1) as usize {
                 tracing::warn!(client_pid, "too many clients; rejecting");
                 // SAFETY: connected pipe handle.
@@ -615,7 +628,6 @@ fn run() -> i32 {
         let Some(dir) = exe.parent() else {
             return 1;
         };
-        init_log(dir.join("logs"));
         let Some(options) = options.as_ref() else {
             tracing::error!("unknown arguments");
             return 2;
@@ -624,10 +636,11 @@ fn run() -> i32 {
             tracing::error!("dev options are refused while elevated");
             return 1;
         }
-        if !trust::is_under_program_files(&exe) {
+        if bubbleplay_host::secure_helper::trust::protected_install_file(&exe).is_err() {
             tracing::error!(exe = %exe.display(), "refusing to run elevated from a non-Program Files location");
             return 1;
         }
+        init_log(dir.join("logs"));
         None
     } else {
         let (Some(options), Some(dir)) = (options.as_ref(), test_dir.as_ref()) else {

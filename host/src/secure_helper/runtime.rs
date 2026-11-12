@@ -153,6 +153,14 @@ impl Server {
                 session == Some(self.session) && trust::process_sid(Some(pid))? == self.sid,
                 "secure helper client identity mismatch"
             );
+            let image_check = image
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("client image unavailable"))
+                .and_then(trust::protected_client_image);
+            if let Err(error) = image_check {
+                tracing::warn!(client_pid=pid, image=%image.as_deref().map(|p| p.display().to_string()).unwrap_or_default(), %error, "refusing unprotected secure helper client");
+                return Err(error);
+            }
             let h = instance.0;
             std::mem::forget(instance);
             let mut file = unsafe { File::from_raw_handle(h.0.cast()) };

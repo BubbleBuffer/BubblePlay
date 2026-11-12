@@ -27,7 +27,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use crate::device_key::DeviceId;
-use crate::dpapi::{dpapi_protect_bytes, dpapi_unprotect_bytes};
+use crate::dpapi::{dpapi_protect_bytes, dpapi_unprotect_bytes_with_migration};
 
 pub const VERSION: u32 = 1;
 /// Longest stored device name, in characters.
@@ -99,7 +99,8 @@ pub fn open_default() -> Result<TrustedDevices> {
 }
 
 /// Loads the list at `path`. A missing file is an empty list and nothing is written. Any other
-/// failure is an error, and the file is left as it is.
+/// failure is an error, and the file is left as it is. A valid legacy DPAPI file is atomically
+/// rewritten with application entropy, keeping its previous bytes as the usual `.bak` file.
 pub fn load(path: impl AsRef<Path>) -> Result<TrustedDevices> {
     let path = path.as_ref();
     let protected = match fs::read(path) {
@@ -116,7 +117,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<TrustedDevices> {
             })
         }
     };
-    let plain = dpapi_unprotect_bytes(&protected).with_context(|| {
+    let (plain, legacy) = dpapi_unprotect_bytes_with_migration(&protected).with_context(|| {
         format!(
             "{} cannot be decrypted by this user's DPAPI key; the file was left unchanged",
             path.display()
@@ -159,6 +160,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<TrustedDevices> {
             path.display()
         )
     })?;
+    if legacy {
+        let migrated = dpapi_protect_bytes(&plain)
+            .context("protecting the legacy trusted device list with application entropy")?;
+        write_atomic(path, &migrated).context("migrating the legacy trusted device list")?;
+    }
     Ok(TrustedDevices {
         path: path.to_path_buf(),
         devices,
@@ -536,6 +542,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dpapi::{dpapi_unprotect_bytes, protect_legacy_for_test};
     use std::time::Duration;
 
     /// A unique scratch folder under the system temp directory, removed on drop.
@@ -589,6 +596,31 @@ mod tests {
             .map(|entry| file_name(&entry.expect("entry").path()))
             .filter(|name| name.ends_with(".tmp"))
             .collect()
+    }
+
+    #[test]
+    fn legacy_dpapi_list_is_migrated_once_on_load() {
+        let dir = TestDir::new("legacy-dpapi");
+        let file = dir.file();
+        let plain = br#"{"version":1,"devices":[]}"#;
+        let legacy = protect_legacy_for_test(plain).expect("protect legacy list");
+        fs::write(&file, &legacy).expect("write legacy list");
+
+        assert!(load(&file).expect("load legacy list").devices().is_empty());
+        let migrated = fs::read(&file).expect("read migrated list");
+        assert_ne!(migrated, legacy);
+        let (decoded, still_legacy) =
+            dpapi_unprotect_bytes_with_migration(&migrated).expect("read with application entropy");
+        assert_eq!(decoded, plain);
+        assert!(!still_legacy, "migrated file must use application entropy");
+        assert_eq!(
+            fs::read(dir.0.join("trusted-devices.json.bak")).unwrap(),
+            legacy
+        );
+
+        load(&file).expect("reload migrated list");
+        assert_eq!(fs::read(&file).unwrap(), migrated, "migrate only once");
+        assert!(temp_files(&dir.0).is_empty());
     }
 
     #[test]
@@ -658,6 +690,10 @@ mod tests {
             (
                 "protected non-json",
                 dpapi_protect_bytes(b"not json").expect("protect"),
+            ),
+            (
+                "legacy protected non-json",
+                protect_legacy_for_test(b"not json").expect("protect legacy"),
             ),
             (
                 "unknown version",

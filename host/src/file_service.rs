@@ -40,6 +40,7 @@ use crate::file_transfer::{
 };
 use crate::native_file_drop::{DropBatch, NativeDropRequest};
 use crate::wss_media::{data_hello, host_socket_request_routed, HostSocket, RelayRoute};
+use crate::wss_v4::host_websocket_config;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(40);
@@ -511,7 +512,9 @@ type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 fn connect_file_socket(worker_url: &str, epoch: &str, route: &RelayRoute) -> Result<Socket> {
     let request = host_socket_request_routed(worker_url, epoch, HostSocket::File, route)?;
-    let (mut ws, _) = tungstenite::connect(request).context("connect file socket")?;
+    let (mut ws, _) =
+        tungstenite::client::connect_with_config(request, Some(host_websocket_config()), 3)
+            .context("connect file socket")?;
     ws.send(Message::text(data_hello("file-host", route)))
         .context("send file hello")?;
     ws.flush().context("flush file hello")?;

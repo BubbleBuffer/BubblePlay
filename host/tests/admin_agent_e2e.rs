@@ -103,6 +103,104 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
     })
 }
 
+/// Use the real command but only isolated kernel objects: no tray UI, host,
+/// scheduled task or input is started. Holding the mutex after the command
+/// exits also proves that `--quit` does not wait for shutdown to finish.
+#[test]
+fn tray_quit_only_signals_an_existing_tray_and_exits_promptly() {
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenEventW, WaitForSingleObject, EVENT_MODIFY_STATE};
+
+    for (running, event_exists) in [(false, false), (false, true), (true, false), (true, true)] {
+        let dir = scratch(&format!("quit-{running}-{event_exists}"));
+        let tray = running.then(|| FakeTray::new(&dir));
+        let name = wide(&scoped_name(
+            r"Local\BubblePlayTray.Quit",
+            Some(dir.as_os_str()),
+        ));
+        // SAFETY: isolated name; the handle remains owned until this case ends.
+        let event = event_exists.then(|| unsafe {
+            Owned(CreateEventW(None, true, false, PCWSTR(name.as_ptr())).unwrap())
+        });
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bubbleplay_tray"))
+            .arg("--quit")
+            .env("BUBBLEPLAY_TRAY_DATA_DIR", &dir)
+            .spawn()
+            .unwrap();
+        let code = wait_exit(&mut child, Duration::from_secs(2));
+        if code.is_none() {
+            // Kill only the exact test child, and reap it before failing.
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(code, Some(0), "running={running}, event={event_exists}");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "--quit must not initialize tray data or logging"
+        );
+        if let Some(event) = event {
+            // SAFETY: valid event; the zero-timeout observation cannot block.
+            let state = unsafe { WaitForSingleObject(event.0, 0) };
+            assert_eq!(state, if running { WAIT_OBJECT_0 } else { WAIT_TIMEOUT });
+        } else {
+            // A quit request must not create an event when none exists.
+            // SAFETY: isolated NUL-terminated event name.
+            let opened = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) };
+            if let Ok(handle) = opened {
+                drop(Owned(handle));
+                panic!("--quit created a missing event");
+            }
+        }
+        drop(tray);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Exercise the production timer/message loop too. Test mode scopes kernel
+/// objects and skips autostart/task writes; the empty data dir has no host
+/// configuration, so the supervisor cannot start a capture/input host.
+#[test]
+fn isolated_tray_observes_quit_event_and_exits() {
+    struct ReapChild(Child);
+
+    impl Drop for ReapChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    let dir = scratch("tray-quit-receiver");
+    let spawn = |quit: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bubbleplay_tray"));
+        command.env("BUBBLEPLAY_TRAY_DATA_DIR", &dir);
+        if quit {
+            command.arg("--quit");
+        }
+        ReapChild(command.spawn().unwrap())
+    };
+    let mut tray = spawn(false);
+    let ready = wait_for(Duration::from_secs(10), || {
+        dir.join("tray.json").is_file().then_some(())
+    });
+    assert!(
+        ready.is_some(),
+        "isolated tray did not reach normal startup"
+    );
+    let mut quitter = spawn(true);
+    let quit_code = wait_exit(&mut quitter.0, Duration::from_secs(2));
+    let tray_code = wait_exit(&mut tray.0, Duration::from_secs(3));
+    // RAII reaps only these two test children, including on assertion failure.
+    drop(quitter);
+    drop(tray);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(quit_code, Some(0), "--quit did not exit promptly");
+    assert_eq!(tray_code, Some(0), "tray did not observe the quit event");
+}
+
 /// Every `agent-YYYY-MM-DD*.jsonl` day file of the dev agent, oldest first.
 fn log_text(dir: &Path) -> String {
     let mut files: Vec<_> = std::fs::read_dir(dir.join("logs"))

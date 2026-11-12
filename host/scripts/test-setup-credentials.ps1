@@ -1,4 +1,4 @@
-# Synthetic configuration tests. Import only function ASTs; never execute setup.
+# Synthetic credential and filesystem boundary checks; never install or elevate.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $path = Join-Path $PSScriptRoot 'setup-tray.ps1'
@@ -79,3 +79,249 @@ Invoke-ServicesPreview -WhatIf
 if ($stepDetails[0] -ne 'services planned Stop and delete: BubblePlayTransport (ProgramData is kept).') { throw "Transport removal must be planned and recorded: $($stepDetails[0])" }
 if ($stepDetails[1] -notlike 'services-kept skipped *') { throw 'The kept services must be recorded.' }
 Write-Output 'setup credential tests passed (boundaries, fresh/saved/migrated config, removed-field rewrite, explicit empty/token-only updates, Transport removal; no writes).'
+
+# Import the real protection and tree-deletion functions without executing setup.
+# Only synthetic credentials and a uniquely named temporary fixture are used.
+foreach ($name in @('ConvertTo-Hex', 'ConvertFrom-Hex', 'Protect-UserHex', 'Unprotect-Hex', 'Assert-NoReparse', 'Get-SafeTreeFiles', 'Remove-SafeTree')) {
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    if (-not $node) { throw "Missing tested function $name." }
+    Invoke-Expression $node.Extent.Text
+}
+Add-Type -AssemblyName System.Security
+$encoded = Protect-UserHex $goodToken
+if ((Unprotect-Hex $encoded) -ne $goodToken -or $script:LegacyUserProtection) { throw 'App-entropy token must decrypt without legacy fallback.' }
+$bytes = [Text.Encoding]::UTF8.GetBytes($goodToken)
+try {
+    $legacy = ConvertTo-Hex ([Security.Cryptography.ProtectedData]::Protect($bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser))
+}
+finally { [Array]::Clear($bytes, 0, $bytes.Length) }
+if ((Unprotect-Hex $legacy) -ne $goodToken -or -not $script:LegacyUserProtection) { throw 'Legacy null-entropy token must remain readable and be marked for rewrite.' }
+$wrongEntropy = [Text.Encoding]::UTF8.GetBytes('synthetic.other.application')
+$rejected = $false
+try { $null = [Security.Cryptography.ProtectedData]::Unprotect((ConvertFrom-Hex $encoded), $wrongEntropy, [Security.Cryptography.DataProtectionScope]::CurrentUser) } catch { $rejected = $true }
+if (-not $rejected) { throw 'An app-entropy blob must reject different entropy.' }
+
+$tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+$fixture = Join-Path $tempRoot ('bubbleplay-install-test-' + [Guid]::NewGuid().ToString('N'))
+$tree = Join-Path $fixture 'install'
+$outside = Join-Path $fixture 'outside'
+$link = Join-Path $tree 'data\assets\linked'
+try {
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $link))
+    [void][IO.Directory]::CreateDirectory($outside)
+    $sentinel = Join-Path $outside 'keep.txt'
+    [IO.File]::WriteAllText($sentinel, 'outside sentinel')
+    $null = New-Item -ItemType Junction -Path $link -Target $outside
+    Assert-Rejected { Remove-SafeTree $tree } 'Reparse'
+    if ([IO.File]::ReadAllText($sentinel) -ne 'outside sentinel') { throw 'Deletion followed a nested junction.' }
+    if (-not (Test-Path -LiteralPath $tree)) { throw 'Unsafe tree must remain after rejection.' }
+    [IO.Directory]::Delete($link)
+    Remove-SafeTree $tree
+    if (Test-Path -LiteralPath $tree) { throw 'Ordinary tree removal must complete.' }
+    if (-not (Test-Path -LiteralPath $sentinel)) { throw 'Ordinary removal changed the outside sentinel.' }
+}
+finally {
+    $absolute = [IO.Path]::GetFullPath($fixture)
+    if (-not $absolute.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture cleanup escaped the temporary directory.' }
+    if (Test-Path -LiteralPath $link) { [IO.Directory]::Delete($link) }
+    if (Test-Path -LiteralPath $fixture) { Remove-SafeTree $fixture }
+}
+# Public entry points must reject arbitrary machine install roots before UAC.
+Assert-Rejected { & $path -InstallDir (Join-Path $tempRoot 'not-program-files') -WhatIf } 'InstallDir must'
+$uninstaller = Join-Path $PSScriptRoot 'uninstall-tray.ps1'
+Assert-Rejected { & $uninstaller -InstallDir (Join-Path $tempRoot 'not-program-files') -WhatIf } 'InstallDir must'
+Write-Output 'Installer boundary tests passed (synthetic DPAPI entropy, nested-junction refusal, safe deletion and fixed machine paths).'
+
+# Exercise receipt writing and autostart registration with only synthetic data
+# and an in-memory registry. Never invoke the install/elevation entry point.
+foreach ($name in @('Write-Receipt', 'Get-RunValue', 'Test-UserInstallExists', 'Set-UserAutostart')) {
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    if (-not $node) { throw "Missing tested function $name." }
+    Invoke-Expression $node.Extent.Text
+}
+$fixture = Join-Path $tempRoot ('bubbleplay-preferences-test-' + [Guid]::NewGuid().ToString('N'))
+$receiptLinks = [Collections.Generic.List[string]]::new()
+try {
+    $IsElevated = $false; $MachinePhase = $false; $IsWhatIf = $false
+    $receipt = [ordered]@{ finishedUtc = $null; result = 'success' }
+    $DataDir = Join-Path $fixture 'ordinary-data'
+    Write-Receipt
+    $written = @(Get-ChildItem -LiteralPath (Join-Path $DataDir 'receipts') -File)
+    if ($written.Count -ne 1 -or (Get-Content -LiteralPath $written[0].FullName -Raw | ConvertFrom-Json).result -ne 'success') { throw 'Ordinary user receipts must still be written.' }
+
+    $outside = Join-Path $fixture 'outside'
+    [void][IO.Directory]::CreateDirectory($outside)
+    $sentinel = Join-Path $outside 'keep.txt'
+    [IO.File]::WriteAllText($sentinel, 'receipt destination must stay untouched')
+    foreach ($kind in @('receipts', 'data')) {
+        $DataDir = Join-Path $fixture ("linked-$kind")
+        $link = if ($kind -eq 'data') { $DataDir } else { Join-Path $DataDir 'receipts' }
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $link))
+        $receiptLinks.Add($link)
+        $null = New-Item -ItemType Junction -Path $link -Target $outside
+        $warnings = @(Write-Receipt 3>&1)
+        if (@($warnings | Where-Object { $_ -is [Management.Automation.WarningRecord] -and $_.Message -like 'Skipping setup receipt:*' }).Count -ne 1) { throw "A $kind junction must skip the receipt with a warning, without throwing." }
+        if (@(Get-ChildItem -LiteralPath $outside -Force).Count -ne 1 -or [IO.File]::ReadAllText($sentinel) -ne 'receipt destination must stay untouched') { throw "Receipt writing followed the $kind junction." }
+        if ($receipt.result -ne 'success') { throw 'A skipped receipt must not turn a successful setup into failure.' }
+        [IO.Directory]::Delete($link)
+    }
+
+    $DataDir = Join-Path $fixture 'preferences'
+    $TraySettingsPath = Join-Path $DataDir 'tray.json'
+    $HostConfigPath = Join-Path $DataDir 'host.json'
+    $TrayExe = Join-Path $fixture 'protected\bubbleplay_tray.exe'
+    $LegacyUserDir = Join-Path $fixture 'legacy'
+    $UninstallKey = Join-Path $fixture 'synthetic-uninstall-key'
+    $RunKey = 'synthetic-HKCU-Run'; $RunValue = 'BubblePlayTray'
+    $registryWrites = [Collections.Generic.List[string]]::new()
+    $fixtureRunProperties = [pscustomobject]@{}
+    $realNewItem = Get-Command New-Item -CommandType Cmdlet
+    function Get-ItemProperty {
+        param($Path, $ErrorAction)
+        if ($Path -ne $RunKey) { throw "Unexpected registry read: $Path" }
+        return $script:fixtureRunProperties
+    }
+    function Set-ItemProperty {
+        param($Path, $Name, $Value)
+        if ($Path -ne $RunKey -or $Name -ne $RunValue) { throw 'Unexpected registry mutation.' }
+        $script:registryWrites.Add([string]$Value)
+        $script:fixtureRunProperties = [pscustomobject]@{ BubblePlayTray = $Value }
+    }
+    function New-Item {
+        param($Path, $ItemType, [switch]$Force, $ErrorAction)
+        if ($Path -eq $RunKey) { return }
+        & $script:realNewItem @PSBoundParameters
+    }
+    function Invoke-Autostart {
+        [CmdletBinding(SupportsShouldProcess = $true)]
+        param([bool]$ExistingInstall)
+        Set-UserAutostart $ExistingInstall
+    }
+    $existing = Test-UserInstallExists
+    if ($existing) { throw 'Absent program/config/registration must be detected as a fresh install.' }
+    Invoke-Autostart $existing -Confirm:$false
+    if ((Get-RunValue) -ne "`"$TrayExe`"" -or (Get-Content -LiteralPath $TraySettingsPath -Raw | ConvertFrom-Json).startAtLogin -ne $true) { throw 'A fresh install must enable Run and startAtLogin.' }
+
+    # A legacy binary is enough to identify an update even when user config is
+    # absent. Run state and startAtLogin can disagree; preserve both choices.
+    [void][IO.Directory]::CreateDirectory($LegacyUserDir)
+    [IO.File]::WriteAllText((Join-Path $LegacyUserDir 'bubbleplay_tray.exe'), 'synthetic marker; never execute')
+    foreach ($case in @(
+        @{ Name = 'disabled'; Run = $null; Settings = '{"startAtLogin":false}' },
+        @{ Name = 'enabled legacy'; Run = '"C:\legacy\bubbleplay_tray.exe"'; Settings = '{"startAtLogin":true}' },
+        @{ Name = 'disabled Run with true setting'; Run = $null; Settings = '{"startAtLogin":true}' },
+        @{ Name = 'enabled Run with false setting'; Run = '"C:\legacy\bubbleplay_tray.exe"'; Settings = '{"startAtLogin":false}' },
+        @{ Name = 'disabled with missing settings'; Run = $null; Settings = $null }
+    )) {
+        $fixtureRunProperties = if ($null -eq $case.Run) { [pscustomobject]@{} } else { [pscustomobject]@{ BubblePlayTray = $case.Run } }
+        if ($null -eq $case.Settings) { [IO.File]::Delete($TraySettingsPath) }
+        else { [IO.File]::WriteAllText($TraySettingsPath, $case.Settings) }
+        $registryWrites.Clear()
+        $existing = Test-UserInstallExists
+        if (-not $existing) { throw "Legacy update was treated as fresh: $($case.Name)" }
+        Invoke-Autostart $existing -Confirm:$false
+        if ($null -eq $case.Run) {
+            if ($registryWrites.Count -ne 0 -or $null -ne (Get-RunValue)) { throw "Update re-enabled autostart: $($case.Name)" }
+        }
+        elseif ((Get-RunValue) -ne "`"$TrayExe`"") { throw 'Enabled legacy autostart must point at the protected replacement.' }
+        if ($null -eq $case.Settings) {
+            if (Test-Path -LiteralPath $TraySettingsPath) { throw 'Update created defaults over missing user settings.' }
+        }
+        elseif ([IO.File]::ReadAllText($TraySettingsPath) -cne $case.Settings) { throw "Update overwrote startAtLogin: $($case.Name)" }
+    }
+}
+finally {
+    $absolute = [IO.Path]::GetFullPath($fixture)
+    if (-not $absolute.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Preference fixture cleanup escaped the temporary directory.' }
+    foreach ($link in $receiptLinks) { if (Test-Path -LiteralPath $link) { [IO.Directory]::Delete($link) } }
+    if (Test-Path -LiteralPath $fixture) { Remove-SafeTree $fixture }
+}
+Write-Output 'Receipt junction and fresh/update autostart checks passed using synthetic files and registry state.'
+
+foreach ($name in @('Test-AccountMatchesSid', 'Test-InstalledTrayPath', 'Stop-RunningTray')) {
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    if (-not $node) { throw "Missing tested function $name." }
+    Invoke-Expression $node.Extent.Text
+}
+# A well-known local group supplies localized qualified/bare account spellings
+# without creating an account or accessing a live scheduled task.
+$testSid = 'S-1-5-32-544'
+$testAccount = ([Security.Principal.SecurityIdentifier]::new($testSid)).Translate([Security.Principal.NTAccount]).Value
+$testBareAccount = ($testAccount -split '\\')[-1]
+foreach ($account in @($testSid, $testAccount, $testBareAccount)) {
+    if (-not (Test-AccountMatchesSid $account $testSid)) { throw "Equivalent task account spelling was rejected: $account" }
+    if (Test-AccountMatchesSid $account 'S-1-5-18') { throw 'Task identity must compare SIDs, not just accept a resolvable name.' }
+}
+$missingAccount = [Environment]::MachineName + '\__bp_missing_' + [Guid]::NewGuid().ToString('N').Substring(0, 6)
+foreach ($account in @('', 'S-not-a-sid', $missingAccount)) {
+    if (Test-AccountMatchesSid $account $testSid) { throw 'Empty/invalid/unresolvable task identities must be rejected.' }
+}
+
+# Synthetic processes cover an old installed --quit that never returns. Every
+# process API is mocked; no executable is launched, slept on or stopped.
+$MachineDir = Join-Path $tempRoot 'synthetic-machine-install'
+$LegacyUserDir = Join-Path $tempRoot 'synthetic-legacy-install'
+$TrayExe = Join-Path $MachineDir 'bubbleplay_tray.exe'
+$fakeTrays = @(
+    [pscustomobject]@{ Id = 101; Path = $TrayExe },
+    [pscustomobject]@{ Id = 102; Path = (Join-Path $LegacyUserDir 'bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 103; Path = (Join-Path $MachineDir 'nested\bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 104; Path = (Join-Path ($MachineDir + '-other') 'bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 105; Path = (Join-Path $tempRoot 'unrelated\bubbleplay_tray.exe') },
+    [pscustomobject]@{ Id = 106; Path = $null }
+)
+$fakeQuitter = [pscustomobject]@{ Id = 107; Path = $TrayExe }
+$fakeQuitter | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+    param([int]$Milliseconds)
+    $script:quitWaitMilliseconds = $Milliseconds
+    return $script:quitCompletes
+}
+$fakeQuitter | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $script:quitDisposed = $true }
+$fakeProcesses = @{}
+foreach ($process in @($fakeTrays) + @($fakeQuitter)) { $fakeProcesses[[int]$process.Id] = $process }
+$stoppedIds = [Collections.Generic.List[int]]::new()
+$sleepMilliseconds = [Collections.Generic.List[int]]::new()
+function Get-Process {
+    param([string[]]$Name, [int]$Id, $ErrorAction)
+    if ($PSBoundParameters.ContainsKey('Id')) {
+        if ($script:swapTrayPid -and $Id -eq 101) { return [pscustomobject]@{ Id = 101; Path = (Join-Path $tempRoot 'unrelated\replacement.exe') } }
+        if ($script:fakeProcesses.ContainsKey($Id)) { return $script:fakeProcesses[$Id] }
+        return
+    }
+    if ($Name -contains 'bubbleplay_tray') { return $script:fakeTrays }
+    # No adjacent host/app/agent processes in this fixture.
+}
+function Start-Process {
+    param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru, $WindowStyle)
+    if ($Wait -or -not $PassThru -or -not (Test-InstalledTrayPath $FilePath) -or $ArgumentList -ne '--quit') { throw 'Quit launch must use a verified install image and a bounded process wait.' }
+    return $script:fakeQuitter
+}
+function Stop-Process {
+    [CmdletBinding()]
+    param([int[]]$Id, [Parameter(ValueFromPipeline = $true)]$InputObject, [switch]$Force)
+    process {
+        if ($InputObject) { throw 'Tray shutdown must stop explicit verified PIDs; adjacent process fixture is empty.' }
+        foreach ($processId in @($Id)) { if ($processId -gt 0) { $script:stoppedIds.Add($processId) } }
+    }
+}
+function Start-Sleep { param($Milliseconds) $script:sleepMilliseconds.Add([int]$Milliseconds) }
+function Invoke-TrayStop {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+    Stop-RunningTray
+}
+foreach ($quitCompletes in @($false, $true)) {
+    foreach ($swapTrayPid in @($false, $true)) {
+        $stoppedIds.Clear(); $stepDetails.Clear(); $sleepMilliseconds.Clear()
+        $quitWaitMilliseconds = 0; $quitDisposed = $false
+        Invoke-TrayStop -Confirm:$false
+        if ($quitWaitMilliseconds -ne 10000 -or -not $quitDisposed) { throw 'Installed --quit must have a ten-second bound and release its process handle.' }
+        $expected = if ($swapTrayPid) { '102,107' } else { '101,102,107' }
+        if ((@($stoppedIds | Sort-Object) -join ',') -ne $expected) { throw 'Tray shutdown stopped an unrelated, nested or replaced process image.' }
+        $expectedTimeouts = if ($quitCompletes) { 0 } else { 1 }
+        if (@($stepDetails | Where-Object { $_ -like 'stop-tray warning *timed out*' }).Count -ne $expectedTimeouts) { throw 'Only quit timeouts must record the timeout fallback.' }
+        $expectedSleep = if ($quitCompletes) { '1500' } else { '' }
+        if (($sleepMilliseconds -join ',') -ne $expectedSleep) { throw 'Completed quit requests need one bounded poll grace; timed-out requests need no extra delay.' }
+    }
+}
+Write-Output 'Task SID normalization and bounded, path-verified tray shutdown checks passed without live tasks or processes.'

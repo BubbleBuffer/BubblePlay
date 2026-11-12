@@ -21,6 +21,9 @@ param(
     [switch]$SourceDirty,
     [string]$BinaryDir,
     [string]$ScriptDir,
+    # Optional Flutter Release bundle. Only its executable, root DLLs and data
+    # tree are shipped; symbols, logs, configs and unrelated root files stay out.
+    [string]$AppDir,
     [Parameter(Mandatory = $true)][string]$QuickstartPath,
     [Parameter(Mandatory = $true)][string]$DependencyNoticesPath,
     [string]$LicensePath,
@@ -55,6 +58,20 @@ function Assert-NoReparse([string]$Path) {
 function Assert-File([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required release file missing: $Path" }
     Assert-NoReparse $Path
+}
+
+function Get-AppFiles([string]$Root, [string]$Directory) {
+    Assert-NoReparse $Directory
+    foreach ($item in Get-ChildItem -LiteralPath $Directory -Force) {
+        Assert-NoReparse $item.FullName
+        $relative = $item.FullName.Substring($Root.Length + 1).Replace('\', '/')
+        if ($item.PSIsContainer) {
+            if ($relative -eq 'data' -or $relative.StartsWith('data/', [StringComparison]::Ordinal)) { Get-AppFiles $Root $item.FullName }
+        }
+        elseif ($relative -ceq 'bubbleplay_app.exe' -or $relative -cmatch '^[a-zA-Z0-9_.-]+\.dll$' -or $relative.StartsWith('data/', [StringComparison]::Ordinal)) {
+            $item
+        }
+    }
 }
 
 function Get-StreamHash([IO.Stream]$Stream) {
@@ -107,6 +124,16 @@ foreach ($name in @('bubbleplay-host.exe', 'bubbleplay_tray.exe', 'bubbleplay_ad
 foreach ($name in @('setup-tray.ps1', 'update-tray.ps1', 'uninstall-tray.ps1')) {
     $sources[$name] = Join-Path $ScriptDir $name
 }
+if ($AppDir) {
+    $AppDir = [IO.Path]::GetFullPath($AppDir).TrimEnd('\')
+    Assert-File (Join-Path $AppDir 'bubbleplay_app.exe')
+    foreach ($file in Get-AppFiles $AppDir $AppDir) {
+        $relative = $file.FullName.Substring($AppDir.Length + 1).Replace('\', '/')
+        if ($sources.Contains($relative)) { throw "App bundle collides with release file: $relative" }
+        if ($relative -notlike 'data/*') { Assert-X64Executable $file.FullName }
+        $sources[$relative] = $file.FullName
+    }
+}
 $sources['QUICKSTART.md'] = [IO.Path]::GetFullPath($QuickstartPath)
 $sources['THIRD-PARTY-NOTICES.md'] = [IO.Path]::GetFullPath($DependencyNoticesPath)
 if ($LicensePath) { $sources['LICENSE'] = [IO.Path]::GetFullPath($LicensePath) }
@@ -139,7 +166,7 @@ $manifest = [ordered]@{
     schema = 'bubbleplay.public-release.v1'
     version = $Version
     platform = 'windows-x64'
-    profile = 'per-user-tray'
+    profile = 'per-machine-tray'
     sourceRevision = $SourceRevision.ToLowerInvariant()
     sourceState = $SourceState
     sourceDirty = $(if ($SourceState -eq 'unknown') { $null } else { $SourceState -eq 'uncommitted' })
