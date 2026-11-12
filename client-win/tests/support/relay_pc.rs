@@ -127,13 +127,16 @@ pub async fn next_json(ws: &mut Ws) -> Value {
     }
 }
 
-/// The next message of `kind`, skipping relay `pong`s only; anything else is a failure.
+/// The next message of `kind`, skipping relay `pong`s and, unless it is what is awaited, `peer-joined`
+/// (the relay does not order a viewer joining against the reply to the PC's own hello); anything else
+/// is a failure.
 pub async fn next_of(ws: &mut Ws, kind: &str) -> Value {
     loop {
         let value = next_json(ws).await;
         match value["type"].as_str() {
             Some(found) if found == kind => return value,
             Some("pong") => continue,
+            Some("peer-joined") => continue,
             _ => panic!("PC expected {kind}, got {value}"),
         }
     }
