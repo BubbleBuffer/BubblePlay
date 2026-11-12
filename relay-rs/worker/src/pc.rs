@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use bp_relay_core::directory::{PcReport, REPORT_EVERY_MS};
 use bp_relay_core::relay::{
-    Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, UpgradeRequest, reasons,
+    Action, AdminError, ConnId, ConnSnapshot, Relay as CoreRelay, Upgraded, UpgradeRequest, reasons,
 };
 use serde_json::json;
 use worker::js_sys;
@@ -104,9 +104,10 @@ impl crate::PcRelay {
             };
             live.core.upgrade(upgrade, client, now_ms())
         };
-        let Ok(id) = accepted else {
+        let Ok(Upgraded { id, evicted }) = accepted else {
             return http::status(404);
         };
+        self.run_sync(evicted);
 
         let pair = WebSocketPair::new()?;
         let tag = format!("{TAG_PREFIX}{}", id.0);

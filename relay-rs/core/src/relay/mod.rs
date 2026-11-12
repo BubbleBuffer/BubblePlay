@@ -12,6 +12,8 @@ mod forward;
 mod hello;
 mod pairing;
 mod pcs;
+mod preauth;
+pub mod reasons;
 mod snapshot;
 mod state;
 mod types;
@@ -28,9 +30,14 @@ use pairing::{PairFailures, PairWindow};
 use state::{Conn, Kind, Phase, Role, Room, key_for, read_limit};
 
 pub use pcs::{MAX_PCS, PcRecord, PcTable};
+pub use preauth::{
+    EVICTED_CLOSE_CODE, HELLO_TIMEOUT_MS, PRE_AUTH_MAX_PER_PREFIX, PRE_AUTH_MAX_TOTAL,
+    PROOF_TIMEOUT_MS,
+};
 pub use types::{
-    Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, PcListing, Reject, Route,
-    SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig, UpgradeRequest,
+    Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, DEFAULT_MAX_CONNECTIONS,
+    PcListing, Reject, Route, SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig,
+    UpgradeRequest, Upgraded,
 };
 
 /// The routing state for one relay.
@@ -54,34 +61,6 @@ pub struct Relay {
     client_log_dropped: u64,
     /// When that debug line was last written.
     client_log_logged_ms: Option<u64>,
-}
-
-/// The close reasons clients can show. No secrets, no detail an outsider could use.
-pub mod reasons {
-    /// Malformed or unexpected hello, proof or packet before the session is live.
-    pub const INVALID_HELLO: &str = "invalid hello";
-    /// A live socket sent a packet the relay does not accept.
-    pub const INVALID_PACKET: &str = "invalid packet";
-    /// The viewer's identity proof did not verify.
-    pub const INVALID_PROOF: &str = "invalid proof";
-    /// The viewer is not on the PC's admission list and offered no pairing code.
-    pub const NOT_PAIRED: &str = "not paired";
-    /// The pairing code was wrong, or no pairing window is open.
-    pub const PAIRING_CODE: &str = "pairing code not accepted";
-    /// Too many failed pairing attempts, from this network or against this PC.
-    pub const RATE_LIMITED: &str = "rate limited";
-    /// A media or file socket's ticket or epoch was not accepted.
-    pub const NOT_AUTHORIZED: &str = "not authorized";
-    /// The socket did not finish its hello or proof in time.
-    pub const TIMED_OUT: &str = "timed out";
-    /// The host removed this viewer from the admission list.
-    pub const ACCESS_REMOVED: &str = "access removed";
-    /// The site gate did not approve this browser socket.
-    pub const NOT_APPROVED: &str = "not approved";
-    /// The socket could not be restored after the relay woke from hibernation.
-    pub const SESSION_NOT_RESTORED: &str = "session not restored";
-    /// The PC was removed by the admin.
-    pub const PEER_REMOVED: &str = "peer removed";
 }
 
 impl Relay {
@@ -147,13 +126,14 @@ impl Relay {
 
     /// Accepts an upgrade. Origin and the gate cookie were checked by the
     /// adapter. `client` is the peer address; its prefix keys the pairing rate
-    /// limits. Refusals are `Reject` (HTTP 404), including the connection cap.
+    /// limits. Refusals are `Reject` (HTTP 404), including the connection cap. A full relay closes
+    /// pending sockets to make room (see `preauth`); `Upgraded::evicted` holds those closes.
     pub fn upgrade(
         &mut self,
         req: UpgradeRequest,
         client: IpAddr,
         now_ms: u64,
-    ) -> Result<ConnId, Reject> {
+    ) -> Result<Upgraded, Reject> {
         self.clock_ms = self.clock_ms.max(now_ms);
         let role = req.route.role();
         let kind = role.kind();
@@ -182,7 +162,9 @@ impl Relay {
             }
             epoch
         };
-        if self.conns.len() >= self.config.max_connections {
+        let prefix = Prefix::of(client);
+        let mut evicted = Vec::new();
+        if !self.make_room(prefix, &mut evicted) {
             return Err(self.upgrade_refused("upgrade.connection-cap", role, Some(&pc)));
         }
         let id = ConnId(self.next_id);
@@ -198,14 +180,14 @@ impl Relay {
                 deadline_ms: now_ms + self.config.timings.hello_ms,
                 closing: false,
                 ticket: None,
-                prefix: Prefix::of(client),
+                prefix,
                 device: String::new(),
                 pairing: false,
                 activity_ms: now_ms,
                 saved_activity_ms: now_ms,
             },
         );
-        Ok(id)
+        Ok(Upgraded { id, evicted })
     }
 
     /// Logs an upgrade the relay answers with HTTP 404.

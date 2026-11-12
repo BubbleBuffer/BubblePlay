@@ -16,7 +16,7 @@ use url::Url;
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
 pub const DEFAULT_ASSETS_DIR: &str = "/assets";
 pub const DEFAULT_STATE_DIR: &str = "/data";
-pub const DEFAULT_MAX_CONNECTIONS: u32 = 32;
+pub const DEFAULT_MAX_CONNECTIONS: u32 = bp_relay_core::relay::DEFAULT_MAX_CONNECTIONS as u32;
 pub const DEFAULT_APPROVAL_TTL_S: u32 = 90;
 pub const DEFAULT_TURN_TTL_S: u32 = 21_600;
 pub const ENV_TOKEN: &str = "BP_RELAY_TOKEN";

@@ -23,7 +23,7 @@ pub mod rng;
 pub use relay::{
     Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, MAX_PCS, PcListing, PcRecord,
     PcTable, Reject, Relay, Route, SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig,
-    UpgradeRequest,
+    UpgradeRequest, Upgraded,
 };
 pub use rng::RelayRng;
 

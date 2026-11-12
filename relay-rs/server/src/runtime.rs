@@ -293,7 +293,7 @@ impl Shared {
 
     /// Runs actions that cannot persist (the close paths only). A PersistPcs here is logged and
     /// skipped; the next persist writes the whole table anyway.
-    fn run_sync(&self, actions: Vec<Action>) {
+    pub(crate) fn run_sync(&self, actions: Vec<Action>) {
         let mut queue: VecDeque<Action> = actions.into();
         while let Some(action) = queue.pop_front() {
             match action {
