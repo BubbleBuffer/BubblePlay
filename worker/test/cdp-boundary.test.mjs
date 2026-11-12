@@ -200,7 +200,6 @@ test("responsive product shell keeps normal controls compact and diagnostics adv
   assert.match(client, /Windows secure desktop/);
   assert.match(client, /desktopKind === "secure"/);
   assert.match(client, /keyboardInput\.setAttribute\("autocorrect", secureDesktop \? "off" : "on"\)/);
-  assert.match(client, /secureTextUnits/);
   // Touch order follows the Android quick-action bar.
   assert.match(client, /data-ui-action="keyboard"[\s\S]*data-ui-action="monitors"[\s\S]*data-ui-action="pointer"[\s\S]*data-ui-action="shortcuts"[\s\S]*data-ui-action="keys"[\s\S]*data-ui-action="arrows"[\s\S]*data-ui-action="more"/);
 });
@@ -313,10 +312,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /action: "monitor"/);
   assert.match(client, /id="session-strip"/);
   assert.match(client, /id="keyboard-input"/);
-  assert.match(client, /reconcileTextEdit/);
-  assert.match(client, /let keyboardShadow = ""/);
   assert.match(client, /compositionstart/);
-  assert.match(client, /Applied correction/);
   assert.doesNotMatch(client, /keyboardInput\.value = "";\s*\}\);/);
   assert.match(client, /data-vk="162"/);
   assert.match(client, /createPopoverController\(\{/);

@@ -16,10 +16,10 @@ import {
   splitRecovery,
   rtcPeerEndAction,
 } from "/recovery.js";
-import { createCompositionCommitGate } from "/composition-gate.js";
+import { createKeyboardDraft } from "/keyboard-draft.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
- import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
+ import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, RemoteCursor, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
 import { cropGain } from "/sharp-viewport.js";
 import { createSharpSession } from "/sharp-session.js";
@@ -1435,7 +1435,7 @@ function cleanupPeer() {
   soundController.detachSink("rtc");
   clearWssTimers();
   authenticatedSession?.resetPeer();
-  resetKeyboardDraft();
+  keyboardDraft.reset();
   resetTouchCursor();
   cursorAppearance.reset();
   inputReady = false;
@@ -3932,11 +3932,9 @@ document.addEventListener("keyup", (e) => {
 });
 const keyboardInput = document.getElementById("keyboard-input");
 const keyboardStatus = document.getElementById("keyboard-status");
-let keyboardShadow = "";
-let keyboardComposing = false;
-const secureCompositionCommit = createCompositionCommitGate(text => {
-  if (!inputReady || desktopKind !== "secure") { resetKeyboardDraft(); return; }
-  handleSecureKeyboardInput({ data: text, inputType: "insertCompositionText" });
+const keyboardDraft = createKeyboardDraft({
+  input, field: keyboardInput, inputReady: () => inputReady, desktopKind: () => desktopKind,
+  desktopInputState: () => desktopInputState, setStatus: text => { keyboardStatus.textContent = text; },
 });
 const modifierVks = new Map([["Ctrl", 0x11], ["Alt", 0x12], ["Shift", 0x10], ["Win", 0x5B]]);
 // Keys popover (touch), after the Android app: navigation and editing keys,
@@ -4044,74 +4042,11 @@ function renderShortcutList() {
     return row;
   }));
 }
-function resetKeyboardDraft() {
-  keyboardComposing = false;
-  secureCompositionCommit.reset();
-  keyboardShadow = "";
-  keyboardInput.value = "";
-}
-function sendKeyboardText(text) {
-  let chunk = "";
-  let sent = 0;
-  for (const character of String(text)) {
-    const candidate = chunk + character;
-    if (new TextEncoder().encode(candidate).byteLength > 500 && chunk) {
-      if (input.text(chunk)) sent += Array.from(chunk).length;
-      chunk = character;
-    } else chunk = candidate;
-  }
-  if (chunk && input.text(chunk)) sent += Array.from(chunk).length;
-  return sent;
-}
-function reconcileKeyboardValue(nextValue) {
-  const next = String(nextValue ?? "");
-  const edit = reconcileTextEdit(keyboardShadow, next);
-   if (inputReady) {
-    for (let i = 0; i < edit.deleteCount; i++) {
-      input.key(0x08, false);
-      input.key(0x08, true);
-    }
-    const inserted = sendKeyboardText(edit.insert);
-    if (edit.deleteCount || inserted) {
-      keyboardStatus.textContent = edit.deleteCount
-        ? `Applied correction: ${edit.deleteCount} delete${edit.deleteCount === 1 ? "" : "s"}${inserted ? ` + ${inserted} character${inserted === 1 ? "" : "s"}` : ""}.`
-        : `Sent ${inserted} character${inserted === 1 ? "" : "s"}.`;
-    }
-  }
-  keyboardShadow = next;
-}
-function handleSecureKeyboardInput(event) {
-  if (desktopInputState !== "enabled") { resetKeyboardDraft(); return; }
-  if (event.inputType === "deleteContentBackward") {
-    input.key(0x08, false); input.key(0x08, true);
-    keyboardStatus.textContent = "Protected input sent.";
-    resetKeyboardDraft();
-    return;
-  }
-  const source = event.data ?? keyboardInput.value;
-  const units = secureTextUnits(source, event.inputType || "insertText");
-  for (const unit of units) input.text(unit);
-  keyboardStatus.textContent = units.length ? "Protected input sent." : "Paste and automatic corrections are disabled on secure desktop.";
-  resetKeyboardDraft();
-}
-keyboardInput.addEventListener("compositionstart", () => { secureCompositionCommit.reset(); keyboardComposing = true; });
-keyboardInput.addEventListener("input", event => {
-  if (!inputReady || event.isComposing || keyboardComposing) return;
-  if (desktopKind === "secure" && secureCompositionCommit.consume(event.data ?? keyboardInput.value)) return;
-  if (desktopKind === "secure") { handleSecureKeyboardInput(event); return; }
-  reconcileKeyboardValue(keyboardInput.value);
-});
-keyboardInput.addEventListener("compositionend", event => {
-  keyboardComposing = false;
-  if (desktopKind === "secure") {
-    if (inputReady) secureCompositionCommit.stage(event.data ?? keyboardInput.value);
-    else resetKeyboardDraft();
-    return;
-  }
-  if (inputReady) reconcileKeyboardValue(keyboardInput.value);
-});
+keyboardInput.addEventListener("compositionstart", () => keyboardDraft.compositionStart());
+keyboardInput.addEventListener("input", event => keyboardDraft.input(event));
+keyboardInput.addEventListener("compositionend", event => keyboardDraft.compositionEnd(event));
 window.addEventListener("blur", () => {
-  releaseInput(); held.clear(); resetKeyboardDraft();
+  releaseInput(); held.clear(); keyboardDraft.reset();
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { releaseInput(); resetTouchCursor(); } });
 
@@ -4435,7 +4370,7 @@ function renderKeyboardButton() {
 }
 function toggleTouchKeyboard() {
   popovers.close({ restore: false });
-  if (document.activeElement === keyboardInput) { keyboardInput.blur(); resetKeyboardDraft(); releaseLatchedModifiers(); }
+  if (document.activeElement === keyboardInput) { keyboardInput.blur(); keyboardDraft.reset(); releaseLatchedModifiers(); }
   else keyboardInput.focus({ preventScroll: true });
   renderKeyboardButton();
 }

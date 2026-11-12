@@ -518,7 +518,7 @@ test("receiver failure closes authentication, media, pending tracks and input wi
     soundController: { detachSink() {} }, clearWssTimers() {}, closingPeer: false,
     releaseInput: () => cleanupCalls.push("release-input"),
   });
-  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  resetKeyboardDraft();", source.indexOf("function cleanupPeer(")));
+  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  keyboardDraft.reset();", source.indexOf("function cleanupPeer(")));
   vm.runInContext(cleanupPrefix + "\n}\ncleanupPeer();", cleanupContext);
   assert.deepEqual(cleanupCalls, ["track-stop", "release-input", "peer-reset"]);
   assert.equal(cleanupContext.pendingRtcTracks.length, 0);
@@ -574,7 +574,7 @@ test("WSS teardown releases through ctl and cannot authorize an unbound DataChan
     stopWssMedia: () => { context.usingWssMedia = false; }, soundController: { detachSink() {} }, clearWssTimers() {},
   });
   const inputFns = source.slice(source.indexOf("function inputControlState("), source.indexOf("\nlet motionFrame"));
-  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  resetKeyboardDraft();", source.indexOf("function cleanupPeer(")));
+  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  keyboardDraft.reset();", source.indexOf("function cleanupPeer(")));
   vm.runInContext(inputFns + "\n" + cleanupPrefix + "\n}\ncleanupPeer();", context);
   assert.deepEqual(sent, ["ctl-input"]);
   assert.equal(vm.runInContext("sendInput(data, dc)", context), false);

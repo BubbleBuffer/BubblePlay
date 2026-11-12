@@ -88,3 +88,6 @@ Settings has two groups that matter here.
 `worker/public/receiver.js` is being split into modules that each own their state behind a small interface (plain ES modules, no bundler). Split so far:
 
 - `sharp-session.js`: the sharp-viewport negotiation with the host (requested, committed and pending crop, the transition timeout and the session-wide disable). The receiver supplies the desktop size, viewport geometry and transport through `createSharpSession(env)` and renders the crop the session reports. Crop math stays in `sharp-viewport.js`.
+- `composition-gate.js`: commits secure-desktop Android composition text once, through one pending transaction.
+- `connection-status.js`: pure model of the connection chip (state, label, tooltip, Admin warning).
+- `keyboard-draft.js`: the on-screen keyboard field: diffs the draft against what was sent, chunks text under the packet limit, and sends protected input only on a secure desktop.
