@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use bp_device_key::relay_origin;
 use bp_relay_core::gate::GATE_HOLD_MS;
+use bp_relay_core::limits::MIN_SECRET_BYTES;
 use ipnet::IpNet;
 use serde::Deserialize;
 use url::Url;
@@ -269,8 +270,8 @@ fn secret_field(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Secret, ConfigError> {
     if let Some(value) = env(env_name) {
-        if value.is_empty() {
-            return Err(invalid(env_name, "is set but empty"));
+        if value.len() < MIN_SECRET_BYTES {
+            return Err(invalid(env_name, too_short()));
         }
         return Ok(Secret::new(value));
     }
@@ -279,9 +280,13 @@ fn secret_field(
             field,
             format!("is required; set it in relay.json or in {env_name}"),
         )),
-        Some(value) if value.is_empty() => Err(invalid(field, "is empty")),
+        Some(value) if value.len() < MIN_SECRET_BYTES => Err(invalid(field, too_short())),
         Some(value) => Ok(Secret::new(value)),
     }
+}
+
+fn too_short() -> String {
+    format!("must be at least {MIN_SECRET_BYTES} bytes")
 }
 
 fn parse_turn(raw: RawTurn) -> Result<Turn, ConfigError> {
@@ -294,8 +299,8 @@ fn parse_turn(raw: RawTurn) -> Result<Turn, ConfigError> {
     let secret = raw
         .secret
         .ok_or_else(|| invalid("turn.secret", "is required when turn is set"))?;
-    if secret.len() < 32 {
-        return Err(invalid("turn.secret", "must be at least 32 bytes"));
+    if secret.len() < MIN_SECRET_BYTES {
+        return Err(invalid("turn.secret", too_short()));
     }
     let ttl_s = raw.ttl_s.unwrap_or(DEFAULT_TURN_TTL_S);
     if !(300..=86_400).contains(&ttl_s) {
@@ -335,7 +340,7 @@ mod tests {
     use super::*;
 
     fn base() -> String {
-        r#"{"public_origin":"https://relay.example.com","token":"tok-one","admin_token":"adm-one"}"#
+        r#"{"public_origin":"https://relay.example.com","token":"tok-one-0123456789012345678901234567","admin_token":"adm-one-0123456789012345678901234567"}"#
             .to_string()
     }
 
@@ -403,13 +408,16 @@ mod tests {
     #[test]
     fn env_overrides_both_secrets() {
         let env = |name: &str| match name {
-            ENV_TOKEN => Some("env-token".to_string()),
-            ENV_ADMIN_TOKEN => Some("env-admin".to_string()),
+            ENV_TOKEN => Some("env-token-0123456789012345678901234567".to_string()),
+            ENV_ADMIN_TOKEN => Some("env-admin-0123456789012345678901234567".to_string()),
             _ => None,
         };
         let cfg = parse_config(&base(), &env).unwrap();
-        assert_eq!(cfg.token.expose(), "env-token");
-        assert_eq!(cfg.admin_token.expose(), "env-admin");
+        assert_eq!(cfg.token.expose(), "env-token-0123456789012345678901234567");
+        assert_eq!(
+            cfg.admin_token.expose(),
+            "env-admin-0123456789012345678901234567"
+        );
     }
 
     #[test]
@@ -417,6 +425,14 @@ mod tests {
         let env = |name: &str| (name == ENV_TOKEN).then(String::new);
         let message = error_text(parse_config(&base(), &env));
         assert!(message.contains(ENV_TOKEN), "{message}");
+    }
+
+    #[test]
+    fn a_secret_below_the_minimum_length_is_refused_by_field() {
+        let short = base().replace("tok-one-0123456789012345678901234567", "short");
+        let message = error_text(parse(&short));
+        assert!(message.starts_with("token:"), "{message}");
+        assert!(message.contains(&MIN_SECRET_BYTES.to_string()), "{message}");
     }
 
     #[test]
@@ -429,8 +445,14 @@ mod tests {
     fn debug_output_never_shows_secrets() {
         let cfg = parse(&base()).unwrap();
         let shown = format!("{cfg:?}");
-        assert!(!shown.contains("tok-one"), "{shown}");
-        assert!(!shown.contains("adm-one"), "{shown}");
+        assert!(
+            !shown.contains("tok-one-0123456789012345678901234567"),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("adm-one-0123456789012345678901234567"),
+            "{shown}"
+        );
     }
 
     #[test]

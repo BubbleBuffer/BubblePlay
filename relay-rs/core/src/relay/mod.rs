@@ -39,6 +39,7 @@ pub use types::{
     PcListing, Reject, Route, SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig,
     UpgradeRequest, Upgraded,
 };
+pub use util::ct_eq;
 
 /// The routing state for one relay.
 pub struct Relay {

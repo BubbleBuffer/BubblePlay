@@ -60,8 +60,8 @@ are an error. Every validation error names the field it is about.
 | `listen` | `0.0.0.0:8080` | An IP address and port. Host names are not accepted. |
 | `assets_dir` | `/assets` | The static files. |
 | `state_dir` | `/data` | Where `pcs.json` and `gate.json` live. |
-| `token` | required | The first-registration ticket. `BP_RELAY_TOKEN` overrides it. |
-| `admin_token` | required | Bearer token for `/healthz` from outside loopback. `BP_RELAY_ADMIN_TOKEN` overrides it. |
+| `token` | required | The first-registration ticket, at least 32 bytes (`MIN_SECRET_BYTES`). `BP_RELAY_TOKEN` overrides it. |
+| `admin_token` | required | Bearer token for `/healthz` from outside loopback and the admin API, at least 32 bytes. `BP_RELAY_ADMIN_TOKEN` overrides it. |
 | `max_connections` | `32` | At least 1. Enforced by the relay core. Pending sockets are capped separately (see below). |
 | `approval_ttl_s` | `90` | Must be 30 to 120 seconds. |
 | `trusted_proxy_cidrs` | `[]` | CIDR ranges of reverse proxies. `X-Forwarded-For` is read only when the direct peer is in one of them. |

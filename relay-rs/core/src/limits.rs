@@ -28,6 +28,9 @@ pub const FILE_HEADER_BYTES: usize = 16;
 /// 16-byte packet header.
 pub const FILE_LIMIT: usize = 64 * 1024 + FILE_HEADER_BYTES;
 
+/// The shortest bearer secret an adapter accepts (RELAY_TOKEN, ADMIN_TOKEN, TURN secret), in bytes.
+pub const MIN_SECRET_BYTES: usize = 32;
+
 /// Hello and any other pre-authentication message: 16 KiB.
 pub const HELLO_LIMIT: usize = 16 * 1024;
 

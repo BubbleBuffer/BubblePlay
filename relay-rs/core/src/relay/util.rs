@@ -23,9 +23,9 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Constant-time equality for secrets. Lengths are compared first, as
-/// crypto/subtle does.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time equality for secrets, the one comparison every bearer, token and ticket check
+/// uses. Lengths are compared first, as crypto/subtle does.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
