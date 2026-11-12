@@ -202,7 +202,7 @@ impl Server {
             // desktop-bound resources/releases held input before stopping server.
             let result = result
                 .map_err(anyhow::Error::from)
-                .and_then(|_| self.host_session(&mut file));
+                .and_then(|_| self.host_session(&mut file, version));
             self.ended.store(true, Ordering::Release);
             result
         })();
@@ -210,7 +210,8 @@ impl Server {
             tracing::info!(error=%e,"secure helper connection closed");
         }
     }
-    fn host_session(&self, file: &mut File) -> Result<()> {
+    fn host_session(&self, file: &mut File, version: u16) -> Result<()> {
+        let elevated = version >= protocol::ELEVATED_FOREGROUND_VERSION;
         let _desktop_switches = desktop::SwitchWatcher::new()?;
         let (mapping, name) = Mapping::create(&self.sid, self.session)?;
         protocol::write(file, &Message::Mapping { name })?;
@@ -456,7 +457,13 @@ impl Server {
                     epoch = epoch
                         .checked_add(1)
                         .ok_or_else(|| anyhow::anyhow!("desktop epoch exhausted"))?;
-                    worker = Some(Worker::spawn(self.session, self.sid.clone(), r, epoch));
+                    worker = Some(Worker::spawn(
+                        self.session,
+                        self.sid.clone(),
+                        r,
+                        epoch,
+                        elevated,
+                    ));
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
