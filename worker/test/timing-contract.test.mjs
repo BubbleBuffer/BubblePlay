@@ -6,6 +6,7 @@ import {
   RECYCLED_AUTH_TIMEOUT_MAX_MS, RECYCLED_AUTH_TIMEOUT_MS, SIGNALING_ANSWER_LIMIT_MS, SUSPEND_GAP_MS,
   connectTimeoutMs, recycledAuthTimeoutMs,
 } from "../public/recovery.js";
+import { AUTH_TIMEOUT_MS } from "../public/dk-session.js";
 import { V4_BACKOFF_MAX_MS, V4_BACKOFF_MIN_MS, V4_HEARTBEAT_MS, nextBackoffMsV4 } from "../public/media-v4.js";
 
 // fixtures/session-timing-contract.json, "browser" section: the viewer's timers and retry schedules.
@@ -21,6 +22,7 @@ test("browser timers match the timing contract", () => {
   assert.equal(MEDIA_ANSWER_LIMIT_MS, values.mediaAnswerLimitMs);
   assert.equal(SUSPEND_GAP_MS, values.suspendGapMs);
   assert.equal(RECOVERY_BUDGET_MS, values.recoveryBudgetMs);
+  assert.equal(AUTH_TIMEOUT_MS, values.authHostTimeoutMs);
 });
 
 test("browser media backoff follows the contract schedule", () => {

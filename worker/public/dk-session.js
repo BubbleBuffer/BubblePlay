@@ -14,7 +14,7 @@ const LOG_TYPES = new Set(["logs-state", "logs-ack", "feedback-ack"]);
 // Host monitor snapshots: delivered to onPreviewMessage only when both sides negotiated
 // monitor-previews-v1, ignored otherwise.
 const PREVIEW_TYPES = new Set(["monitor-preview"]);
-const AUTH_TIMEOUT_MS = 10_000;
+export const AUTH_TIMEOUT_MS = 10_000;
 const BINARY_KINDS = new Set(["cursor", "input"]);
 
 export function browserDeviceName(nav = globalThis.navigator) {
