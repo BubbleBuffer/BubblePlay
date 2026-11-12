@@ -15,6 +15,7 @@ import {
   splitRecovery,
   rtcPeerEndAction,
 } from "/recovery.js";
+import { createOnceReporter } from "/report.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
@@ -108,7 +109,7 @@ function replaceTransferredSharpCanvas() {
 }
 
 function releaseWebRtcVideoSink() {
-  try { decoder?.close(); } catch {}
+  try { decoder?.close(); } catch { /* already closed */ }
   decoder = null;
   if (encodedWorker) {
     encodedWorker.terminate();
@@ -775,10 +776,8 @@ let everAuthenticated = false;
 let recoveryLossMs = null;
 let recoverySuspendedAtLossMs = 0;
 const suspendTracker = createSuspendTracker();
-try {
-  document.addEventListener("freeze", () => suspendTracker.freeze(performance.now()));
-  document.addEventListener("resume", () => suspendTracker.resume(performance.now()));
-} catch {}
+document.addEventListener("freeze", () => suspendTracker.freeze(performance.now()));
+document.addEventListener("resume", () => suspendTracker.resume(performance.now()));
 let recoveryBudgetStartMs = null;
 let recoveryAttempts = 0;
 // Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
@@ -814,7 +813,9 @@ function sendInput(data, channel) {
   if (!authenticatedSession?.mediaReady) return false;
   if (desktopInputState !== "enabled") return false;
   if (!desktopAvailable || desktopAwaitingFrame) return false;
-  if (!usingWssMedia && authenticatedSession.rtcReady && channel?.readyState === "open") try { channel.send(data); return true; } catch {}
+  if (!usingWssMedia && authenticatedSession.rtcReady && channel?.readyState === "open") {
+    try { channel.send(data); return true; } catch (error) { reportOnce("input-channel-send-failed", error); }
+  }
   // The WSS media fallback deliberately keeps input/cursor on /ws.
   if (usingWssMedia && signalingRegistered && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount <= 16_384) return authenticatedSession.sendInput(data);
   return false;
@@ -925,6 +926,7 @@ function recordSignalingError(kind, message, detail = null) {
 }
 
 // Viewer events go to the local browser log (dk-log.js). Phase B uploads them to the PC.
+const reportOnce = createOnceReporter((level, event, detail) => viewerLog(level, event, detail));
 function viewerLog(level, event, detail = {}) {
   globalThis.BPLog?.log(level, "receiver", event, { attempt: diagnosticAttemptId, build: clientBuild,
     transport: requestedTransport, codec: codecSession.codec, ...detail });
@@ -1065,7 +1067,7 @@ function armConnectTimeout(socket, generation) {
     socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
     ws = null;
     signalingGeneration++;
-    try { socket.close(); } catch {}
+    try { socket.close(); } catch { /* already closed */ }
     reconnectSignaling("connect-timeout");
   }, waitedMs);
 }
@@ -1119,7 +1121,7 @@ function recycleSignaling(reason) {
   authenticatedSession?.close();
   authenticatedSession = null;
   signalingGeneration++;
-  try { socket?.close(1000, reason); } catch {}
+  try { socket?.close(1000, reason); } catch { /* already closed */ }
   reconnectSignaling(reason);
 }
 
@@ -1171,7 +1173,7 @@ async function handleSignal(socket, generation, ev) {
                 isActive: () => current() && authenticatedSession === session && ws?.readyState === WebSocket.OPEN });
               logUploader.start();
             }
-          } catch (error) { try { globalThis.BPLog?.warn("receiver", "log upload did not start", { cause: String(error?.message ?? error).slice(0, 160) }); } catch {} }
+          } catch (error) { try { globalThis.BPLog?.warn("receiver", "log upload did not start", { cause: String(error?.message ?? error).slice(0, 160) }); } catch { /* logging never breaks the viewer */ } }
           sendStreamMode("signaling-start");
           if (wssSelected) requestWssMediaStart();
           else startPeer(peerGeneration);
@@ -1383,7 +1385,7 @@ function endAuthenticatedSession(refusal) {
   setFileTransferAvailable(false);
   hudState.ws = "error";
   hud.classList.add("bad");
-  try { socket?.close(1000, "session-ended"); } catch {}
+  try { socket?.close(1000, "session-ended"); } catch { /* already closed */ }
   sessionGate?.showRefusal({ ...refusal, actionLabel: "Back to PCs", onAction: () => location.assign(pcListUrl(location.href)) });
 }
 
@@ -1399,7 +1401,7 @@ function updateAuthenticatedInputReady() {
 function openAuthenticatedMedia() {
   if (!authenticatedSession?.mediaReady) return;
   sessionGate?.hide();
-  if (!sessionTouched && sessionPc) { sessionTouched = true; touchPc(sessionPc).catch(() => {}); }
+  if (!sessionTouched && sessionPc) { sessionTouched = true; touchPc(sessionPc).catch(() => { /* the last-used stamp is cosmetic */ }); }
   if (!wssSelected && !usingWssMedia) {
     const tracks = pendingRtcTracks;
     pendingRtcTracks = [];
@@ -1465,14 +1467,14 @@ function cleanupPeer() {
   cursorAppearance.reset();
   inputReady = false;
   connected = false;
-  try { dc?.close(); } catch {}
-  try { motionDc?.close(); } catch {}
+  try { dc?.close(); } catch { /* already closed */ }
+  try { motionDc?.close(); } catch { /* already closed */ }
   dc = null;
   motionDc = null;
-  try { pc?.close(); } catch {}
+  try { pc?.close(); } catch { /* already closed */ }
   pc = null;
   closingPeer = false;
-  try { decoder?.close(); } catch {}
+  try { decoder?.close(); } catch { /* already closed */ }
   decoder = null;
   if (encodedWorker) {
     encodedWorker.terminate();
@@ -1502,7 +1504,7 @@ function stopWssMedia() {
   clearWssTimers();
   stopWssAudio();
   wssDecoderEpoch++;
-  try { wssV4.socket?.close(1000, "switch"); } catch {}
+  try { wssV4.socket?.close(1000, "switch"); } catch { /* already closed */ }
   Object.assign(wssV4, { socket: null, socketOpen: false, everOpened: false, hostPresent: false, reconnecting: false,
     backoffMs: 0, lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity });
   wssV4.gate.reset("start");
@@ -1604,7 +1606,7 @@ function openWssV4Socket() {
   };
   socket.onerror = () => {
     if (!current()) return;
-    try { socket.close(); } catch {}
+    try { socket.close(); } catch { /* already closed */ }
   };
 }
 
@@ -1709,7 +1711,7 @@ function startWssV4() {
     if (step === "ping") sendWssV4('{"type":"ping"}');
     else if (step === "dead") {
       viewerLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt), unansweredMs: Math.round(now - wssV4.pingSentMs) });
-      try { wssV4.socket?.close(4000, "silent"); } catch {}
+      try { wssV4.socket?.close(4000, "silent"); } catch { /* already closed */ }
     }
   }, 1_000);
   openWssV4Socket();
@@ -1978,7 +1980,7 @@ function resyncWssDecoder(reason) {
   clearWssKeyframeWatchdog();
   wssDecoderEpoch++;
   wssWorker?.post({ type: "resync", epoch: wssDecoderEpoch, reason });
-  try { decoder?.close(); } catch {} decoder = null;
+  try { decoder?.close(); } catch { /* already closed */ } decoder = null;
   latencyGuard.reset(reason);
   resetRenderPacing();
   wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
@@ -2046,11 +2048,11 @@ function endRtcPeerOnly(reason) {
   if (!pc) return;
   soundController.detachSink("rtc");
   closingPeer = true;
-  try { dc?.close(); } catch {}
-  try { motionDc?.close(); } catch {}
+  try { dc?.close(); } catch { /* already closed */ }
+  try { motionDc?.close(); } catch { /* already closed */ }
   dc = null;
   motionDc = null;
-  try { pc.close(); } catch {}
+  try { pc.close(); } catch { /* already closed */ }
   pc = null;
   closingPeer = false;
   rtcStartupFallback?.stop(); rtcStartupFallback = null;
@@ -2345,7 +2347,7 @@ async function startPeer(generation = peerGeneration) {
       transceiver.setCodecPreferences(codec);
     } else if (codecSession.codec === "hevc" && codecSession.fallbackToH264()) {
       offerSent = false;
-      try { candidate.close(); } catch {}
+      try { candidate.close(); } catch { /* already closed */ }
       startPeer(generation);
       return;
     }
@@ -2470,7 +2472,7 @@ export function endSession() {
   signalingRegistered = false;
   signalingPc = signalingTicket = null;
   signalingGeneration++;
-  try { socket?.close(1000, "session-ended"); } catch {}
+  try { socket?.close(1000, "session-ended"); } catch { /* already closed */ }
 }
 
 function showNotAdmitted(reason = "") {
@@ -2770,7 +2772,7 @@ function resetRenderPacing() {
   RENDER.cadenceMs = 16.67;
   RENDER.prevTs = null;
   RENDER.prevWall = 0;
-  for (const f of RENDER.queue) { try { f.frame.close(); } catch {} }
+  for (const f of RENDER.queue) { try { f.frame.close(); } catch { /* already closed */ } }
   RENDER.queue = [];
   RENDER.rafPending = false;
   lastRenderedTimestamp = null;
@@ -2833,7 +2835,7 @@ function onDecodedFrame(frame) {
       const stale = RENDER.queue.shift();
       retained = stale.frame !== frame;
       framePresentationTelemetry.noteRafCoalesced();
-      try { stale.frame.close(); } catch {}
+      try { stale.frame.close(); } catch { /* already closed */ }
     }
     if (!RENDER.rafPending) {
       RENDER.rafPending = true;
@@ -2842,7 +2844,7 @@ function onDecodedFrame(frame) {
   } catch (e) {
     hudState.dec = `render:${e.message}`;
   } finally {
-    if (!retained) { try { frame.close(); } catch {} }
+    if (!retained) { try { frame.close(); } catch { /* already closed */ } }
   }
 }
 
@@ -2854,7 +2856,7 @@ function renderTick() {
     // fresher frame arrives.
     while (RENDER.queue.length > 1) {
       framePresentationTelemetry.noteRafCoalesced();
-      try { RENDER.queue.shift().frame.close(); } catch {}
+      try { RENDER.queue.shift().frame.close(); } catch { /* already closed */ }
     }
     const front = RENDER.queue[0];
     if (!front) return;
@@ -3386,7 +3388,7 @@ function startNativeVideo(track, generation = peerGeneration) {
   }
   video.addEventListener("loadeddata", () => { if (video.videoWidth && video.videoHeight) markFirstFramePresented(); }, { once: true });
   video.addEventListener("playing", () => { if (video.videoWidth && video.videoHeight) markFirstFramePresented(); }, { once: true });
-  const tryPlay = () => video.play().catch(() => {});
+  const tryPlay = () => video.play().catch(() => { /* autoplay blocked: the next tap retries */ });
   tryPlay();
   // Mobile browsers (iOS especially) may refuse autoplay until a user
   // gesture; resume on the first tap anywhere.
@@ -3403,7 +3405,7 @@ function startEncodedStreams(receiver, generation = peerGeneration) {
     for (;;) {
       const { value: chunk, done } = await reader.read();
       if (done) break;
-      if (generation !== peerGeneration) { try { chunk.close(); } catch {} break; }
+      if (generation !== peerGeneration) { try { chunk.close(); } catch { /* already closed */ } break; }
       const metadata = typeof chunk.getMetadata === "function" ? chunk.getMetadata() : {};
       const wrapped = {
         type: chunk.type,
@@ -3463,7 +3465,7 @@ function followDecoderCodec(codec) {
   if (!codecSession.followBitstreamCodec(codec)) return;
   clearWssKeyframeWatchdog();
   wssDecoderEpoch++;
-  try { decoder?.close(); } catch {}
+  try { decoder?.close(); } catch { /* already closed */ }
   decoder = null;
   // Keep the admitted keyframe's generation and ordering gate. A full resync
   // would request another keyframe and discard the one that proves the codec.
@@ -3517,7 +3519,7 @@ function feedDecoder(chunk, generation) {
     const decoderEpoch = ++wssDecoderEpoch;
     decoder = new VideoDecoder({
       output: (frame) => {
-        if (decoderEpoch !== wssDecoderEpoch) { try { frame.close(); } catch {} return; }
+        if (decoderEpoch !== wssDecoderEpoch) { try { frame.close(); } catch { /* already closed */ } return; }
         clearWssKeyframeWatchdog();
         wssNoOutputFailures = 0;
         if (usingWssMedia && !debugFirstDecoderOutput) {
@@ -3575,7 +3577,7 @@ function feedDecoder(chunk, generation) {
     } catch (e) {
       viewerLog("error", "decoder-config-error", { message: String(e?.message || e), codec });
       hudState.dec = `cfg:${e.message}`;
-      try { decoder.close(); } catch {}
+      try { decoder.close(); } catch { /* already closed */ }
       decoder = null;
       if (usingWssMedia) noteWssFailure("configure-unsupported");
       return;
@@ -3688,7 +3690,7 @@ function drawFrame(frame, due = performance.now()) {
     hudState.presented = framesDrawn;
     if (usingWssMedia && metadata !== undefined) wssPresentedSequence = metadata.sequence >>> 0;
   } finally {
-    try { frame.close(); } catch {}
+    try { frame.close(); } catch { /* already closed */ }
   }
 }
 
@@ -3909,7 +3911,7 @@ function updateKeyboardLock() {
   if (!keyboard?.lock) return;
   // Fullscreen streams receive system shortcuts (Ctrl+W, Alt+Tab where the
   // browser allows it, Esc) instead of the local browser.
-  if (document.fullscreenElement && settings.keyboardLock) keyboard.lock().catch(() => {}); else keyboard.unlock?.();
+  if (document.fullscreenElement && settings.keyboardLock) keyboard.lock().catch(() => { /* lock refused: keys stay with the browser */ }); else keyboard.unlock?.();
 }
 document.addEventListener("fullscreenchange", updateKeyboardLock);
 
@@ -4230,7 +4232,7 @@ function showContextHint() {
   if (!hasPresentedFrame || !contextHint || !contextHintCopy) return;
   const mode = pointerMode === "game" ? "game" : "work";
   let dismissed = false;
-  try { dismissed = localStorage.getItem(`bp_hint_${mode}_dismissed`) === "1"; } catch {}
+  try { dismissed = localStorage.getItem(`bp_hint_${mode}_dismissed`) === "1"; } catch { /* storage unavailable */ }
   contextHint.hidden = dismissed;
   contextHint.dataset.mode = mode;
   contextHintCopy.textContent = mode === "game"
@@ -4455,7 +4457,7 @@ function dispatchGesture(actions) {
 // or outside the browser window still reach the mousemove handler (clamped
 // to the picture's edge, so the remote cursor reaches the monitor edge for
 // edge hold), and the release is never lost.
-inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "mouse" && pointerMode === "desktop") { try { inputSurface.setPointerCapture(e.pointerId); } catch {} } if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "mouse") mousePointerActive = false; if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
+inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "mouse" && pointerMode === "desktop") { try { inputSurface.setPointerCapture(e.pointerId); } catch { /* pointer is no longer active */ } } if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "mouse") mousePointerActive = false; if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointermove", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.move(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
 inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId,e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.cancel(e.pointerId)); releaseInput(); resetTouchCursor(); hudState.touch = "cancelled"; e.preventDefault(); });
@@ -4753,7 +4755,7 @@ document.getElementById("copy-diagnostics").onclick = async e => {
 document.getElementById("dismiss-context-hint").onclick = e => {
   e.stopPropagation();
   const mode = contextHint.dataset.mode === "game" ? "game" : "work";
-  try { localStorage.setItem(`bp_hint_${mode}_dismissed`, "1"); } catch {}
+  try { localStorage.setItem(`bp_hint_${mode}_dismissed`, "1"); } catch { /* storage unavailable */ }
   contextHint.hidden = true;
   inputSurface.focus({ preventScroll: true });
 };

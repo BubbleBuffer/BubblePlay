@@ -341,7 +341,7 @@
         };
         request.onsuccess = () => {
           db = request.result;
-          db.onversionchange = () => { try { db.close(); } catch { /* ignore */ } db = null; dbState = "memory"; };
+          db.onversionchange = () => { try { db.close(); } catch { /* already closed */ } db = null; dbState = "memory"; };
           loadStored(db);
         };
         request.onerror = request.onblocked = () => failDb();
@@ -467,7 +467,7 @@
             if (name in next) context[name] = idOrNull(next[name]);
           }
           if ("build" in next) extra.build = idOrNull(next.build);
-        } catch { /* ignore */ }
+        } catch { /* a hostile context object keeps the previous context */ }
       },
       context: () => ({ ...context, ...extra }),
       /** Registers a literal secret (a passphrase, a code) so it is replaced wherever it appears. */

@@ -174,11 +174,11 @@ export function createFeedback({ doc = globalThis.document, log = globalThis.BPL
       cancel.textContent = "Close";
       status.textContent = result?.persisted === false ? SAVED_MEMORY_TEXT : SAVED_TEXT;
       cancel.focus();
-      try { log.info("feedback", "report saved", { id: report.id, kind: report.kind, persisted: result?.persisted !== false }); } catch { /* ignore */ }
+      try { log.info("feedback", "report saved", { id: report.id, kind: report.kind, persisted: result?.persisted !== false }); } catch { /* logging never breaks feedback */ }
     } catch (error) {
       status.textContent = "This report could not be saved. Try again.";
       send.disabled = false;
-      try { log.warn("feedback", "report not saved", { cause: String(error?.message ?? error).slice(0, 160) }); } catch { /* ignore */ }
+      try { log.warn("feedback", "report not saved", { cause: String(error?.message ?? error).slice(0, 160) }); } catch { /* logging never breaks feedback */ }
     } finally {
       busy = false;
     }

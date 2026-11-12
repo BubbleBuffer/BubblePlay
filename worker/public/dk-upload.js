@@ -52,7 +52,7 @@ export function createLogUploader({
   const tried = new Set();
   const stats = { batches: 0, lines: 0, reports: 0 };
 
-  const note = (level, msg, fields) => { try { log?.log?.(level, "dk-upload", msg, fields); } catch { /* ignore */ } };
+  const note = (level, msg, fields) => { try { log?.log?.(level, "dk-upload", msg, fields); } catch { /* logging never breaks the uploader */ } };
   const describe = error => String(error?.message ?? error).slice(0, 160);
 
   function arm(delay) {
@@ -249,7 +249,7 @@ export function createLogUploader({
     reportInflight = null;
     if (message.status === "ok") {
       stats.reports++;
-      Promise.resolve().then(() => log.deleteReport(id)).then(() => { try { log.reportSent?.(id); } catch { /* ignore */ } })
+      Promise.resolve().then(() => log.deleteReport(id)).then(() => { try { log.reportSent?.(id); } catch { /* the sent notice never breaks the uploader */ } })
         .catch(error => note("warn", "sent report could not be removed", { cause: describe(error) }));
     } else {
       note("info", "report not accepted, it stays for the next connection", { status: String(message.status).slice(0, 16), reason: String(message.reason ?? "").slice(0, 80) });
@@ -283,9 +283,9 @@ export function createLogUploader({
   function stop() {
     if (stopped) return;
     stopped = true;
-    try { if (timer !== null) cancel(timer); } catch { /* ignore */ }
+    try { if (timer !== null) cancel(timer); } catch { /* timer already gone */ }
     timer = null;
-    try { unsubscribe?.(); } catch { /* ignore */ }
+    try { unsubscribe?.(); } catch { /* already unsubscribed */ }
     unsubscribe = null;
   }
 }
