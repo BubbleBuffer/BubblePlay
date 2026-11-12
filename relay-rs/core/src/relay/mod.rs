@@ -10,12 +10,14 @@
 
 mod forward;
 mod hello;
+mod host_hello;
 mod pairing;
 mod pcs;
 mod preauth;
 pub mod reasons;
 mod snapshot;
 mod state;
+mod tickets;
 mod types;
 mod util;
 
