@@ -37,7 +37,8 @@ import {
 import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
-import { SoundController, WssAudioPlayer, isAudioPacket, probeOpusDecode, soundButtonView, sumAudioStats } from "/audio.js";
+import { SoundController, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
+import { createWssAudioSession } from "/wss-audio.js";
 import { FileTransferClient } from "/file-client.js";
 import { touchPc } from "/devicekey-store.js";
 import { pcListUrl, registerProof, relayOrigin, viewerHello } from "/dk-relay.js";
@@ -182,11 +183,11 @@ let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: fal
 let hostCapabilitiesGeneration = 0;
 // Local PC sound (audio.js). Sinks: the WebRTC <audio> element and the WSS player.
 let hostAudioCapable = false; // host-capabilities.audio === 1
-let wssAudioPlayer = null;
-let wssAudioSinkAttached = false;
-let wssAudioRetired = sumAudioStats(); // counters from players already stopped
 let latestInboundAudio = null; // WebRTC inbound-rtp for the audio track
 const soundController = new SoundController({ target: document, onChange: () => renderSoundSlot() });
+const wssAudio = createWssAudioSession({
+  soundController, onRejected: () => recordWssPacketRejection("audio-invalid-packet"), log: viewerLog,
+});
 let hasPresentedFrame = false;
 let fileDropPresentedGeneration = null;
 let fileDropPresentedViewportRevision = null;
@@ -1475,7 +1476,7 @@ function stopWssMedia() {
   usingWssMedia = false;
   teardownWssWorker();
   clearWssTimers();
-  stopWssAudio();
+  wssAudio.stop();
   wssDecoderEpoch++;
   try { wssV4.socket?.close(1000, "switch"); } catch {}
   Object.assign(wssV4, { socket: null, socketOpen: false, everOpened: false, hostPresent: false, reconnecting: false,
@@ -1565,7 +1566,7 @@ function openWssV4Socket() {
     wssV4.socketOpen = false;
     wssV4.hostPresent = false;
     wssV4.socket = null;
-    stopWssAudio();
+    wssAudio.stop();
     hudState.ice = "wss v4 reconnecting";
     debugTrace("media-v4-close", { code: event.code, reason: event.reason || "", wasClean: event.wasClean });
     scheduleWssV4Reconnect("socket-close");
@@ -1579,7 +1580,7 @@ function openWssV4Socket() {
 function onWssV4Packet(data) {
   // BPA1 audio shares the media socket. It skips the v4 counters, ACK and gate.
   if (isAudioPacket(data)) {
-    onWssAudioPacket(data);
+    wssAudio.push(data);
     return;
   }
   wssMediaReceivedBytes += data.byteLength;
@@ -1619,48 +1620,12 @@ function onWssV4Packet(data) {
   });
 }
 
-function onWssAudioPacket(data) {
-  wssAudioPlayer ??= createWssAudioPlayer();
-  if (wssAudioPlayer.push(data) === "rejected") {
-    recordWssPacketRejection("audio-invalid-packet");
-    return;
-  }
-  if (!wssAudioSinkAttached) {
-    wssAudioSinkAttached = true;
-    const player = wssAudioPlayer;
-    soundController.attachSink("wss", {
-      start: () => player.resume(),
-      setMuted: muted => player.setMuted(muted),
-      stop: () => player.stop(),
-    });
-  }
-}
-
-function createWssAudioPlayer() {
-  return new WssAudioPlayer({
-    createContext: () => new AudioContext({ latencyHint: "interactive", sampleRate: 48000 }),
-    createDecoder: init => new AudioDecoder(init),
-    createChunk: init => new EncodedAudioChunk(init),
-    onError: error => viewerLog("warn", "wss-audio-error", { name: error?.name || "error" }),
-  });
-}
-
-function stopWssAudio() {
-  if (wssAudioPlayer) wssAudioRetired = sumAudioStats(wssAudioRetired, wssAudioPlayer.stats());
-  wssAudioPlayer?.stop();
-  wssAudioPlayer = null;
-  if (wssAudioSinkAttached) {
-    wssAudioSinkAttached = false;
-    soundController.detachSink("wss");
-  }
-}
-
 // Diagnostics: "off" without the host capability, otherwise the controller state.
 function audioSnapshot() {
   return {
     announced: hostAudioCapable,
     controller: hostAudioCapable ? soundController.state : "off",
-    wss: sumAudioStats(wssAudioRetired, wssAudioPlayer?.stats()),
+    wss: wssAudio.stats(),
     webrtc: latestInboundAudio ? { ...latestInboundAudio } : null,
   };
 }

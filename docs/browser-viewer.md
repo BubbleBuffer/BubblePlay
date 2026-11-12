@@ -91,3 +91,4 @@ Settings has two groups that matter here.
 - `composition-gate.js`: commits secure-desktop Android composition text once, through one pending transaction.
 - `connection-status.js`: pure model of the connection chip (state, label, tooltip, Admin warning).
 - `keyboard-draft.js`: the on-screen keyboard field: diffs the draft against what was sent, chunks text under the packet limit, and sends protected input only on a secure desktop.
+- `wss-audio.js`: the WSS audio player for one media session, its sound-controller sink, and cumulative counters across restarts.
