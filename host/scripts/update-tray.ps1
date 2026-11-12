@@ -207,6 +207,9 @@ if ($Build) {
     if ($PSCmdlet.ShouldProcess($manifest, 'cargo build --release (host + tray + admin agent + secure-desktop helper)')) {
         # Cargo reads .cargo/config.toml from the working directory, not the manifest's, so build from host/.
         Push-Location (Split-Path $manifest)
+        # Stamp the build identity: feedback reports read BUBBLEPLAY_COMMIT at compile time.
+        $commit = & git -C (Split-Path $manifest) rev-parse --short HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $commit) { $env:BUBBLEPLAY_COMMIT = $commit }
         try { & cargo build --offline --locked --release --manifest-path $manifest --bin bubbleplay-host --bin bubbleplay_tray --bin bubbleplay_admin_agent --bin bubbleplay_secure_helper }
         finally { Pop-Location }
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed with $LASTEXITCODE" }
@@ -262,11 +265,25 @@ elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $($changed -
     $previousDir = Join-Path $InstallDir 'previous'
     New-Item -ItemType Directory -Force -Path $previousDir | Out-Null
     $hostPreviousHash = $null
+    # A host still on probation (pending) or without a rollback (failed) has not proven itself: it must
+    # not become the rollback target, so the earlier known-good previous\ host stays in place.
+    $statePath = Join-Path $dataDir 'update-state.json'
+    $keptPreviousHash = $null
+    if ((Test-Path -LiteralPath $statePath) -and (Test-Path -LiteralPath (Join-Path $previousDir 'bubbleplay-host.exe'))) {
+        try { $oldState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { $oldState = $null }
+        if ($oldState -and @('pending', 'failed') -contains $oldState.status -and $oldState.previousHash) {
+            $keptPreviousHash = [string]$oldState.previousHash
+            Write-Warning "The installed host ($($oldState.status)) is unproven; keeping the earlier known-good host as the rollback target."
+        }
+    }
     foreach ($name in $changed) {
         $target = Join-Path $InstallDir $name
         $temp = "$target.new"
         Copy-Item -Force -LiteralPath $sources[$name] -Destination $temp
-        if ((Test-Path -LiteralPath $target) -and $Binaries -contains $name) {
+        if ($keptPreviousHash -and $name -eq 'bubbleplay-host.exe') {
+            $hostPreviousHash = $keptPreviousHash
+        }
+        elseif ((Test-Path -LiteralPath $target) -and $Binaries -contains $name) {
             # Keep exactly one previous build of each binary.
             $previous = Join-Path $previousDir $name
             Move-Item -Force -LiteralPath $target -Destination $previous
