@@ -32,6 +32,7 @@ pub use types::{
     Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, PcListing, Reject, Route,
     SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig, UpgradeRequest,
 };
+pub use util::ct_eq;
 
 /// The routing state for one relay.
 pub struct Relay {

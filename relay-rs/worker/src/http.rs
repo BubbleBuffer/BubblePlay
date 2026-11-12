@@ -3,6 +3,7 @@
 //! bearer check, the gate's response mapping, the JSON admin responses and the security headers.
 
 use bp_relay_core::gate::Response as GateResponse;
+use bp_relay_core::relay::ct_eq;
 use worker::js_sys::{Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
@@ -67,21 +68,12 @@ fn host_without_port(value: &str) -> &str {
     }
 }
 
-/// True when `Authorization` is `Bearer <expected>`. The comparison visits every byte, so the
-/// time it takes does not depend on where the first difference is.
+/// True when `Authorization` is `Bearer <expected>`, compared in constant time.
 pub fn bearer_matches(authorization: Option<&str>, expected: &str) -> bool {
     let Some(presented) = authorization.and_then(|value| value.strip_prefix("Bearer ")) else {
         return false;
     };
-    let (presented, expected) = (presented.as_bytes(), expected.as_bytes());
-    if presented.len() != expected.len() {
-        return false;
-    }
-    presented
-        .iter()
-        .zip(expected)
-        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
+    ct_eq(presented.as_bytes(), expected.as_bytes())
 }
 
 /// `200 ok` for healthz. HEAD gets the same headers and no body.

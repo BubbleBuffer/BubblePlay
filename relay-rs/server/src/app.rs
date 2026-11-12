@@ -18,9 +18,8 @@ use bp_relay_core::gate::{
     Hold, HoldCheck, Prefix, Request as GateRequest, Response as GateResponse, Verdict,
 };
 use bp_relay_core::presence::PRESENCE_PATH;
-use bp_relay_core::relay::{AdminError, UpgradeRequest};
+use bp_relay_core::relay::{AdminError, UpgradeRequest, ct_eq};
 use serde_json::{Value, json};
-use subtle::ConstantTimeEq;
 use url::form_urlencoded;
 
 use crate::assets::serve_asset;
@@ -313,7 +312,7 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     else {
         return false;
     };
-    bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
+    ct_eq(presented.as_bytes(), expected.as_bytes())
 }
 
 /// The admin API, behind the admin bearer. Anything wrong with the bearer, the route or the id is

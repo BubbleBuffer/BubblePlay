@@ -5,6 +5,7 @@ use bp_device_key::relay_origin;
 use bp_relay_core::gate::{
     GATE_HOLD_MS, GateConfig, MAX_APPROVAL_TTL_SECS, MIN_APPROVAL_TTL_SECS, NtfyConfig,
 };
+use bp_relay_core::limits::MIN_SECRET_BYTES;
 use bp_relay_core::relay::{CoreConfig, TurnConfig};
 use worker::url::Host;
 use worker::{Env, Url};
@@ -125,8 +126,10 @@ fn turn_config(env: &Env) -> Result<TurnConfig, String> {
     }
     let secret = optional_secret(env, "TURN_SECRET")
         .ok_or_else(|| "TURN_SECRET is required when TURN is set".to_owned())?;
-    if secret.len() < 32 {
-        return Err("TURN_SECRET must be at least 32 bytes".to_owned());
+    if secret.len() < MIN_SECRET_BYTES {
+        return Err(format!(
+            "TURN_SECRET must be at least {MIN_SECRET_BYTES} bytes"
+        ));
     }
     let ttl_s = match optional_var(env, "TURN_TTL_S") {
         None => DEFAULT_TURN_TTL_S,
@@ -177,8 +180,8 @@ fn required_var(env: &Env, name: &str) -> Result<String, String> {
 
 fn required_secret(env: &Env, name: &str) -> Result<String, String> {
     let value = optional_secret(env, name).ok_or_else(|| format!("{name} is not set"))?;
-    if value.is_empty() {
-        return Err(format!("{name} is empty"));
+    if value.len() < MIN_SECRET_BYTES {
+        return Err(format!("{name} must be at least {MIN_SECRET_BYTES} bytes"));
     }
     Ok(value)
 }

@@ -9,8 +9,8 @@
 #   npx wrangler@4.148.0 delete -c wrangler.deploy.toml
 #
 # Secrets are not in this file. Set each with wrangler, which then prompts for the value:
-#   npx wrangler@4.148.0 secret put RELAY_TOKEN -c wrangler.deploy.toml    # registration token, required
-#   npx wrangler@4.148.0 secret put ADMIN_TOKEN -c wrangler.deploy.toml    # admin bearer token, required
+#   npx wrangler@4.148.0 secret put RELAY_TOKEN -c wrangler.deploy.toml    # registration token, at least 32 bytes, required
+#   npx wrangler@4.148.0 secret put ADMIN_TOKEN -c wrangler.deploy.toml    # admin bearer token, at least 32 bytes, required
 #   npx wrangler@4.148.0 secret put TURN_SECRET -c wrangler.deploy.toml    # needed when TURN_HOST is set, 32 bytes or more
 #   npx wrangler@4.148.0 secret put NTFY_TOKEN -c wrangler.deploy.toml     # optional, for ntfy approval pushes
 
