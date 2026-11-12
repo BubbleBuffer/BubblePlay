@@ -38,6 +38,7 @@ import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyN
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
 import { SoundController, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
+import { formatHud } from "/hud-text.js";
 import { createWssAudioSession } from "/wss-audio.js";
 import { FileTransferClient } from "/file-client.js";
 import { touchPc } from "/devicekey-store.js";
@@ -701,22 +702,11 @@ function renderConnectionStatus() {
   document.getElementById("session-strip").classList.toggle("status-warning", !!warning);
 }
 let connectionStatusDetail = "Connecting…";
-function qualityHudText() {
-  if (!hostQuality) return "quality …";
-  const target = `${Math.round(hostQuality.targetBitrateBps / 1_000)}k`;
-  const bwe = hostQuality.bweBps === null ? "…" : `${Math.round(hostQuality.bweBps / 1_000)}k`;
-  return `quality ${hostQuality.profile} ${hostQuality.width}x${hostQuality.height}@${hostQuality.fps} ${target}/${bwe} ${hostQuality.reason}`;
-}
 setInterval(() => {
   if (cursorReconciler?.feedbackAt !== null && cursorReconciler?.feedbackAt !== undefined) hudState.cursorAge = Math.round(performance.now()-cursorReconciler.feedbackAt);
-  hud.innerHTML =
-    `ws ${hudState.ws} | ice ${hudState.ice} | route ${hudState.route} | control ${hudState.control} motion ${hudState.motion}\n` +
-    `zoom ${hudState.zoom}× | pointer ${hudState.pointer} ${hudState.cursorSeq} ${hudState.cursorAge}ms | motion ${hudState.motionSent}/${hudState.motionCoalesced}/${hudState.motionDropped} | touch ${hudState.touch}\n` +
-    `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
-    `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
-    `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps\n` +
-    `${clientBuild} | ${fullFrameDiagnostic ? "full-frame" : "sharp-zoom"} | media g${hudState.mediaGeneration} | view ${sharpSession.telemetry.state} r${sharpSession.telemetry.revision} ${sharpSession.telemetry.crop}\n` +
-    qualityHudText();
+  hud.innerHTML = formatHud(hudState, {
+    clientBuild, fullFrame: fullFrameDiagnostic, sharp: sharpSession.telemetry, hostQuality,
+  });
   if (diagnosticsOutput && diagnosticsVisible) diagnosticsOutput.textContent = diagnosticsReport();
   renderConnectionStatus();
 }, 250);
