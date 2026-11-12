@@ -23,9 +23,8 @@
       "firstFrameWatchdogMs": 5000
     },
     "unpinned": {
-      "signalingReconnect": "literal 250 in receiver.js (setTimeout(connect, 250))",
+      "signalingReconnect": "literal 250 in receiver.js (setTimeout(connect, 250)); naming it breaks the vm-sliced receiver tests, which stub every identifier the sliced function uses",
       "keyframeThrottleMs": "literal 250 in receiver.js; media-v4.js exports V4_KEYFRAME_REQUEST_INTERVAL_MS but receiver.js does not use it",
-      "authHostTimeoutMs": "AUTH_TIMEOUT_MS in dk-session.js is not exported",
       "firstFrameWatchdogMs": "literal 5_000 in receiver.js"
     }
   },
