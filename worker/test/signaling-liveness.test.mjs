@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { SIGNALING_ANSWER_LIMIT_MS, signalingUnanswered } from "../public/recovery.js";
+import { MEDIA_ANSWER_LIMIT_MS, SIGNALING_ANSWER_LIMIT_MS, mediaHeartbeatStep, signalingUnanswered, createSuspendTracker, splitRecovery } from "../public/recovery.js";
 
 // Drives receiver.js's heartbeat rule on a fake clock: each tick checks, then pings
 // (keeping the oldest unanswered ping), exactly as the interval in receiver.js does.
@@ -51,4 +51,53 @@ test("signalingUnanswered needs an outstanding ping older than the limit", () =>
   assert.equal(signalingUnanswered({ pingSentMs: 100, inboundMs: 100, nowMs: 1e9 }), false);
   assert.equal(signalingUnanswered({ pingSentMs: 100, inboundMs: 99, nowMs: 100 + SIGNALING_ANSWER_LIMIT_MS - 1 }), false);
   assert.equal(signalingUnanswered({ pingSentMs: 100, inboundMs: 99, nowMs: 100 + SIGNALING_ANSWER_LIMIT_MS }), true);
+});
+
+// The WSS v4 media socket: a static desktop sends the viewer only a frame or so a minute while the
+// viewer acks every few seconds (acks are not modelled: only inbound traffic counts). Pings must not wait for the viewer to be quiet, or the socket is
+// closed as "silent" although the relay would answer. Drives the receiver's 1 s tick on a fake clock.
+function mediaSocket({ tickMs, relayAnswers }) {
+  const state = { pingSentMs: null, lastPingAt: 0, lastInboundAt: 0 };
+  let closedAt = null;
+  const hostFrameEveryMs = 60_000;
+  for (let now = 1_000; now < 30 * 60_000 && closedAt === null; now += tickMs) {
+    if (now % hostFrameEveryMs < tickMs) state.lastInboundAt = now;
+    const step = mediaHeartbeatStep(state, now, { heartbeatMs: 15_000 });
+    if (step === "dead") closedAt = now;
+    else if (step === "ping" && relayAnswers(now)) state.lastInboundAt = now + 80;
+  }
+  return closedAt;
+}
+
+test("a media socket the relay keeps answering is never closed, on a static desktop or in a throttled tab", () => {
+  for (const tickMs of [1_000, 60_000]) {
+    assert.equal(mediaSocket({ tickMs, relayAnswers: () => true }), null, `tick ${tickMs} ms`);
+  }
+});
+
+test("a media socket whose pings go unanswered is closed within the limit, as before", () => {
+  const deadFrom = 10 * 60_000;
+  const closedAt = mediaSocket({ tickMs: 1_000, relayAnswers: now => now < deadFrom });
+  const after = closedAt - deadFrom;
+  assert.ok(after > 0 && after <= 15_000 + MEDIA_ANSWER_LIMIT_MS + 1_000, `closed ${after} ms after the last pong`);
+});
+
+test("recovery time excludes frozen and suspended time, but not a throttled hidden tab", () => {
+  // A throttled tab ticks once a minute: not suspended.
+  const throttled = createSuspendTracker();
+  for (let now = 0; now <= 600_000; now += 60_000) throttled.tick(now);
+  assert.equal(throttled.totalMs(600_000), 0);
+  // The PC sleeps 14 minutes between two ticks; recovery after waking takes 3.9 s.
+  const asleep = createSuspendTracker();
+  asleep.tick(0); asleep.tick(15_000);
+  const loss = asleep.totalMs(15_000);
+  asleep.tick(15_000 + 856_000);
+  assert.deepEqual(splitRecovery(856_700 + 3_900 - 700, asleep.totalMs(876_000) - loss),
+    { recoveryMs: 859_900, suspendedMs: 856_000, activeMs: 3_900 });
+  // A page freeze is counted from the events, and the tick gap after it is not counted twice.
+  const frozen = createSuspendTracker();
+  frozen.tick(0); frozen.freeze(5_000);
+  assert.equal(frozen.totalMs(125_000), 120_000, "open freeze counts so far");
+  frozen.resume(125_000); frozen.tick(130_000);
+  assert.equal(frozen.totalMs(130_000), 120_000);
 });

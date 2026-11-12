@@ -539,6 +539,16 @@ pub struct RateDecision {
     pub reason: RateReason,
 }
 
+impl RateDecision {
+    /// Worth an info log line: a delay or skip signal, or a cut to under 80 % of the previous
+    /// rate (a collapse onto a constrained link). Stepping up and gentle capacity tracking are
+    /// routine and log at debug.
+    pub fn is_notable(&self) -> bool {
+        !matches!(self.reason, RateReason::Clean | RateReason::Capacity)
+            || self.bitrate_bps.saturating_mul(5) < self.previous_bps.saturating_mul(4)
+    }
+}
+
 /// Bitrate floor for a frame size: 2.5 Mbps at 1080p, scaled by pixels.
 pub fn rate_floor_for_pixels(width: u32, height: u32) -> u64 {
     let pixels = u64::from(width) * u64::from(height);
@@ -1529,23 +1539,34 @@ fn record_rate_decision(shared: &mut Shared, decision: Option<RateDecision>) {
     let Some(decision) = decision else {
         return;
     };
-    info!(
-        bitrate_bps = decision.bitrate_bps,
-        previous_bps = decision.previous_bps,
-        reason = decision.reason.as_str(),
-        capacity_bps = shared
-            .capacity
-            .capacity()
-            .map_or(0, |capacity| capacity.bps),
-        rate_cap_bps = shared
-            .capacity
-            .rate_cap()
-            .map_or(0, |capacity| capacity.bps),
-        last_rtt_ms = shared.stats.last_rtt_ms,
-        min_rtt_ms = shared.rate.min_rtt_ms().unwrap_or(0.0),
-        floor_bps = shared.rate.floor_bps(),
-        "WSS v4 rate decision"
-    );
+    // Probing up and small capacity tracking happen every second or so (27k info lines in two
+    // days): only a real signal or a collapse stays at info.
+    macro_rules! log_decision {
+        ($level:ident) => {
+            $level!(
+                bitrate_bps = decision.bitrate_bps,
+                previous_bps = decision.previous_bps,
+                reason = decision.reason.as_str(),
+                capacity_bps = shared
+                    .capacity
+                    .capacity()
+                    .map_or(0, |capacity| capacity.bps),
+                rate_cap_bps = shared
+                    .capacity
+                    .rate_cap()
+                    .map_or(0, |capacity| capacity.bps),
+                last_rtt_ms = shared.stats.last_rtt_ms,
+                min_rtt_ms = shared.rate.min_rtt_ms().unwrap_or(0.0),
+                floor_bps = shared.rate.floor_bps(),
+                "WSS v4 rate decision"
+            );
+        };
+    }
+    if decision.is_notable() {
+        log_decision!(info);
+    } else {
+        log_decision!(debug);
+    }
     shared.events.bitrate_bps = Some(decision.bitrate_bps);
     shared.events.bitrate_reason = Some(decision.reason.as_str());
     if let Some(activity) = &shared.producer_activity {
@@ -2085,6 +2106,23 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;
+
+    #[test]
+    fn only_signals_and_collapses_are_notable_rate_decisions() {
+        let decision = |previous_bps, bitrate_bps, reason| RateDecision {
+            bitrate_bps,
+            previous_bps,
+            reason,
+        };
+        // Probing up and gentle capacity tracking are routine.
+        assert!(!decision(4_800_000, 6_000_000, RateReason::Clean).is_notable());
+        assert!(!decision(2_000_000, 2_500_000, RateReason::Capacity).is_notable());
+        assert!(!decision(6_000_000, 5_000_000, RateReason::Capacity).is_notable());
+        // A collapse onto a constrained link, delay growth and skipped frames are not.
+        assert!(decision(6_000_000, 500_000, RateReason::Capacity).is_notable());
+        assert!(decision(6_000_000, 4_800_000, RateReason::SustainedSkips).is_notable());
+        assert!(decision(5_000_000, 4_900_000, RateReason::RttGrowth).is_notable());
+    }
 
     fn idle_shared(now: Instant) -> Shared {
         Shared {

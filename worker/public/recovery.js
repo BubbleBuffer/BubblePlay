@@ -14,6 +14,53 @@ export function signalingUnanswered({ pingSentMs, inboundMs, nowMs, limitMs = SI
   return pingSentMs !== null && inboundMs < pingSentMs && nowMs - pingSentMs >= limitMs;
 }
 
+// The WSS v4 media socket gets the same rule. The viewer pings it every heartbeat whatever else it
+// sends (its acks used to postpone the ping, leaving a static desktop with no inbound traffic but
+// the host's rare frames: healthy sockets were closed as silent), and the relay answers each ping.
+// The socket is dead only when a ping stays unanswered this long, counted from the oldest
+// unanswered ping. Hidden-tab timer throttling only spaces the pings out, so it never trips it.
+// 25 s after a ping that follows 15 s of quiet is the old 40 s of silence.
+export const MEDIA_ANSWER_LIMIT_MS = 25_000;
+/** One heartbeat tick on `state` ({ pingSentMs, lastPingAt, lastInboundAt }): "ping", "dead" or "none". */
+export function mediaHeartbeatStep(state, nowMs, { heartbeatMs, limitMs = MEDIA_ANSWER_LIMIT_MS }) {
+  if (signalingUnanswered({ pingSentMs: state.pingSentMs, inboundMs: state.lastInboundAt, nowMs, limitMs })) return "dead";
+  if (nowMs - state.lastPingAt < heartbeatMs) return "none";
+  state.lastPingAt = nowMs;
+  if (state.pingSentMs === null || state.lastInboundAt >= state.pingSentMs) state.pingSentMs = nowMs;
+  return "ping";
+}
+
+// Time the page was frozen or the PC asleep must not count as recovery time ("recovered after
+// 856700 ms" after a lid close, when the real recovery took 3.9 s). The tracker adds up suspended
+// time from two sources: Page Lifecycle freeze/resume, and a gap between two ticks of the 15 s
+// heartbeat longer than a throttled hidden tab can explain (its timers still fire about once a
+// minute). Times are performance.now() milliseconds.
+export const SUSPEND_GAP_MS = 90_000;
+export function createSuspendTracker({ gapMs = SUSPEND_GAP_MS } = {}) {
+  let lastTick = null, frozenAt = null, total = 0;
+  return {
+    /** Call on every heartbeat tick. */
+    tick(nowMs) {
+      if (frozenAt === null && lastTick !== null && nowMs - lastTick > gapMs) total += nowMs - lastTick;
+      lastTick = nowMs;
+    },
+    freeze(nowMs) { if (frozenAt === null) frozenAt = nowMs; },
+    resume(nowMs) {
+      if (frozenAt === null) return;
+      total += nowMs - frozenAt;
+      frozenAt = null;
+      lastTick = nowMs; // the gap that follows is already counted
+    },
+    /** Suspended milliseconds so far (an open freeze counts up to `nowMs`). */
+    totalMs(nowMs) { return total + (frozenAt === null ? 0 : nowMs - frozenAt); },
+  };
+}
+/** Split a recovery into wall-clock, suspended and active milliseconds. */
+export function splitRecovery(wallMs, suspendedMs) {
+  const suspended = Math.min(Math.max(Math.round(suspendedMs), 0), Math.round(wallMs));
+  return { recoveryMs: Math.round(wallMs), suspendedMs: suspended, activeMs: Math.round(wallMs) - suspended };
+}
+
 // A failed WebRTC transport can leave the host's old RTC epoch alive long
 // enough to consume and ignore a replacement offer. Recycling signaling makes
 // the relay notify the host first, so both sides converge on a fresh epoch.

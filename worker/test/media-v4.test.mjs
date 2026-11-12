@@ -109,6 +109,9 @@ test("receiver wires v4: media-socket keyframes, in-order decode, reconnect back
   assert.match(source, /shouldPresentDecodedV4\(/);
   assert.match(source, /Connected · WSS \(static\)/);
   assert.match(source, /recycleSignaling\("signaling-silent"\);[\s\S]{0,200}sendRelay\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
+  // The media heartbeat pings on its own clock: the viewer's acks (lastSendAt) must not postpone it.
+  assert.match(source, /mediaHeartbeatStep\(wssV4, now, \{ heartbeatMs: V4_HEARTBEAT_MS \}\)/);
+  assert.doesNotMatch(source, /now - wssV4\.lastSendAt >= V4_HEARTBEAT_MS/);
   // v4 has no deadline expiry timer.
   assert.match(source, /\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*startWssV4\(\);/);
 });

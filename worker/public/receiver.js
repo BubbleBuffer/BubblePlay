@@ -10,6 +10,9 @@ import {
   shouldRetryOnWake,
   shouldRetryAuthTimeout,
   signalingUnanswered,
+  mediaHeartbeatStep,
+  createSuspendTracker,
+  splitRecovery,
   rtcPeerEndAction,
 } from "/recovery.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
@@ -772,6 +775,12 @@ let terminalSignalingFailure = false;
 // authentication. recoveryAttempts: signaling connections opened since the loss.
 let everAuthenticated = false;
 let recoveryLossMs = null;
+let recoverySuspendedAtLossMs = 0;
+const suspendTracker = createSuspendTracker();
+try {
+  document.addEventListener("freeze", () => suspendTracker.freeze(performance.now()));
+  document.addEventListener("resume", () => suspendTracker.resume(performance.now()));
+} catch {}
 let recoveryBudgetStartMs = null;
 let recoveryAttempts = 0;
 // Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
@@ -854,7 +863,7 @@ let wssStartupRecoveries = 0;
 // WSS v4 single-socket session state.
 const wssV4 = {
   gate: new V4ReceiveGate(), socket: null, socketOpen: false, everOpened: false, hostPresent: false,
-  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, lastSendAt: 0, lastInboundAt: 0,
+  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, lastSendAt: 0, lastInboundAt: 0, lastPingAt: 0, pingSentMs: null,
   lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity,
   presentSkips: 0, gateDrops: 0, frames: 0,
 };
@@ -926,7 +935,7 @@ function viewerLog(level, event, detail = {}) {
 function noteConnectionLoss() {
   if (!everAuthenticated) return;
   const now = performance.now();
-  if (recoveryLossMs === null) { recoveryLossMs = now; recoveryAttempts = 0; }
+  if (recoveryLossMs === null) { recoveryLossMs = now; recoveryAttempts = 0; recoverySuspendedAtLossMs = suspendTracker.totalMs(now); }
   if (recoveryBudgetStartMs === null) recoveryBudgetStartMs = now;
 }
 
@@ -942,11 +951,13 @@ function sessionAuthTimeoutMs() {
 
 function noteRecovered() {
   if (recoveryLossMs === null) return;
-  const recoveryMs = Math.round(performance.now() - recoveryLossMs);
+  const now = performance.now();
+  // Frozen or suspended time is reported apart: activeMs is what the recovery target measures.
+  const { recoveryMs, suspendedMs, activeMs } = splitRecovery(now - recoveryLossMs, suspendTracker.totalMs(now) - recoverySuspendedAtLossMs);
   const attempts = recoveryAttempts;
   recoveryLossMs = recoveryBudgetStartMs = null;
   recoveryAttempts = 0;
-  viewerLog("info", `recovered after ${recoveryMs} ms, ${attempts} attempts`, { recoveryMs, attempts });
+  viewerLog("info", `recovered after ${activeMs} ms, ${attempts} attempts`, { recoveryMs, activeMs, suspendedMs, attempts });
 }
 
 // A failed session. A silent PC on a recycled session retries on a new signaling connection while
@@ -1344,6 +1355,7 @@ async function addRemoteIce(candidate, generation, ice) {
 // Keep the relay's WebSocket alive (15 s idle heartbeat, same as the host), and
 // recycle it silently when the relay stops answering (recovery.js signalingUnanswered).
 setInterval(() => {
+  suspendTracker.tick(performance.now());
   if (!signalingRegistered) return;
   const now = performance.now();
   if (signalingUnanswered({ pingSentMs: signalingPingSentMs, inboundMs: signalingInboundMs, nowMs: now })) {
@@ -1552,7 +1564,8 @@ function openWssV4Socket() {
   socket.onopen = () => {
     if (!current()) return;
     socket.send(JSON.stringify({ type: "hello", role: "media-viewer", ticket }));
-    wssV4.lastSendAt = wssV4.lastInboundAt = performance.now();
+    wssV4.lastSendAt = wssV4.lastInboundAt = wssV4.lastPingAt = performance.now();
+    wssV4.pingSentMs = null;
   };
   socket.onmessage = (event) => {
     if (!current()) return;
@@ -1691,10 +1704,13 @@ function startWssV4() {
   wssV4.heartbeatTimer = setInterval(() => {
     if (!usingWssMedia) return;
     const now = performance.now();
-    if (wssV4.socketOpen && now - wssV4.lastSendAt >= V4_HEARTBEAT_MS) sendWssV4('{"type":"ping"}');
-    // The relay answers every heartbeat; silence means a half-open socket.
-    if (wssV4.socketOpen && now - wssV4.lastInboundAt > V4_HEARTBEAT_MS * 2 + 10_000) {
-      viewerLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt) });
+    if (!wssV4.socketOpen) return;
+    // The relay answers every heartbeat; a ping left unanswered means a half-open socket
+    // (recovery.js mediaHeartbeatStep). Acks and other traffic never postpone the ping.
+    const step = mediaHeartbeatStep(wssV4, now, { heartbeatMs: V4_HEARTBEAT_MS });
+    if (step === "ping") sendWssV4('{"type":"ping"}');
+    else if (step === "dead") {
+      viewerLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt), unansweredMs: Math.round(now - wssV4.pingSentMs) });
       try { wssV4.socket?.close(4000, "silent"); } catch {}
     }
   }, 1_000);

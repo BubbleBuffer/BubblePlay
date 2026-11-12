@@ -198,7 +198,9 @@ internal class SessionWire(
                     }
                 }
                 "ctl" -> {
-                    if (state != State.READY) return fail(SessionProblem.CONTROL_FAILED)
+                    // No ctl key exists before auth-host, so an earlier ctl was sealed for the previous
+                    // session of this pair (the PC had not yet seen the reconnect): drop it.
+                    if (state != State.READY) return Event.Ignored
                     val opened = channel!!.open(text)
                     // A refusal may be the first ctl: it must remain visible to the user.
                     if (opened.kind == "error") {

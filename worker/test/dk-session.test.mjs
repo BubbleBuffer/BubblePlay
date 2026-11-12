@@ -602,11 +602,24 @@ test("each failure cause gets its own plain text and a log line with the cause",
     await pin.session.receive(hs.messages.authHost);
     assert.equal(pin.events.failures[0].reason, "pc-key-changed");
     const stray = await harness();
-    await stray.session.receive({ type: "ctl", kind: "x", seq: 0, data: "AA" });
+    await stray.session.receive({ type: "plain-junk" });
     assert.equal(stray.events.failures[0].reason, "unexpected-message");
   } finally {
     globalThis.BPLog = previous;
   }
+});
+
+test("a ctl sealed for the previous session, arriving before auth-host, is dropped and the handshake still completes", async () => {
+  // After a signaling reconnect the PC may still send its old session's last ctl messages to the
+  // new socket before it answers auth-hello. They used to end the new session ("unexpected ctl").
+  const h = await harness();
+  await h.session.receive({ type: "ctl", kind: "cursor", seq: 7, data: "AA" });
+  await h.session.receive({ type: "ctl", kind: "x", seq: 8, data: "AA" });
+  assert.deepEqual(h.events.failures, []);
+  await h.authenticate();
+  assert.equal(h.events.authenticated, 1);
+  assert.deepEqual(h.events.failures, []);
+  h.session.close();
 });
 
 test("client-logs-v1 is advertised but optional; log messages are delivered only when both sides negotiated it", async () => {

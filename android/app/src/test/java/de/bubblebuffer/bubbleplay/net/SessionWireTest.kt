@@ -144,6 +144,13 @@ class SessionWireTest {
     }
 
     @Test
+    fun ctlOfThePreviousSessionBeforeAuthHostIsDroppedAndTheHandshakeCompletes() {
+        val s = Script().apply { admit() }
+        assertEquals(SessionWire.Event.Ignored, s.wire.receive("""{"type":"ctl","kind":"cursor","seq":7,"data":"AA"}"""))
+        assertEquals(SessionWire.Event.Authenticated, s.wire.receive(s.authHost))
+    }
+
+    @Test
     fun replayGapAndBadTagEndTheControlSession() {
         for (failure in listOf("replay", "gap", "tag")) {
             val s = Script().apply { authenticate() }
