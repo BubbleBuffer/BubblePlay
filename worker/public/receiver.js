@@ -6,14 +6,9 @@ import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateI
 import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
-  recycledAuthTimeoutMs,
-  connectTimeoutMs,
   shouldRetryOnWake,
-  shouldRetryAuthTimeout,
   signalingUnanswered,
   mediaHeartbeatStep,
-  createSuspendTracker,
-  splitRecovery,
   rtcPeerEndAction,
 } from "/recovery.js";
 import { createKeyboardDraft } from "/keyboard-draft.js";
@@ -39,6 +34,7 @@ import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
 import { SoundController, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
 import { formatHud } from "/hud-text.js";
+import { createRecoveryTracker } from "/recovery-tracker.js";
 import { createWssAudioSession } from "/wss-audio.js";
 import { FileTransferClient } from "/file-client.js";
 import { touchPc } from "/devicekey-store.js";
@@ -446,7 +442,7 @@ function markFirstFramePresented(presentedGeneration = null, presentedViewportRe
   if (firstFrameHandshake.presented) return true;
   if (usingWssMedia) wssStartupRecoveries = 0;
   firstFrameHandshake.presented = true;
-  noteRecovered();
+  recovery.noteRecovered();
   monitorPreviews.onFirstFrame();
   if (!usingWssMedia) {
     rtcStartupFallback?.stop();
@@ -733,20 +729,11 @@ let reconnectTimer = null;
 let pendingConnect = null;
 let connectTimer = null;
 let terminalSignalingFailure = false;
-// Recovery after a lost signaling connection. everAuthenticated: this page had a session before,
-// so a silent PC is retried (recovery.js). recoveryLossMs: clock time of the loss, kept until the
-// first frame is shown again. recoveryBudgetStartMs: start of the retry budget, restarted by each
-// authentication. recoveryAttempts: signaling connections opened since the loss.
-let everAuthenticated = false;
-let recoveryLossMs = null;
-let recoverySuspendedAtLossMs = 0;
-const suspendTracker = createSuspendTracker();
+const recovery = createRecoveryTracker({ now: () => performance.now(), log: (...args) => viewerLog(...args) });
 try {
-  document.addEventListener("freeze", () => suspendTracker.freeze(performance.now()));
-  document.addEventListener("resume", () => suspendTracker.resume(performance.now()));
+  document.addEventListener("freeze", () => recovery.freeze());
+  document.addEventListener("resume", () => recovery.resume());
 } catch {}
-let recoveryBudgetStartMs = null;
-let recoveryAttempts = 0;
 // Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
 let signalingPingSentMs = null;
 let signalingInboundMs = 0;
@@ -896,40 +883,12 @@ function viewerLog(level, event, detail = {}) {
     transport: requestedTransport, codec: codecSession.codec, ...detail });
 }
 
-function noteConnectionLoss() {
-  if (!everAuthenticated) return;
-  const now = performance.now();
-  if (recoveryLossMs === null) { recoveryLossMs = now; recoveryAttempts = 0; recoverySuspendedAtLossMs = suspendTracker.totalMs(now); }
-  if (recoveryBudgetStartMs === null) recoveryBudgetStartMs = now;
-}
-
-function noteSessionAuthenticated() {
-  everAuthenticated = true;
-  recoveryBudgetStartMs = null;
-}
-
-// Wait for the PC's auth-host: 10 s for a first connection, shorter and backing off for a recycled session.
-function sessionAuthTimeoutMs() {
-  return everAuthenticated && recoveryLossMs !== null ? recycledAuthTimeoutMs(recoveryAttempts - 1) : undefined;
-}
-
-function noteRecovered() {
-  if (recoveryLossMs === null) return;
-  const now = performance.now();
-  // Frozen or suspended time is reported apart: activeMs is what the recovery target measures.
-  const { recoveryMs, suspendedMs, activeMs } = splitRecovery(now - recoveryLossMs, suspendTracker.totalMs(now) - recoverySuspendedAtLossMs);
-  const attempts = recoveryAttempts;
-  recoveryLossMs = recoveryBudgetStartMs = null;
-  recoveryAttempts = 0;
-  viewerLog("info", `recovered after ${activeMs} ms, ${attempts} attempts`, { recoveryMs, activeMs, suspendedMs, attempts });
-}
-
 // A failed session. A silent PC on a recycled session retries on a new signaling connection while
 // the budget lasts; everything else ends the session as before.
 function handleSessionFailure(refusal, reason) {
-  noteConnectionLoss();
-  if (shouldRetryAuthTimeout({ reason, established: everAuthenticated, budgetStartMs: recoveryBudgetStartMs, nowMs: performance.now() })) {
-    viewerLog("info", "auth-timeout-retry", { attempts: recoveryAttempts, sinceLossMs: Math.round(performance.now() - recoveryLossMs) });
+  recovery.noteLoss();
+  if (recovery.shouldRetryAuthTimeout(reason)) {
+    viewerLog("info", "auth-timeout-retry", { attempts: recovery.attempts, sinceLossMs: recovery.sinceLossMs() });
     recycleSignaling("auth-timeout");
     return;
   }
@@ -948,7 +907,7 @@ function reconnectSignaling(reason) {
     authenticatedSession?.close();
     authenticatedSession = null;
     const generation = ++signalingGeneration;
-    if (recoveryLossMs !== null) recoveryAttempts++;
+    recovery.noteConnectionOpened();
     const socketUrl = signalingSocketUrl();
     debugTrace("signaling-construct", {
       path: new URL(socketUrl).pathname,
@@ -971,7 +930,7 @@ function reconnectSignaling(reason) {
       if (ws !== socket || generation !== signalingGeneration) return;
       clearTimeout(connectTimer);
       const admitted = signalingRegistered;
-      noteConnectionLoss();
+      recovery.noteLoss();
       hudState.ws = "closed";
       latestInputStatus = null;
       inputStatusReason = null;
@@ -1023,11 +982,11 @@ function reconnectSignaling(reason) {
 // 10 s) and tries a new one. Handlers are detached first so a late event of the old socket is ignored.
 function armConnectTimeout(socket, generation) {
   clearTimeout(connectTimer);
-  const waitedMs = connectTimeoutMs({ recovering: recoveryLossMs !== null, attempt: recoveryAttempts - 1 });
+  const waitedMs = recovery.connectTimeoutMs();
   if (waitedMs === null) return;
   connectTimer = setTimeout(() => {
     if (ws !== socket || generation !== signalingGeneration || socket.readyState !== WebSocket.CONNECTING) return;
-    viewerLog("info", "signaling-connect-abandoned", { connectAttempt: recoveryAttempts, waitedMs });
+    viewerLog("info", "signaling-connect-abandoned", { connectAttempt: recovery.attempts, waitedMs });
     socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
     ws = null;
     signalingGeneration++;
@@ -1052,7 +1011,7 @@ function signalingSocketUrl() {
 
 function recycleSignaling(reason) {
   if (terminalSignalingFailure) return;
-  noteConnectionLoss();
+  recovery.noteLoss();
   latestInputStatus = null;
   inputStatusReason = null;
   invalidatePendingMonitorRequest(reason);
@@ -1122,11 +1081,11 @@ async function handleSignal(socket, generation, ev) {
       const current = () => ws === socket && generation === signalingGeneration;
       let logUploader = null;
       const session = createViewerSession({ identity: sessionIdentity, pcId: sessionPc, pinnedPublic: sessionPinnedPublic,
-        relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc", authTimeoutMs: sessionAuthTimeoutMs(),
+        relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc", authTimeoutMs: recovery.authTimeoutMs(),
         send: message => current() && sendRelay(message),
         onAuthenticated: () => {
           if (!current()) return;
-          noteSessionAuthenticated();
+          recovery.noteAuthenticated();
           viewerLog("info", "signaling-authenticated");
           // Logs and saved reports go to the PC when it offers client-logs-v1. Never blocks the session.
           try {
@@ -1319,7 +1278,7 @@ async function addRemoteIce(candidate, generation, ice) {
 // Keep the relay's WebSocket alive (15 s idle heartbeat, same as the host), and
 // recycle it silently when the relay stops answering (recovery.js signalingUnanswered).
 setInterval(() => {
-  suspendTracker.tick(performance.now());
+  recovery.tick();
   if (!signalingRegistered) return;
   const now = performance.now();
   if (signalingUnanswered({ pingSentMs: signalingPingSentMs, inboundMs: signalingInboundMs, nowMs: now })) {

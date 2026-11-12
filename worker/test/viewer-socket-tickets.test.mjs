@@ -1,3 +1,4 @@
+import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -83,8 +84,8 @@ function signalHarness(identity) {
     debugTrace: (...args) => output.push(args), recordSignalingError: (...args) => output.push(args),
     shouldReconnectAfterClose: () => false, restartPeer() {},
     clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
-    noteConnectionLoss() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
-    recoveryLossMs: null, recoveryAttempts: 0,
+    recovery: recoveryStub(), handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
+    
     sendStreamMode: reason => endpoint.push(["stream-mode", reason]), wssSelected: false,
     startPeer: generation => endpoint.push(["start-peer", generation]), peerGeneration: 0,
     requestWssMediaStart: () => endpoint.push(["start-wss"]),

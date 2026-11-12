@@ -3,9 +3,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { createViewerSession } from "../public/dk-session.js";
+import { createRecoveryTracker } from "../public/recovery-tracker.js";
 import {
   RECOVERY_BUDGET_MS, recycledAuthTimeoutMs, shouldRetryAuthTimeout, connectTimeoutMs, shouldRetryOnWake,
-  shouldReconnectAfterClose, createSuspendTracker, splitRecovery,
+  shouldReconnectAfterClose, createSuspendTracker,
 } from "../public/recovery.js";
 
 const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").split(String.fromCharCode(13, 10)).join("\n");
@@ -45,20 +46,21 @@ test("the session honours the shorter auth-host wait", async () => {
 function receiverHarness() {
   const output = { ended: [], recycled: [], logs: [] };
   let now = 100_000;
+  const suspend = createSuspendTracker();
+  const log = (level, event, detail) => output.logs.push({ level, event, detail });
+  const recovery = createRecoveryTracker({ now: () => now, log, suspend });
   const context = vm.createContext({
-    everAuthenticated: false, recoveryLossMs: null, recoveryBudgetStartMs: null, recoveryAttempts: 0,
-    performance: { now: () => now }, Math, suspendTracker: createSuspendTracker(), splitRecovery, recoverySuspendedAtLossMs: 0, recycledAuthTimeoutMs, shouldRetryAuthTimeout,
-    viewerLog: (level, event, detail) => output.logs.push({ level, event, detail }),
+    recovery, viewerLog: log,
     recycleSignaling: reason => output.recycled.push(reason),
     endAuthenticatedSession: refusal => output.ended.push(refusal),
   });
-  vm.runInContext(["noteConnectionLoss", "noteSessionAuthenticated", "sessionAuthTimeoutMs", "noteRecovered", "handleSessionFailure"].map(fn).join("\n"), context);
-  return { context, output, advance: ms => { now += ms; } };
+  vm.runInContext(fn("handleSessionFailure"), context);
+  return { context, recovery, suspend, output, advance: ms => { now += ms; } };
 }
 
 test("auth timeout on a first connection ends the session as before", () => {
   const h = receiverHarness();
-  assert.equal(h.context.sessionAuthTimeoutMs(), undefined);
+  assert.equal(h.recovery.authTimeoutMs(), undefined);
   h.context.handleSessionFailure({ title: "PC not reachable" }, "auth-timeout");
   assert.equal(h.output.ended.length, 1);
   assert.deepEqual(h.output.recycled, []);
@@ -66,16 +68,16 @@ test("auth timeout on a first connection ends the session as before", () => {
 
 test("auth timeout after a loss retries with a shorter, growing wait until the budget is spent", () => {
   const h = receiverHarness();
-  h.context.noteSessionAuthenticated();
-  h.context.noteConnectionLoss(); // peer-left
-  h.context.recoveryAttempts = 1; // first reconnect socket opened
-  assert.equal(h.context.sessionAuthTimeoutMs(), 3000);
+  h.recovery.noteAuthenticated();
+  h.recovery.noteLoss(); // peer-left
+  h.recovery.noteConnectionOpened(); // first reconnect socket opened
+  assert.equal(h.recovery.authTimeoutMs(), 3000);
   h.advance(3500);
   h.context.handleSessionFailure({ title: "PC not reachable" }, "auth-timeout");
   assert.deepEqual(h.output.recycled, ["auth-timeout"]);
   assert.equal(h.output.ended.length, 0);
-  h.context.recoveryAttempts = 2;
-  assert.equal(h.context.sessionAuthTimeoutMs(), 4500);
+  h.recovery.noteConnectionOpened();
+  assert.equal(h.recovery.authTimeoutMs(), 4500);
   h.advance(RECOVERY_BUDGET_MS);
   h.context.handleSessionFailure({ title: "PC not reachable" }, "auth-timeout");
   assert.equal(h.output.ended.length, 1, "the budget is spent: the existing terminal screen");
@@ -84,8 +86,8 @@ test("auth timeout after a loss retries with a shorter, growing wait until the b
 
 test("a real refusal after a loss is never retried", () => {
   const h = receiverHarness();
-  h.context.noteSessionAuthenticated();
-  h.context.noteConnectionLoss();
+  h.recovery.noteAuthenticated();
+  h.recovery.noteLoss();
   h.context.handleSessionFailure({ title: "PC key changed" }, "pc-key-changed");
   assert.equal(h.output.ended.length, 1);
   assert.deepEqual(h.output.recycled, []);
@@ -93,29 +95,29 @@ test("a real refusal after a loss is never retried", () => {
 
 test("one info line reports the total time and attempts when the first frame returns", () => {
   const h = receiverHarness();
-  h.context.noteRecovered();
+  h.recovery.noteRecovered();
   assert.deepEqual(h.output.logs, [], "nothing on a first connection");
-  h.context.noteSessionAuthenticated();
-  h.context.noteConnectionLoss();
-  h.context.recoveryAttempts = 2;
+  h.recovery.noteAuthenticated();
+  h.recovery.noteLoss();
+  h.recovery.noteConnectionOpened(); h.recovery.noteConnectionOpened();
   h.advance(3120);
-  h.context.noteRecovered();
-  h.context.noteRecovered();
+  h.recovery.noteRecovered();
+  h.recovery.noteRecovered();
   assert.equal(h.output.logs.length, 1);
   assert.equal(h.output.logs[0].level, "info");
   assert.deepEqual({ ...h.output.logs[0].detail }, { recoveryMs: 3120, activeMs: 3120, suspendedMs: 0, attempts: 2 });
-  assert.equal(h.context.recoveryLossMs, null);
+  assert.equal(h.recovery.recovering, false);
 });
 
 test("the recovery line reports frozen or suspended time apart from active time", () => {
   const h = receiverHarness();
-  h.context.noteSessionAuthenticated();
-  h.context.suspendTracker.tick(100_000);
-  h.context.noteConnectionLoss();
+  h.recovery.noteAuthenticated();
+  h.suspend.tick(100_000);
+  h.recovery.noteLoss();
   h.advance(856_700); // the PC sleeps; no tick fires meanwhile
-  h.context.suspendTracker.tick(100_000 + 856_700);
+  h.suspend.tick(100_000 + 856_700);
   h.advance(3_900);
-  h.context.noteRecovered();
+  h.recovery.noteRecovered();
   assert.deepEqual({ ...h.output.logs[0].detail }, { recoveryMs: 860_600, activeMs: 3_900, suspendedMs: 856_700, attempts: 0 });
   assert.match(h.output.logs[0].event, /^recovered after 3900 ms/);
 });
@@ -145,20 +147,22 @@ function signalingHarness({ recovering }) {
     constructor(url) { this.url = url; this.readyState = 0; this.closed = false; sockets.push(this); }
     close() { this.closed = true; this.readyState = 3; }
   }
+  const recovery = createRecoveryTracker({ now: () => clock, log: () => {} });
+  if (recovering) { recovery.noteAuthenticated(); recovery.noteLoss(); }
   const context = vm.createContext({
     ws: null, signalingGeneration: 0, reconnectTimer: null, pendingConnect: null, connectTimer: null,
-    terminalSignalingFailure: false, recoveryLossMs: recovering ? 1 : null, recoveryAttempts: 0,
+    terminalSignalingFailure: false, recovery,
     hudState: {}, latestInputStatus: null, inputStatusReason: null, authenticatedSession: null,
     signalingRegistered: false, signalingPc: null, signalingTicket: null, sessionIdentity: {}, params: {},
     hud: { classList: { add() {} } },
     WebSocket: FakeSocket, URL, Promise, Math, Number, Array,
-    connectTimeoutMs, shouldRetryOnWake, shouldReconnectAfterClose,
+    shouldRetryOnWake, shouldReconnectAfterClose,
     setTimeout: (fn, delay) => { const id = nextId++; timers.push({ id, at: clock + delay, fn }); return id; },
     clearTimeout: id => { timers = timers.filter(t => t.id !== id); },
     signalingSocketUrl: () => "wss://relay.test/ws?pc=pc",
     debugTrace() {}, viewerLog: (level, event, detail) => logs.push({ level, event, detail: { ...detail } }),
     sendRelay: message => sent.push(message), viewerHello: () => ({ type: "hello" }), wantsTurn: () => false,
-    handleSignal: async () => {}, noteConnectionLoss() {}, cleanupPeer() {}, recordSignalingError() {},
+    handleSignal: async () => {}, cleanupPeer() {}, recordSignalingError() {},
     releaseInput() {}, showNotAdmitted() {}, restartPeer() {}, performance: { now: () => clock },
   });
   vm.runInContext(["reconnectSignaling", "armConnectTimeout", "wakeReconnect"].map(fn).join("\n"), context);
