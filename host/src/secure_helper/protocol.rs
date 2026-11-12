@@ -3,7 +3,11 @@ pub use crate::admin_agent::protocol::Role;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 pub const PROTOCOL_MIN: u16 = 2;
-pub const PROTOCOL_MAX: u16 = 2;
+/// v3 adds [`Kind::ElevatedForeground`]: normal-desktop input while the foreground window is
+/// above the admin agent's integrity (DWM's `Ghost` for a hung app). Sent only to v3 hosts.
+pub const PROTOCOL_MAX: u16 = 3;
+/// First version whose host understands [`Kind::ElevatedForeground`].
+pub const ELEVATED_FOREGROUND_VERSION: u16 = 3;
 pub const MAGIC: &[u8; 4] = b"BPSH";
 pub const HEADER_LEN: usize = 8;
 pub const MAX_PAYLOAD: usize = 24 * 1024;
@@ -38,6 +42,9 @@ pub enum Kind {
     Uac,
     Lock,
     Other,
+    /// Default desktop, foreground window owned by a process above High integrity (verified by
+    /// the helper). Input only; the host keeps capturing the normal desktop itself.
+    ElevatedForeground,
 }
 impl Kind {
     pub fn name(self) -> &'static str {
@@ -45,6 +52,7 @@ impl Kind {
             Self::Uac => "uac",
             Self::Lock => "lock",
             Self::Other => "other",
+            Self::ElevatedForeground => "elevated-foreground",
         }
     }
 }
@@ -197,6 +205,8 @@ pub fn reason_name(reason: &str) -> &'static str {
         "capture-unavailable" => "capture-unavailable",
         "desktop-changed" => "desktop-changed",
         "invalid-geometry" => "invalid-geometry",
+        "foreground-not-elevated" => "foreground-not-elevated",
+        "not_elevated" => "not_elevated",
         "no_input_capability" => "no_input_capability",
         "not_secure" => "not_secure",
         "not_ready" => "not_ready",
@@ -371,7 +381,31 @@ impl FrameInfo {
 pub fn consent_matches(image: &str, session: Option<u32>, expected: &str, console: u32) -> bool {
     session == Some(console) && image.eq_ignore_ascii_case(expected)
 }
+/// SECURITY_MANDATORY_HIGH_RID: the elevated admin agent's level. UIPI drops its
+/// input while the foreground belongs to anything above it.
+pub const HIGH_INTEGRITY_RID: u32 = 0x3000;
+/// The helper injects on the default desktop only while the foreground is the
+/// DWM ghost of a hung window: class `Ghost`, owned by System32 `dwm.exe` in the
+/// console session, above High integrity. Any other window, including other
+/// System-integrity ones, stays on the admin agent path.
+pub fn elevated_foreground_matches(
+    class: &str,
+    image: &str,
+    session: Option<u32>,
+    integrity: u32,
+    expected: &str,
+    console: u32,
+) -> bool {
+    class == "Ghost"
+        && session == Some(console)
+        && image.eq_ignore_ascii_case(expected)
+        && integrity > HIGH_INTEGRITY_RID
+}
 pub fn caps(secure: bool, kind: Kind, admin: bool, available: bool) -> Vec<&'static str> {
+    if !secure && kind == Kind::ElevatedForeground && admin && available {
+        // No pixels and no consent action: the normal capture keeps running.
+        return vec!["input"];
+    }
     if !secure || !available {
         return Vec::new();
     }
@@ -485,6 +519,34 @@ mod tests {
         assert_eq!(caps(true, Kind::Uac, false, true), vec!["view", "deny"]);
         assert_eq!(caps(true, Kind::Lock, true, true), vec!["view", "input"]);
         assert!(caps(false, Kind::Uac, true, true).is_empty());
+        assert_eq!(
+            caps(false, Kind::ElevatedForeground, true, true),
+            vec!["input"]
+        );
+        assert!(caps(false, Kind::ElevatedForeground, false, true).is_empty());
+        assert!(caps(false, Kind::ElevatedForeground, true, false).is_empty());
+        let dwm = r"C:\Windows\System32\dwm.exe";
+        for (class, image, session, integrity, ok) in [
+            (
+                "Ghost",
+                r"c:\windows\system32\DWM.EXE",
+                Some(1),
+                0x4000,
+                true,
+            ),
+            ("Ghost", dwm, Some(1), 0x3000, false),
+            ("Ghost", dwm, Some(2), 0x4000, false),
+            ("Ghost", dwm, None, 0x4000, false),
+            ("Ghost", r"C:\Temp\dwm.exe", Some(1), 0x4000, false),
+            ("ghost", dwm, Some(1), 0x4000, false),
+            ("WinUIDesktopWin32WindowClass", dwm, Some(1), 0x4000, false),
+        ] {
+            assert_eq!(
+                elevated_foreground_matches(class, image, session, integrity, dwm, 1),
+                ok,
+                "{class} {image} {session:?} {integrity:#x}"
+            );
+        }
     }
     #[test]
     fn policy_matrix() {
