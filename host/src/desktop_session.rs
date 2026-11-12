@@ -159,6 +159,15 @@ impl ProcessInputPrivilege {
     }
 }
 
+/// Integrity RID of a process token; `None` when the query is refused.
+pub fn process_integrity_rid(pid: u32) -> Option<u32> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let process = TokenHandle(process);
+    ProcessInputPrivilege::from_process(process.0)
+        .ok()
+        .map(|p| p.integrity_rid)
+}
+
 /// Called on the existing foreground housekeeping cadence. Token inspection
 /// happens only when HWND/PID changes, including windows ignored by following
 /// (for example, a modal dialog or a window during a drag).
@@ -212,6 +221,10 @@ impl ForegroundPrivilegeTracker {
             "remote input foreground privilege changed"
         );
         true
+    }
+
+    pub fn target_integrity(&self) -> Option<u32> {
+        self.target.map(|token| token.integrity_rid)
     }
 
     pub fn requires_admin(&self) -> bool {
