@@ -197,7 +197,7 @@ export function createWssPipeline({
   }
 
   function onOutput(frame, owner) {
-    if (owner !== decoder) { try { frame.close(); } catch { /* ignore */ } return; }
+    if (owner !== decoder) { try { frame.close(); } catch { /* already closed */ } return; }
     if (!firstOutput) { firstOutput = true; trace("decoder-first-output", { timestamp: frame.timestamp }); }
     let metadata = seqByTimestamp.get(frame.timestamp);
     if (metadata !== undefined) {
@@ -240,7 +240,7 @@ export function createWssPipeline({
       out.attempted = true;
       draw(frame, metadata, out);
     } finally {
-      try { frame.close(); } catch { /* ignore */ }
+      try { frame.close(); } catch { /* already closed */ }
       post(out);
     }
   }

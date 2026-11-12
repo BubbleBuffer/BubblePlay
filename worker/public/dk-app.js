@@ -21,8 +21,8 @@ export const FORGET_ENDPOINT = "/__gate/forget";
 // Local viewer log (dk-log.js). Absent in tests and when the script is blocked. Callers pass
 // plain causes (error class and message), never passphrases, codes, keys or key file text.
 const blog = (level, msg, fields) => { try { globalThis.BPLog?.log(level, "dk-app", msg, fields); } catch { /* logging never breaks the viewer */ } };
-const setLogContext = context => { try { globalThis.BPLog?.setContext(context); } catch { /* ignore */ } };
-const hideSecret = secret => { try { if (secret) globalThis.BPLog?.registerSecret(String(secret)); } catch { /* ignore */ } };
+const setLogContext = context => { try { globalThis.BPLog?.setContext(context); } catch { /* logging never breaks the viewer */ } };
+const hideSecret = secret => { try { if (secret) globalThis.BPLog?.registerSecret(String(secret)); } catch { /* logging never breaks the viewer */ } };
 const cause = error => (error === undefined || error === null ? undefined
   : `${error.name || "Error"}: ${String(error.message ?? error)}`.slice(0, 160));
 

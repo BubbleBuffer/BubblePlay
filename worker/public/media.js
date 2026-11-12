@@ -256,7 +256,7 @@ export class HybridTileCache {
         Promise.resolve(this.decodeImage(operation.png)).then(bitmap => {
           const current = this.tiles.get(operation.tileId);
           if (!bitmap || current?.token !== token) {
-            try { bitmap?.close?.(); } catch {}
+            try { bitmap?.close?.(); } catch { /* already closed */ }
             return;
           }
           current.bitmap = bitmap;
@@ -306,11 +306,11 @@ export class HybridTileCache {
   remove(tileId) {
     const tile = this.tiles.get(tileId);
     if (!tile) return;
-    try { tile.bitmap?.close?.(); } catch {}
+    try { tile.bitmap?.close?.(); } catch { /* already closed */ }
     this.tiles.delete(tileId);
   }
   clear() {
-    for (const tile of this.tiles.values()) try { tile.bitmap?.close?.(); } catch {}
+    for (const tile of this.tiles.values()) try { tile.bitmap?.close?.(); } catch { /* already closed */ }
     this.tiles.clear();
     this.token++;
   }
@@ -417,7 +417,7 @@ export class HevcTileCache {
     if (state !== "supported") {
       this.resetDecoderWork();
       this.clearTiles();
-      try { this.decoder?.close?.(); } catch {}
+      try { this.decoder?.close?.(); } catch { /* already closed */ }
       this.decoder = null;
     }
     return true;
@@ -562,7 +562,7 @@ export class HevcTileCache {
         (Number.isFinite(frame?.codedWidth) && frame.codedWidth !== 128) ||
         (Number.isFinite(frame?.codedHeight) && frame.codedHeight !== 128)) {
       this.stats.staleOutputRejects++;
-      try { frame?.close?.(); } catch {}
+      try { frame?.close?.(); } catch { /* already closed */ }
     } else {
       this.pending.delete(timestamp);
       pending.accessUnit = null;
@@ -594,12 +594,12 @@ export class HevcTileCache {
     if (!tile) return;
     this.pending.delete(tile.timestamp);
     this.decodeQueue = this.decodeQueue.filter(entry => entry !== tile);
-    try { tile.frame?.close?.(); } catch {}
+    try { tile.frame?.close?.(); } catch { /* already closed */ }
     this.tiles.delete(tileId);
   }
 
   clearTiles() {
-    for (const tile of this.tiles.values()) try { tile.frame?.close?.(); } catch {}
+    for (const tile of this.tiles.values()) try { tile.frame?.close?.(); } catch { /* already closed */ }
     this.tiles.clear();
     this.pending.clear();
     this.decodeQueue.length = 0;
@@ -615,7 +615,7 @@ export class HevcTileCache {
     this.pending.clear();
     this.decodeQueue.length = 0;
     if (this.decoder && this.decoder.state !== "closed") {
-      try { this.decoder.reset(); } catch {}
+      try { this.decoder.reset(); } catch { /* the decoder is closed next */ }
     }
   }
 
@@ -623,7 +623,7 @@ export class HevcTileCache {
     this.stats.decoderErrors++;
     this.resetDecoderWork();
     this.clearTiles();
-    try { this.decoder?.close?.(); } catch {}
+    try { this.decoder?.close?.(); } catch { /* already closed */ }
     this.decoder = null;
   }
 
@@ -656,7 +656,7 @@ export class HevcTileCache {
   close() {
     this.resetDecoderWork();
     this.clearTiles();
-    try { this.decoder?.close?.(); } catch {}
+    try { this.decoder?.close?.(); } catch { /* already closed */ }
     this.decoder = null;
   }
 }
