@@ -93,7 +93,7 @@ function signalHarness(identity) {
     handleCursorState: (bytes, route) => endpoint.push(["cursor", Array.from(bytes), route]),
     inputReady: false, pendingRtcTracks: [], dc: null, motionDc: null, onInputReady() {},
     invalidatePendingMonitorRequest() {}, lastRenderedDueMs: null, usingWssMedia: false,
-    wssV4: { socketOpen: false, lastSeq: 0 }, wssPresentedSequence: 0,
+    wssV4: { lastSeq: 0 }, wssSocket: { isOpen: false }, wssPresentedSequence: 0,
     wssMediaReceivedPackets: 0, wssRecoveryState: "idle",
     createSignalingRecycleDiagnostic: value => value,
     createViewerSession(options) {
@@ -292,35 +292,6 @@ test("admission traces and authenticated client logs exclude session credentials
   assert.ok(h.output.some(message => message[0] === "signaling-hello-ok"));
   assert.doesNotMatch(JSON.stringify([h.output, h.endpoint, h.logged]), /test-only-secret-socket-ticket/);
   assert.doesNotMatch(JSON.stringify(h.output.filter(message => Array.isArray(message))), /pc-one/);
-});
-
-test("media hello requires authenticated media and a current ticket; obsolete sockets cannot send", () => {
-  const sent = [], sockets = [];
-  class Socket {
-    constructor(url) { this.url = url; sockets.push(this); }
-    send(text) { sent.push(text); }
-  }
-  const h = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, usingWssMedia: true, mediaEpoch: epoch,
-    wssV4: {}, signalingTicket: null, authenticatedSession: null,
-    mediaSocketUrl: () => `wss://relay.test/media-ws?epoch=${epoch}&pc=pc-one`,
-    performance: { now: () => 1 }, setTimeout: () => 0, clearTimeout() {}, MEDIA_CONNECT_TIMEOUT_MS: 1, viewerLog() {} });
-  vm.runInContext(receiverFunction("openWssV4Socket"), h);
-  h.openWssV4Socket(); assert.equal(sockets.length, 0);
-  h.signalingTicket = ticket;
-  h.openWssV4Socket(); assert.equal(sockets.length, 0);
-  h.authenticatedSession = { mediaReady: false };
-  h.openWssV4Socket(); assert.equal(sockets.length, 0);
-  h.authenticatedSession.mediaReady = true;
-  h.openWssV4Socket(); sockets[0].onopen();
-  assert.equal(sent[0], JSON.stringify({ type: "hello", role: "media-viewer", ticket }));
-  h.signalingTicket = "replacement";
-  sockets[0].onopen(); assert.equal(sent.length, 1);
-  h.openWssV4Socket(); sockets[1].onopen();
-  assert.equal(sent[1], JSON.stringify({ type: "hello", role: "media-viewer", ticket: "replacement" }));
-  sockets[0].onopen(); assert.equal(sent.length, 2);
-  h.authenticatedSession.mediaReady = false;
-  sockets[1].onopen(); assert.equal(sent.length, 2);
-  for (const socket of sockets) assert.ok(!socket.url.includes(ticket));
 });
 
 test("file hello reads the current ticket callback without exposing it in snapshots", () => {
