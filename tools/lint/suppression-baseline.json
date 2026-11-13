@@ -14,6 +14,6 @@
     "#[allow(": 8
   },
   "worker": {
-    "empty catch": 2
+    "empty catch": 1
   }
 }

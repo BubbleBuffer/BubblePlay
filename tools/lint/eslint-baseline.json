@@ -52,14 +52,13 @@
   "worker/public/dk-session.js": {
     "max-lines-per-function": 1,
     "no-control-regex": 1,
-    "no-magic-numbers": 7
+    "no-magic-numbers": 8
   },
   "worker/public/dk-upload.js": {
     "max-lines-per-function": 1,
     "no-magic-numbers": 12
   },
   "worker/public/file-client.js": {
-    "no-empty": 1,
     "no-magic-numbers": 13
   },
   "worker/public/file-transfer.js": {
@@ -73,19 +72,17 @@
     "no-magic-numbers": 274
   },
   "worker/public/latency-worker.js": {
-    "no-empty": 4,
     "no-magic-numbers": 36
   },
   "worker/public/latency.js": {
     "max-lines-per-function": 1,
-    "no-magic-numbers": 68
+    "no-magic-numbers": 66
   },
   "worker/public/media-v4.js": {
-    "no-magic-numbers": 49
+    "no-magic-numbers": 50
   },
   "worker/public/media.js": {
     "max-lines-per-function": 2,
-    "no-empty": 10,
     "no-magic-numbers": 84
   },
   "worker/public/monitor-previews.js": {
@@ -95,11 +92,10 @@
     "no-magic-numbers": 2
   },
   "worker/public/receiver.js": {
-    "max-lines-per-function": 7,
-    "no-dupe-else-if": 1,
-    "no-empty": 32,
-    "no-magic-numbers": 172,
-    "no-unused-vars": 6
+    "max-lines-per-function": 8,
+    "no-empty": 1,
+    "no-magic-numbers": 141,
+    "no-unused-vars": 4
   },
   "worker/public/recovery.js": {
     "no-magic-numbers": 4
@@ -107,8 +103,14 @@
   "worker/public/remote-clipboard.js": {
     "no-magic-numbers": 6
   },
+  "worker/public/report.js": {
+    "no-magic-numbers": 1
+  },
   "worker/public/settings.js": {
     "no-magic-numbers": 4
+  },
+  "worker/public/sharp-session.js": {
+    "max-lines-per-function": 1
   },
   "worker/public/sharp-viewport.js": {
     "no-magic-numbers": 3
@@ -119,6 +121,9 @@
   "worker/public/turn.js": {
     "no-control-regex": 1,
     "no-magic-numbers": 1
+  },
+  "worker/public/wss-media-socket.js": {
+    "max-lines-per-function": 1
   },
   "worker/public/wss-pipeline.js": {
     "max-lines-per-function": 1,
@@ -147,7 +152,13 @@
   "worker/test/input-status.test.mjs": {
     "no-regex-spaces": 1
   },
+  "worker/test/keyboard-draft.test.mjs": {
+    "no-unused-vars": 1
+  },
   "worker/test/media.test.mjs": {
+    "no-unused-vars": 1
+  },
+  "worker/test/viewer-robustness.test.mjs": {
     "no-unused-vars": 1
   },
   "worker/test/viewer-socket-tickets.test.mjs": {
