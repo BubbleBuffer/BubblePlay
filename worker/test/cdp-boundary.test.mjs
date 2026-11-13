@@ -27,7 +27,7 @@ test("external debug attempts report before module imports and across the WSS pr
   assert.match(client, /trace\("bootstrap-inline"/);
   for (const stage of [
     "module-ready", "signaling-construct", "signaling-open",
-    "signaling-hello-ok", "media-v4-open", "media-first-packet",
+    "signaling-hello-ok", "media-first-packet",
     "decoder-configured", "decoder-first-output", "first-presented",
   ]) assert.match(client, new RegExp(`debugTrace\\(\"${stage}\"`));
 });
@@ -296,7 +296,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /streamMode: streamModeValue\(\)/);
   assert.match(client, /<option value="auto">Auto<\/option>/);
   assert.match(client, /function mediaSocketUrl\(\)/);
-  assert.match(client, /role: "media-viewer"/);
   assert.match(client, /hev1\.1\.6\.L120\.B0/);
   assert.match(client, /media-control/);
   assert.match(client, /fullFrameDiagnostic/);

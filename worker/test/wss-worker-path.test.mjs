@@ -120,7 +120,7 @@ test("receiver.js picks the path with the selector and keeps the main-thread fal
 
 test("ACKs stay on receipt and report the worker decodedSeq; recovery and watchdog stay in the receiver", () => {
   const client = read("receiver.js");
-  assert.match(client, /ACK on receipt[\s\S]*sendWssV4\(ackMessageV4\(\{[^}]*decodedSeq: wssV4\.decodedSeq[\s\S]*?decodeWssFrame\(\{/);
+  assert.match(client, /ACK on receipt[\s\S]*wssSocket\.send\(ackMessageV4\(\{[^}]*decodedSeq: wssV4\.decodedSeq[\s\S]*?decodeWssFrame\(\{/);
   assert.match(client, /function onWssWorkerFrameOut\(m\)[\s\S]*wssV4\.decodedSeq = m\.decodedSequence/);
   assert.match(client, /function decodeWssFrame\(frame\) \{\s*if \(wssWorker\) \{\s*if \(wssWorker\.ready\) postWssFrameToWorker\(frame\);\s*return;/);
   assert.match(client, /function onWssWorkerMessage\(m\)[\s\S]*if \(m\.epoch !== wssDecoderEpoch\) return;/);

@@ -6,11 +6,9 @@ import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateI
 import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
-  MEDIA_CONNECT_TIMEOUT_MS,
   OFFER_FAILURE_LIMIT,
   shouldRetryOnWake,
   signalingUnanswered,
-  mediaHeartbeatStep,
   rtcPeerEndAction,
 } from "/recovery.js";
 import { createOnceReporter } from "/report.js";
@@ -37,6 +35,7 @@ import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
 import { SoundController, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
 import { formatHud } from "/hud-text.js";
+import { createWssMediaSocket } from "/wss-media-socket.js";
 import { createRecoveryTracker } from "/recovery-tracker.js";
 import { createWssAudioSession } from "/wss-audio.js";
 import { FileTransferClient } from "/file-client.js";
@@ -810,7 +809,6 @@ let wssTileCapability = null;
 let wssCaptureId = 0;
 const wssCaptureWaiters = new Map();
 let wssSelected = requestedTransport === TRANSPORT.WSS || startOnRememberedWss;
-let wssReconnectTimer = null;
 let wssKeyframeTimer = null;
 let wssDecoderEpoch = 0;
 let wssNoOutputFailures = 0;
@@ -818,18 +816,17 @@ let wssRecoveryPending = false;
 let wssRecoveryState = "awaiting-keyframe";
 let wssLastRecoveryAt = -Infinity;
 let wssStartupRecoveries = 0;
-// WSS v4 single-socket session state.
+// WSS v4 per-session frame state; the socket itself is wssSocket (wss-media-socket.js).
 const wssV4 = {
-  gate: new V4ReceiveGate(), socket: null, socketOpen: false, everOpened: false, hostPresent: false,
-  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, connectTimer: null, lastSendAt: 0, lastInboundAt: 0, lastPingAt: 0, pingSentMs: null,
+  gate: new V4ReceiveGate(),
   lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity,
   presentSkips: 0, gateDrops: 0, frames: 0,
 };
 function wssV4Status() {
-  const open = wssV4.socketOpen && wssV4.hostPresent;
+  const open = wssSocket.isOpen && wssSocket.hostPresent;
   return wssV4StatusLabel({
     socketOpen: open,
-    reconnecting: wssV4.reconnecting || (wssV4.socketOpen && !wssV4.hostPresent && hasPresentedFrame),
+    reconnecting: wssSocket.reconnecting || (wssSocket.isOpen && !wssSocket.hostPresent && hasPresentedFrame),
     framesPresented: hasPresentedFrame ? 1 : 0,
     lastFrameAtMs: wssV4.lastFrameAt,
     nowMs: performance.now(),
@@ -1039,7 +1036,7 @@ function recycleSignaling(reason) {
     signalingRegistered,
     socketReadyState: ws?.readyState ?? null,
     usingWssMedia,
-    mediaSocketOpen: wssV4.socketOpen,
+    mediaSocketOpen: wssSocket.isOpen,
     mediaGeneration: Number.isSafeInteger(hudState.mediaGeneration) ? hudState.mediaGeneration : null,
     reconstructed: wssV4.lastSeq,
     presented: wssPresentedSequence,
@@ -1434,9 +1431,7 @@ function cleanupPeer() {
 function clearWssTimers() {
   rtcStartupFallback?.stop(); rtcStartupFallback = null;
   clearWssKeyframeWatchdog();
-  clearInterval(wssV4.heartbeatTimer); wssV4.heartbeatTimer = null;
-  clearTimeout(wssReconnectTimer); wssReconnectTimer = null;
-  clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
+  wssSocket.clearTimers();
 }
 
 function stopWssMedia() {
@@ -1445,9 +1440,8 @@ function stopWssMedia() {
   clearWssTimers();
   wssAudio.stop();
   wssDecoderEpoch++;
-  try { wssV4.socket?.close(1000, "switch"); } catch { /* already closed */ }
-  Object.assign(wssV4, { socket: null, socketOpen: false, everOpened: false, hostPresent: false, reconnecting: false,
-    backoffMs: 0, lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity });
+  wssSocket.stop();
+  Object.assign(wssV4, { lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity });
   wssV4.gate.reset("start");
   wssStartedHost = false;
   wssPresentedSequence = 0; wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
@@ -1465,96 +1459,20 @@ function stopWssMedia() {
   sharpScreen.classList.remove("active");
 }
 
-function sendWssV4(text) {
-  const socket = wssV4.socket;
-  if (!socket || socket.readyState !== WebSocket.OPEN) return false;
-  try { socket.send(text); } catch { return false; }
-  wssV4.lastSendAt = performance.now();
-  return true;
-}
-
-function scheduleWssV4Reconnect(reason) {
-  clearTimeout(wssReconnectTimer);
-  wssV4.backoffMs = nextBackoffMsV4(wssV4.backoffMs);
-  wssV4.reconnecting = true;
-  debugTrace("media-v4-reconnect-scheduled", { reason, delayMs: wssV4.backoffMs });
-  wssReconnectTimer = setTimeout(() => {
-    wssReconnectTimer = null;
-    if (!usingWssMedia) return;
-    wssV4.reconnects++;
-    openWssV4Socket();
-  }, jitteredBackoffMsV4(wssV4.backoffMs));
-}
-
-function openWssV4Socket() {
-  if (!usingWssMedia || !mediaEpoch || !signalingTicket || !authenticatedSession?.mediaReady) return;
-  const ticket = signalingTicket;
-  const socket = new WebSocket(mediaSocketUrl());
-  socket.binaryType = "arraybuffer";
-  wssV4.socket = socket;
-  wssV4.socketOpen = false;
-  wssV4.hostPresent = false;
-  const current = () => usingWssMedia && wssV4.socket === socket && signalingTicket === ticket && authenticatedSession?.mediaReady;
-  clearTimeout(wssV4.connectTimer);
-  wssV4.connectTimer = setTimeout(() => {
-    wssV4.connectTimer = null;
-    if (!current() || wssV4.socketOpen) return;
-    viewerLog("warn", "wss-v4-connect-timeout", { waitedMs: MEDIA_CONNECT_TIMEOUT_MS, reconnects: wssV4.reconnects });
-    socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
-    wssV4.socket = null;
-    try { socket.close(); } catch {} // already closing or closed
-    scheduleWssV4Reconnect("connect-timeout");
-  }, MEDIA_CONNECT_TIMEOUT_MS);
-  socket.onopen = () => {
-    if (!current()) return;
-    socket.send(JSON.stringify({ type: "hello", role: "media-viewer", ticket }));
-    wssV4.lastSendAt = wssV4.lastInboundAt = wssV4.lastPingAt = performance.now();
-    wssV4.pingSentMs = null;
-  };
-  socket.onmessage = (event) => {
-    if (!current()) return;
-    wssV4.lastInboundAt = performance.now();
-    if (typeof event.data !== "string") {
-      onWssV4Packet(event.data);
-      return;
-    }
-    let message;
-    try { message = JSON.parse(event.data); } catch { return; }
-    if (message.type === "hello-ok") {
-      clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
-      const reconnect = wssV4.everOpened;
-      wssV4.socketOpen = true;
-      wssV4.everOpened = true;
-      wssV4.reconnecting = false;
-      wssV4.backoffMs = 0;
-      // Whatever was in flight on the old socket is gone: the decoder must
-      // restart from the keyframe the host sends when it sees this peer.
-      wssV4.gate.reset(reconnect ? "reconnect" : "connect");
-      debugTrace("media-v4-open", { reconnect, reconnects: wssV4.reconnects });
-      if (reconnect) viewerLog("info", "wss-v4-reconnected", { reconnects: wssV4.reconnects });
-      maybeStartWssHost();
-    } else if (message.type === "media-peer") {
-      const present = message.present === true;
-      if (present && !wssV4.hostPresent) wssV4.gate.reset("host-joined");
-      wssV4.hostPresent = present;
-    }
-  };
-  socket.onclose = (event) => {
-    if (!current()) return;
-    clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
-    wssV4.socketOpen = false;
-    wssV4.hostPresent = false;
-    wssV4.socket = null;
-    wssAudio.stop();
-    hudState.ice = "wss v4 reconnecting";
-    debugTrace("media-v4-close", { code: event.code, reason: event.reason || "", wasClean: event.wasClean });
-    scheduleWssV4Reconnect("socket-close");
-  };
-  socket.onerror = () => {
-    if (!current()) return;
-    try { socket.close(); } catch { /* already closed */ }
-  };
-}
+const wssSocket = createWssMediaSocket({
+  active: () => usingWssMedia, epoch: () => mediaEpoch,
+  ticket: () => (authenticatedSession?.mediaReady ? signalingTicket : null),
+  url: mediaSocketUrl, now: () => performance.now(), onPacket: data => onWssV4Packet(data),
+  onOpen: ({ reconnect }) => {
+    // Whatever was in flight on the old socket is gone: the decoder must
+    // restart from the keyframe the host sends when it sees this peer.
+    wssV4.gate.reset(reconnect ? "reconnect" : "connect");
+    maybeStartWssHost();
+  },
+  onPeer: ({ joined }) => { if (joined) wssV4.gate.reset("host-joined"); },
+  onClosed: () => { wssAudio.stop(); hudState.ice = "wss v4 reconnecting"; },
+  log: viewerLog, trace: debugTrace,
+});
 
 function onWssV4Packet(data) {
   // BPA1 audio shares the media socket. It skips the v4 counters, ACK and gate.
@@ -1571,7 +1489,7 @@ function onWssV4Packet(data) {
   }
   const nowMs = performance.now();
   // ACK on receipt: the host measures delivery delay, not decode time.
-  sendWssV4(ackMessageV4({ generation: frame.generation, seq: frame.seq, recvTsMs: nowMs,
+  wssSocket.send(ackMessageV4({ generation: frame.generation, seq: frame.seq, recvTsMs: nowMs,
     decodedSeq: wssV4.decodedSeq }));
   wssV4.frames++;
   wssV4.lastFrameAt = nowMs;
@@ -1607,24 +1525,6 @@ function audioSnapshot() {
     wss: wssAudio.stats(),
     webrtc: latestInboundAudio ? { ...latestInboundAudio } : null,
   };
-}
-
-function startWssV4() {
-  clearInterval(wssV4.heartbeatTimer);
-  wssV4.heartbeatTimer = setInterval(() => {
-    if (!usingWssMedia) return;
-    const now = performance.now();
-    if (!wssV4.socketOpen) return;
-    // The relay answers every heartbeat; a ping left unanswered means a half-open socket
-    // (recovery.js mediaHeartbeatStep). Acks and other traffic never postpone the ping.
-    const step = mediaHeartbeatStep(wssV4, now, { heartbeatMs: V4_HEARTBEAT_MS });
-    if (step === "ping") sendWssV4('{"type":"ping"}');
-    else if (step === "dead") {
-      viewerLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt), unansweredMs: Math.round(now - wssV4.pingSentMs) });
-      try { wssV4.socket?.close(4000, "silent"); } catch { /* already closed */ }
-    }
-  }, 1_000);
-  openWssV4Socket();
 }
 
 function mediaSocketUrl() {
@@ -1739,7 +1639,7 @@ function requestWssMediaStart() {
   connected = true; updateAuthenticatedInputReady();
   wssStartedHost = false;
   // v4 decodes every frame in order: there is no deadline expiry.
-  startWssV4();
+  wssSocket.start();
 }
 
 function activeWssMain10() {
@@ -1834,15 +1734,15 @@ async function selectWssCodec() {
 }
 
 async function maybeStartWssHost() {
-  hudState.ice = wssV4.socketOpen ? "wss" : "wss connecting";
-  if (wssStartedHost || wssStartInFlight || !wssV4.socketOpen) return;
+  hudState.ice = wssSocket.isOpen ? "wss" : "wss connecting";
+  if (wssStartedHost || wssStartInFlight || !wssSocket.isOpen) return;
   wssStartInFlight = true;
   const [codec, audioDecodable] = await Promise.all([selectWssCodec(), wssAudioDecodable, wssWorkerInit]);
   if (!codec) {
     wssStartInFlight = false;
     return;
   }
-  if (!usingWssMedia || wssStartedHost || !wssV4.socketOpen) {
+  if (!usingWssMedia || wssStartedHost || !wssSocket.isOpen) {
     wssStartInFlight = false;
     return;
   }
@@ -1863,7 +1763,7 @@ function requestWssKeyframe(reason, requestId = null) {
   if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < V4_KEYFRAME_REQUEST_INTERVAL_MS) return false;
   requestWssKeyframe.lastAt = now;
   viewerLog("warn", "wss-keyframe-request", { reason, requestId });
-  if (usingWssMedia && !requestId) return sendWssV4(keyframeMessageV4(reason));
+  if (usingWssMedia && !requestId) return wssSocket.send(keyframeMessageV4(reason));
   sendControl({ type: "media-control", action: "keyframe", protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason,
     ...(requestId ? { requestId } : {}), codec: codecSession.codec });
   return true;
@@ -1991,7 +1891,7 @@ function networkRouteHealthSnapshot() {
     signalingRegistered,
     signalingSocketOpen: ws?.readyState === WebSocket.OPEN,
     usingWssMedia,
-    mediaSocketOpen: wssV4.socketOpen,
+    mediaSocketOpen: wssSocket.isOpen,
     recoveryState: wssRecoveryState,
     // A static v4 desktop sends no frames by design; heartbeats cover liveness.
     allowQuiescentIdle: true,
@@ -2658,9 +2558,9 @@ if (diagnosticsEnabled) {
           protocol: WSS_PROTOCOL,
           reconstructed: wssV4.lastSeq, presented: wssPresentedSequence,
           v4: {
-            status: wssV4Status(), socketOpen: wssV4.socketOpen, hostPresent: wssV4.hostPresent,
+            status: wssV4Status(), socketOpen: wssSocket.isOpen, hostPresent: wssSocket.hostPresent,
             frames: wssV4.frames, lastSeq: wssV4.lastSeq, decodedSeq: wssV4.decodedSeq ?? null,
-            gateDrops: wssV4.gateDrops, presentSkips: wssV4.presentSkips, reconnects: wssV4.reconnects,
+            gateDrops: wssV4.gateDrops, presentSkips: wssV4.presentSkips, reconnects: wssSocket.reconnects,
             waitingForKey: wssV4.gate.waitingForKey,
           },
           recoveryState: wssRecoveryState,

@@ -103,15 +103,11 @@ test("receiver wires v4: media-socket keyframes, in-order decode, reconnect back
   const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   assert.match(source, /from "\/media-v4\.js";/);
   assert.match(source, /const WSS_PROTOCOL = V4_VERSION;/);
-  assert.match(source, /if \(usingWssMedia && !requestId\) return sendWssV4\(keyframeMessageV4\(reason\)\);/);
-  assert.match(source, /wssV4\.backoffMs = nextBackoffMsV4\(wssV4\.backoffMs\);/);
+  assert.match(source, /if \(usingWssMedia && !requestId\) return wssSocket\.send\(keyframeMessageV4\(reason\)\);/);
   assert.match(source, /shouldPresentDecodedV4\(/);
   assert.match(source, /recycleSignaling\("signaling-silent"\);[\s\S]{0,200}sendRelay\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
-  // The media heartbeat pings on its own clock: the viewer's acks (lastSendAt) must not postpone it.
-  assert.match(source, /mediaHeartbeatStep\(wssV4, now, \{ heartbeatMs: V4_HEARTBEAT_MS \}\)/);
-  assert.doesNotMatch(source, /now - wssV4\.lastSendAt >= V4_HEARTBEAT_MS/);
   // v4 has no deadline expiry timer.
-  assert.match(source, /\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*startWssV4\(\);/);
+  assert.match(source, /\/\/ v4 decodes every frame in order: there is no deadline expiry\.\s*wssSocket\.start\(\);/);
 });
 
 test("receiver input stays on the signaling socket and the media socket carries only v4 control", () => {
@@ -125,15 +121,11 @@ test("receiver input stays on the signaling socket and the media socket carries 
   const sendInput = body("sendInput");
   assert.match(sendInput, /authenticatedSession\.sendInput\(data\)/);
   assert.doesNotMatch(sendInput, /ws\.send\(data\)/);
-  assert.doesNotMatch(sendInput, /wssV4|sendWssV4/);
+  assert.doesNotMatch(sendInput, /wssV4|wssSocket/);
   assert.match(body("inputControlState"), /ws\.bufferedAmount/);
   assert.doesNotMatch(body("inputControlState"), /wssV4/);
   // Every media-socket send is an ACK, keyframe request, heartbeat or hello.
-  const calls = [...source.matchAll(/sendWssV4\(([^)]*)/g)].map(match => match[1]).filter(arg => arg !== "text");
-  assert.equal(calls.length, 3);
-  for (const arg of calls) assert.match(arg, /^(ackMessageV4|keyframeMessageV4|'\{"type":"ping"\}')/);
-  // Shared media sender, plus the media hello, which always carries its ticket (phase 2).
-  assert.equal([...source.matchAll(/(?<!ws)\bsocket\.send\(/g)].length, 2);
-  assert.match(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer", ticket \}\)\)/);
-  assert.doesNotMatch(source, /socket\.send\(JSON\.stringify\(\{ type: "hello", role: "media-viewer" \}\)\)/);
+  const calls = [...source.matchAll(/wssSocket\.send\(([^)]*)/g)].map(match => match[1]).filter(arg => arg !== "text");
+  assert.equal(calls.length, 2);
+  for (const arg of calls) assert.match(arg, /^(ackMessageV4|keyframeMessageV4)/);
 });
