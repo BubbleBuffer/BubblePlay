@@ -16,10 +16,11 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
-  # Which jobs a change needs (tools/ci-changes.mjs). Runs on build01 (hosted minutes are spent); a skipped job
-  # reports as skipped. Master pushes and manual runs always run everything.
+  # Which jobs a change needs (tools/ci-changes.mjs); a skipped job reports as skipped. Master pushes and manual
+  # runs always run everything. Every job here runs on a GitHub-hosted runner: this repository is public, and a
+  # self-hosted runner would run fork pull-request code on the owner's server.
   changes:
-    runs-on: [self-hosted, build01]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       relay: ${{ steps.filter.outputs.relay }}
@@ -43,11 +44,10 @@ jobs:
         run: node tools/ci-changes.mjs "$BASE"
 
   browser:
-    runs-on: [self-hosted, build01]
+    runs-on: ubuntu-latest
     needs: changes
-    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
     # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay') && needs.changes.outputs.browser == 'true'
+    if: "!startsWith(github.ref, 'refs/heads/lane/rust-relay') && needs.changes.outputs.browser == 'true'"
     strategy:
       matrix:
         # One Node version on pull requests, both on master and manual runs.
@@ -71,9 +71,7 @@ jobs:
   windows-packaging:
     runs-on: windows-latest
     needs: changes
-    # GitHub-hosted Windows minutes are billed and the budget is spent: manual runs only. Changes here are gated
-    # by the local .claude/dk2/win-check.sh run (docs/development.md) until a self-hosted Windows runner exists.
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.packaging == 'true'
+    if: needs.changes.outputs.packaging == 'true'
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -92,10 +90,9 @@ jobs:
           ./host/scripts/test-setup-credentials.ps1
 
   relay-rs:
-    runs-on: [self-hosted, build01]
+    runs-on: ubuntu-latest
     needs: changes
-    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.relay == 'true'
+    if: needs.changes.outputs.relay == 'true'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -103,25 +100,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: |
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt --target wasm32-unknown-unknown --no-self-update
-          # Pin the toolchain for this job only. Jobs from other repos share RUSTUP_HOME on build01
-          # and can change the global default mid-run, so `rustup default` is not enough.
-          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
-          export RUSTUP_TOOLCHAIN=1.97.1
-          # Runners on build01 share RUSTUP_HOME, so rustup can report the wasm32 target
-          # installed while its rlibs are missing. Check the sysroot and reinstall if so.
-          sysroot="$(rustc +1.97.1 --print sysroot)"
-          if ! ls "$sysroot"/lib/rustlib/wasm32-unknown-unknown/lib/libcore-*.rlib >/dev/null 2>&1; then
-            echo "wasm32 rust-std missing from $sysroot; reinstalling"
-            rustup component remove rust-std --target wasm32-unknown-unknown --toolchain 1.97.1 || true
-            rustup target add wasm32-unknown-unknown --toolchain 1.97.1
-            ls "$sysroot"/lib/rustlib/wasm32-unknown-unknown/lib/libcore-*.rlib
-          fi
+          rustup default 1.97.1
           rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -160,11 +140,10 @@ jobs:
         working-directory: relay-rs
         run: cargo check --locked -p bp-relay-core --target wasm32-unknown-unknown
       # worker-build 0.8.7 is the line that matches workers-rs (worker =0.8.7 in relay-rs/worker/Cargo.toml).
-      # Published 2026-09-25, so it is at least two weeks old on 2026-10-23. Reinstalled only when
-      # the installed version differs, so a warm runner skips the compile.
+      # Published 2026-09-25, so it is at least two weeks old on 2026-10-23. The rust-cache step above restores
+      # ~/.cargo/bin, so a warm cache skips the compile; the version check reinstalls on a miss or a bump.
       - name: Install worker-build (pinned)
         run: |
-          export PATH="$HOME/.cargo/bin:$PATH"
           WORKER_BUILD_VERSION=0.8.7
           if [ "$(worker-build --version 2>/dev/null | awk '{print $NF}' || true)" != "$WORKER_BUILD_VERSION" ]; then
             cargo install worker-build --version "$WORKER_BUILD_VERSION" --locked
@@ -210,10 +189,9 @@ jobs:
         run: docker build -f relay-rs/Dockerfile -t bubbleplay-relay-rs:check .
 
   browser-e2e:
-    runs-on: [self-hosted, build01]
+    runs-on: ubuntu-latest
     needs: changes
-    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.changes.outputs.e2e == 'true'
+    if: needs.changes.outputs.e2e == 'true'
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -221,19 +199,12 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         run: |
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install 1.97.1 --profile minimal --no-self-update
-          # Pinned for this job only, as in the relay-rs job: runners share RUSTUP_HOME.
-          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
+          rustup default 1.97.1
+          rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: relay-rs -> target
-          # Runners on build01 share one ~/.cargo, so the cache must not clean ~/.cargo/bin.
-          cache-bin: "false"
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
@@ -250,9 +221,7 @@ jobs:
     name: Host checks (windows-latest)
     runs-on: windows-latest
     needs: changes
-    # GitHub-hosted Windows minutes are billed and the budget is spent: manual runs only. Changes here are gated
-    # by the local .claude/dk2/win-check.sh run (docs/development.md) until a self-hosted Windows runner exists.
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.host == 'true'
+    if: needs.changes.outputs.host == 'true'
     timeout-minutes: 30
     env:
       # Read by the nvidia-video-codec-sdk build script. Set for every step, because
@@ -272,8 +241,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: host -> target
-          # Keep the runner's shared ~/.cargo/bin: cache-bin deletes rustup on build01.
-          cache-bin: "false"
       - name: Fetch locked crates
         run: cargo fetch --locked --manifest-path host/Cargo.toml
       - name: Create NVENC and NVDEC import libraries
@@ -313,8 +280,7 @@ jobs:
           BUBBLEPLAY_FOREGROUND_TESTS: "1"
         run: node tools/check.mjs host
       - name: Admin agent e2e (basic-user token)
-        # Creates a local user: hosted runners only, never a self-hosted one.
-        if: runner.environment == 'github-hosted'
+        # Creates a local user: runs on the hosted runner only.
         # The hosted runner account is an elevated administrator and the dev agent refuses to run
         # elevated, so `Host tests` skips these tests. Run them again as a standard user;
         # BUBBLEPLAY_E2E_REQUIRE_UNELEVATED turns a skip into a failure.
@@ -352,7 +318,7 @@ jobs:
             Remove-LocalUser -Name $user
           }
       - name: Remove the e2e user
-        if: always() && runner.environment == 'github-hosted'
+        if: always()
         shell: pwsh
         run: |
           net user bpe2e 2>$null | Out-Null
@@ -369,9 +335,7 @@ jobs:
     name: Windows client checks (windows-latest)
     runs-on: windows-latest
     needs: changes
-    # GitHub-hosted Windows minutes are billed and the budget is spent: manual runs only. Changes here are gated
-    # by the local .claude/dk2/win-check.sh run (docs/development.md) until a self-hosted Windows runner exists.
-    if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.client == 'true'
+    if: needs.changes.outputs.client == 'true'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -402,12 +366,11 @@ jobs:
         run: rustfmt --check --edition 2021 client-win/src/main.rs
 
   android:
-    name: Android unit tests and lint (build01)
-    runs-on: [self-hosted, build01]
+    name: Android unit tests and lint
+    runs-on: ubuntu-latest
     needs: changes
-    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
     # Rust relay lane pushes only need the relay-rs job; the full suite runs on PRs to master.
-    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !startsWith(github.ref, 'refs/heads/lane/rust-relay') && needs.changes.outputs.android == 'true'
+    if: "!startsWith(github.ref, 'refs/heads/lane/rust-relay') && needs.changes.outputs.android == 'true'"
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -421,15 +384,8 @@ jobs:
       # The relay e2e tests (android/app/src/test/.../e2e) run the viewer code against a real bp-relay.
       - name: Install pinned Rust toolchain
         run: |
-          if ! command -v rustup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install 1.97.1 --profile minimal --no-self-update
-          # Pin the toolchain for this job only (build01 runners share RUSTUP_HOME).
-          echo "RUSTUP_TOOLCHAIN=1.97.1" >> "$GITHUB_ENV"
-          export RUSTUP_TOOLCHAIN=1.97.1
+          rustup default 1.97.1
           rustc --version
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:

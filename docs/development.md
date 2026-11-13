@@ -24,7 +24,11 @@ Start with the affected module's checks. Changes to packet semantics should incl
 
 The relay is in `relay-rs/`, the only relay in the repository. It serves the browser assets from `worker/public/`; Windows capture and encoding remain in the Rust host. Run its tests from `relay-rs/` as CI does (`cargo test --locked --workspace`), then follow [its setup guide](../relay-rs/README.md) for a separate development instance. Never reuse production credentials for fixtures.
 
-The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, the relay-rs tests, clippy, fmt and wasm32 builds and a container build, the host's Rust tests, clippy and fmt on a hosted Windows runner, and Android unit tests and lint on a hosted Ubuntu runner. The host job links against generated NVENC/NVDEC import libraries without an NVIDIA driver, so it does not establish an NVENC encode or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
+Every job of the Checks and App workflows runs on a GitHub-hosted runner (`ubuntu-latest` or `windows-latest`), for pushes and for pull requests including forks: the repository is public, so no self-hosted runner may run code from a pull request. The workflows grant a read-only token (`permissions: contents: read`), use no secrets, and do not use `pull_request_target`. The `changes` job (`tools/ci-changes.mjs`) skips the jobs a change cannot affect.
+
+The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, the relay-rs tests, clippy, fmt and wasm32 builds and a container build, the host's and the Windows client's Rust tests, clippy and fmt on a hosted Windows runner, Android unit tests and lint on a hosted Ubuntu runner, and the Flutter app's analysis, golden tests and debug APK on a hosted Ubuntu runner.
+
+The phone APK workflows (`android-apk.yml`, `flutter-apk.yml`) are the exception: they run on the home server because it holds the key that publishes the APK. They start only from a manual `workflow_dispatch` or after a successful push run of Checks on `master` of `BubbleBuffer/BubblePlay`, never from a pull request. The host job links against generated NVENC/NVDEC import libraries without an NVIDIA driver, so it does not establish an NVENC encode or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
 
 From the root, run the release tooling checks separately:
 
@@ -277,11 +281,3 @@ Before further optimization, build an isolated candidate and compare it with a
 same-machine baseline. Cover: WSS, WebRTC Gaming, H264 fallback,
 relay/child recovery, ten-minute soak, then helper/display/QoS/browser cleanup
 and idle recovery. Keep production deployment separate from candidate validation.
-
-## Windows checks
-
-Jobs on GitHub-hosted runners (Host checks, Windows client checks, windows-packaging) run only on a manual
-`workflow_dispatch` of the Checks workflow: the Actions budget for this private repository is spent on hosted
-Windows minutes. Until a self-hosted Windows runner exists, changes under `host/` and `client-win/` are gated by the
-local run of `.claude/dk2/win-check.sh <worktree> host|client-win` (fmt, clippy, tests, one run at a time across lanes).
-Every other job, including `changes`, runs on build01.

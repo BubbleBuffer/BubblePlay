@@ -1,9 +1,8 @@
 name: App
 
 # The Flutter app (app/): Dart analysis, widget and golden tests, the Android debug APK and the
-# Kotlin host-API tests. Goldens are rendered here on Linux (build01), never on a developer PC.
-# The Windows side (flutter build windows, the Rust core's FFI tests) runs on the developer's PC:
-# hosted Windows runners are out of budget.
+# Kotlin host-API tests. Goldens are rendered here on a GitHub-hosted Linux runner, never on a developer PC.
+# The Windows side (flutter build windows, the Rust core's FFI tests) runs on the developer's PC.
 
 on:
   push:
@@ -44,7 +43,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: app-${{ github.ref }}
@@ -55,10 +54,11 @@ env:
 
 jobs:
   flutter:
-    name: Flutter analyze, tests, Android APK (build01)
-    runs-on: [self-hosted, build01]
-    # build01 is a persistent self-hosted host: never run code from fork PRs on it.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    name: Flutter analyze, tests, Android APK
+    runs-on: ubuntu-latest
+    # Only the manual golden update pushes a commit. GitHub gives fork pull requests a read-only token regardless.
+    permissions:
+      contents: write
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -69,23 +69,15 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: gradle
-      - name: Flutter SDK
-        # One copy per version in the runner's home, reused by later runs.
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+      - name: Flutter configuration
         run: |
-          dir="$HOME/flutter-$FLUTTER_VERSION"
-          if [ ! -x "$dir/bin/flutter" ]; then
-            tmp="$(mktemp -d)"
-            curl --proto '=https' --tlsv1.2 -sSfL -o "$tmp/flutter.tar.xz" \
-              "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
-            tar -xJf "$tmp/flutter.tar.xz" -C "$tmp"
-            rm -rf "$dir"
-            mv "$tmp/flutter" "$dir"
-            rm -rf "$tmp"
-          fi
-          echo "$dir/bin" >> "$GITHUB_PATH"
-          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
-          "$dir/bin/flutter" --version
-          "$dir/bin/flutter" config --no-analytics --no-cli-animations
+          flutter --version
+          flutter config --no-analytics --no-cli-animations
       - name: Dependencies
         working-directory: app
         run: |
@@ -112,7 +104,7 @@ jobs:
           git config user.email "ci@users.noreply.github.com"
           git add app/test/screens/goldens
           if git diff --cached --quiet; then echo "goldens unchanged"; else
-            git commit -m "App: golden pictures rendered on build01"
+            git commit -m "App: golden pictures rendered on CI"
             git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "HEAD:${{ github.ref_name }}"
           fi
       - name: Upload golden pictures
