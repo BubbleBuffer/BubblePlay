@@ -2843,96 +2843,6 @@ mod tests {
     }
 
     #[test]
-    fn current_user_pipe_acl_excludes_world_and_authenticated_users() {
-        let sid = current_user_sid().unwrap();
-        let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
-        assert!(!sddl.contains(";;;WD"));
-        assert!(!sddl.contains(";;;AU"));
-        assert!(SecurityDescriptor::from_sddl(&sddl).is_ok());
-    }
-
-    #[test]
-    fn current_user_pipe_can_be_bound_as_a_single_local_instance() {
-        let sid = current_user_sid().unwrap();
-        let name = format!(r"\\.\pipe\BubblePlay.StreamLab.test.{}", std::process::id());
-        let server = PipeServer::bind_named_for_sid(&name, &sid).unwrap();
-        assert!(PipeServer::bind_named_for_sid(&name, &sid).is_err());
-        drop(server);
-    }
-
-    #[test]
-    fn pipe_accept_is_cancelable_without_a_client() {
-        let sid = current_user_sid().unwrap();
-        let name = format!(
-            r"\\.\pipe\BubblePlay.StreamLab.cancel.{}",
-            std::process::id()
-        );
-        let server = PipeServer::bind_named_for_sid(&name, &sid).unwrap();
-        let stop = Arc::new(AtomicBool::new(true));
-        let started = Instant::now();
-        assert!(server
-            .accept_for_sid_cancelable(&sid, stop, Duration::from_secs(5))
-            .unwrap()
-            .is_none());
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn production_pipe_accept_is_genuinely_overlapped() {
-        assert_ne!(pipe_open_mode() & FILE_FLAG_OVERLAPPED, 0);
-    }
-
-    #[test]
-    fn connected_client_line_is_received_before_the_client_disconnects() {
-        let sid = current_user_sid().unwrap();
-        let name = format!(
-            r"\\.\pipe\BubblePlay.StreamLab.roundtrip.{}.{}",
-            std::process::id(),
-            unix_ms(SystemTime::now()).unwrap()
-        );
-        let server = PipeServer::bind_named_for_sid(&name, &sid).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let server_stop = stop.clone();
-        let server_sid = sid.clone();
-        let (line_tx, line_rx) = mpsc::sync_channel(1);
-        let server_thread = thread::spawn(move || {
-            let accepted = server
-                .accept_for_sid_cancelable(&server_sid, server_stop, Duration::from_secs(15))
-                .unwrap();
-            let mut reader = BufReader::new(accepted.expect("client accepted"));
-            let line = read_line_limited(&mut reader, MAX_COMMAND_BYTES).unwrap();
-            let _ = line_tx.send(line);
-        });
-
-        const CLIENT_SCRIPT: &str = r#"$ErrorActionPreference='Stop'; $p=[IO.Pipes.NamedPipeClientStream]::new('.', $env:BUBBLEPLAY_TEST_PIPE, [IO.Pipes.PipeDirection]::InOut); $p.Connect(10000); $w=[IO.StreamWriter]::new($p); $w.AutoFlush=$true; $w.WriteLine('{"command":"ping"}'); Start-Sleep -Seconds 60"#;
-        let powershell = system_directory()
-            .unwrap()
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe");
-        let pipe_leaf = name.rsplit("\\").next().unwrap();
-        let mut client = configured_powershell(
-            &powershell,
-            CLIENT_SCRIPT,
-            &[("BUBBLEPLAY_TEST_PIPE", OsStr::new(pipe_leaf))],
-        )
-        .spawn()
-        .unwrap();
-        // PowerShell cold startup is not the pipe-read contract. Allow startup
-        // under load, then prove the line arrived while the client is alive.
-        let received = line_rx.recv_timeout(Duration::from_secs(10));
-        let client_still_connected = client.try_wait().unwrap().is_none();
-        if received.is_err() {
-            stop.store(true, Ordering::Release);
-        }
-        let _ = client.kill();
-        let _ = client.wait();
-        server_thread.join().unwrap();
-        assert_eq!(received.unwrap(), Some(r#"{"command":"ping"}"#.to_owned()));
-        assert!(client_still_connected);
-    }
-
-    #[test]
     fn installed_data_acl_is_validated_not_rewritten_and_profile_is_service_readable() {
         const TRANSPORT_SID: &str = "S-1-5-80-36460983-23004156-1113575813-106319344-2112134846";
         assert!(VALIDATE_DATA_ACL_SCRIPT.contains(TRANSPORT_SID));
@@ -2948,3 +2858,7 @@ mod tests {
         assert!(!VALIDATE_SERVICE_CONFIG_ACL_SCRIPT.contains("Set-Acl"));
     }
 }
+
+#[cfg(test)]
+#[path = "bubbleplay_lab_helper/pipe_tests.rs"]
+mod pipe_tests;

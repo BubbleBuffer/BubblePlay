@@ -50,15 +50,26 @@ pub fn create(rtc: &mut Rtc) -> (String, SdpPendingOffer, Mid, Mid) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const OFFER_CONTRACT: &str = include_str!("../../../../fixtures/webrtc-offer-contract.json");
     #[test]
     fn offer_matches_browser_media_order_directions_codecs_and_channels() {
         let mut r = rtc(Instant::now(), true);
         let (s, _, _, _) = create(&mut r);
-        let video = s.find("m=video").unwrap();
-        let audio = s.find("m=audio").unwrap();
-        let app = s.find("m=application").unwrap();
-        assert!(video < audio && audio < app);
-        assert_eq!(s.matches("a=recvonly").count(), 2);
+        let contract: serde_json::Value = serde_json::from_str(OFFER_CONTRACT).unwrap();
+        let positions: Vec<usize> = contract["mediaOrder"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|kind| s.find(&format!("m={}", kind.as_str().unwrap())).unwrap())
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let recvonly = contract["directions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|direction| direction.as_str() == Some("recvonly"))
+            .count();
+        assert_eq!(s.matches("a=recvonly").count(), recvonly);
         assert!(s.contains("H265/90000"));
         assert!(s.contains("H264/90000"));
         assert!(s.contains("opus/48000/2"));
@@ -72,23 +83,21 @@ mod tests {
         assert!(s.contains("profile-id=1"));
         assert!(s.contains("minptime=10"));
         assert!(s.contains("useinbandfec=1"));
-        let source = include_str!("../../../../worker/public/receiver.js");
-        assert!(source.contains("createDataChannel(\"input-control\", { ordered: true })"));
-        assert!(source.contains(
-            "createDataChannel(\"input-motion\", { ordered: false, maxRetransmits: 0 })"
-        ));
-        let [c, m] = channel_configs();
-        assert_eq!(c.label, "input-control");
-        assert_eq!(m.label, "input-motion");
-        assert!(c.ordered);
-        assert!(!m.ordered);
-        assert_eq!(c.reliability, Reliability::Reliable);
-        assert_eq!(
-            m.reliability,
-            Reliability::MaxRetransmits { retransmits: 0 }
-        );
-        assert_eq!(c.negotiated, None);
-        assert_eq!(m.negotiated, None);
+        let configs = channel_configs();
+        let expected = contract["dataChannels"].as_array().unwrap();
+        assert_eq!(configs.len(), expected.len());
+        for (config, want) in configs.iter().zip(expected) {
+            assert_eq!(config.label, want["label"].as_str().unwrap());
+            assert_eq!(config.ordered, want["ordered"].as_bool().unwrap());
+            let reliability = match want["maxRetransmits"].as_u64() {
+                None => Reliability::Reliable,
+                Some(retransmits) => Reliability::MaxRetransmits {
+                    retransmits: retransmits as u16,
+                },
+            };
+            assert_eq!(config.reliability, reliability);
+            assert_eq!(config.negotiated, None);
+        }
     }
     #[test]
     fn capability_fallback_omits_hevc_but_keeps_h264_opus_and_application() {

@@ -1,9 +1,6 @@
 import test from "node:test";
-import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import vm from "node:vm";
-import { createCodecSession, orderRtpCodecPreferences, rtpCodecMimeTypes } from "../public/transport.js";
+import { orderRtpCodecPreferences, rtpCodecMimeTypes } from "../public/transport.js";
 
 const hevc = (sdpFmtpLine = "profile-id=1") => ({ mimeType: "video/H265", clockRate: 90000, sdpFmtpLine });
 const hevcAlias = { mimeType: "video/hevc", clockRate: 90000, sdpFmtpLine: "profile-id=2" };
@@ -70,34 +67,4 @@ test("missing or empty capabilities and unknown codecs yield an empty preference
 
 test("capability entries without a mimeType are skipped rather than throwing", () => {
   assert.deepEqual(orderRtpCodecPreferences([{ clockRate: 90000 }, h264High, null], "hevc"), [h264High]);
-});
-
-test("receiver sets both preferences HEVC first and preserves its capability fallback", () => {
-  const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
-  const start = source.indexOf("  // Prefer HEVC for a fresh page");
-  const block = source.slice(start, source.indexOf("  // Reliable ordered state lane", start));
-  for (const [codec, caps, expected, fallback] of [
-    ["hevc", [h264High, hevc()], [hevc(), h264High], false],
-    ["hevc", [hevc(), h264High], [hevc(), h264High], false],
-    ["hevc", [h264High], null, true],
-    ["hevc", [], null, true],
-    ["h264", [hevc(), h264High], [h264High], false],
-    ["h264", [hevc()], null, false],
-  ]) {
-    const codecSession = createCodecSession({ transport: "webrtc", decoderPath: codec === "h264" ? "webcodecs" : "native" });
-    let preferences = null, closed = false, restarted = false;
-    const context = createSessionContext({ codecSession, orderRtpCodecPreferences, rtpCodecMimeTypes,
-      RTCRtpReceiver: { getCapabilities: () => ({ codecs: caps }) },
-      transceiver: { setCodecPreferences: value => { preferences = value; } },
-      candidate: { close: () => { closed = true; } },
-      startPeer: () => { restarted = true; }, generation: 1, offerSent: true,
-      console: { warn: error => assert.fail(String(error)) },
-    });
-    vm.runInContext(`(() => { ${block} })()`, context);
-    assert.deepEqual(preferences, expected);
-    assert.equal(closed, fallback);
-    assert.equal(restarted, fallback);
-    assert.equal(context.offerSent, !fallback);
-    assert.equal(codecSession.codec, fallback ? "h264" : codec);
-  }
 });

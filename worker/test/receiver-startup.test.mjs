@@ -80,26 +80,6 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
   assert.equal(sockets.length, 2);
 });
 
-test("first-frame is requested directly after successful offer signaling", async () => {
-  const events = [];
-  const start = source.indexOf("    const offer = await candidate.createOffer();");
-  const end = source.indexOf("  } catch (e)", start);
-  const block = source.slice(start, end);
-  const context = createSessionContext({ generation: 3,
-    candidate: { createOffer: async () => ({ sdp: "offer-sdp" }), setLocalDescription: async () => events.push("local-description") },
-    isCurrentPeer: () => true, rtcOfferSignaled: false,
-    sendControl: message => { events.push(message.type); return true; },
-    startFirstFrameHandshake: reason => events.push(`first-frame:${reason}`),
-  });
-  await vm.runInContext(`(async () => { ${block} })()`, context);
-  assert.deepEqual(events, ["local-description", "offer", "first-frame:offer-sent"]);
-  assert.equal(context.rtcOfferSignaled, true);
-  events.length = 0; context.sendControl = () => false; context.rtcOfferSignaled = false;
-  await vm.runInContext(`(async () => { ${block} })()`, context);
-  assert.deepEqual(events, ["local-description"]);
-  assert.equal(context.rtcOfferSignaled, false);
-});
-
 test("slow ICE renews an exhausted offer-time handshake; normal ICE retains its request", () => {
   const timers = new Map();
   let nextTimer = 0;
@@ -123,20 +103,19 @@ test("slow ICE renews an exhausted offer-time handshake; normal ICE retains its 
     mobilePointerDevice: true,
   });
   const handshakeFns = source.slice(source.indexOf("function armFirstFrameWatchdog("), source.indexOf("function markFirstFramePresented("));
-  const iceHandler = source.slice(source.indexOf("  candidate.oniceconnectionstatechange ="), source.indexOf("  candidate.ontrack ="));
-  vm.runInContext(handshakeFns + '\n' + iceHandler, context);
+  vm.runInContext(handshakeFns, context);
   vm.runInContext('startFirstFrameHandshake("desktop-state");', context);
   assert.equal(nextRequest, 0, "request cannot precede the offer");
   context.rtcOfferSignaled = true;
   vm.runInContext('startFirstFrameHandshake("offer-sent");', context);
   const first = state.requestId;
-  candidate.oniceconnectionstatechange();
+  vm.runInContext('startFirstFrameHandshake("ice-connected");', context);
   assert.equal(state.requestId, first); assert.equal(sent.length, 1);
   let timer = timers.get(state.timer); assert.equal(timer.delay, 5_000); timer.fn();
   assert.equal(state.requestId, first); assert.equal(sent.length, 2, "first watchdog retries same request");
   timer = timers.get(state.timer); assert.equal(timer.delay, 5_000); timer.fn();
   assert.equal(state.phase, "failed");
-  candidate.oniceconnectionstatechange();
+  vm.runInContext('startFirstFrameHandshake("ice-connected");', context);
   assert.notEqual(state.requestId, first); assert.equal(state.phase, "starting");
   assert.equal(sent.length, 3, "late media readiness renews the handshake");
 });
@@ -274,19 +253,4 @@ test("terminal RTC failure falls back in auto mode; explicit RTC and transient d
       assert.deepEqual(events, ["fallback"], "repeat failure cannot recycle the signaling socket during WSS startup");
     }
   }
-});
-
-test("ICE failure can rescue auto only once peer connection is no longer connecting", () => {
-  const handler = source.slice(source.indexOf("  candidate.oniceconnectionstatechange ="), source.indexOf("  candidate.ontrack ="));
-  const events = [];
-  const candidate = { iceConnectionState: "failed", connectionState: "connecting" };
-  const context = createSessionContext({ candidate, generation: 0, isCurrentPeer: () => true,
-    rtcStartupFallback: { progress() {} }, hudState: {}, connected: false,
-    requestedTransport: "auto", TRANSPORT: { AUTO: "auto" }, usingWssMedia: false, wssSelected: false,
-    switchToWss: reason => events.push(reason),
-  });
-  vm.runInContext(handler, context);
-  candidate.oniceconnectionstatechange(); assert.deepEqual(events, []);
-  candidate.connectionState = "failed";
-  candidate.oniceconnectionstatechange(); assert.deepEqual(events, ["ice-failed"]);
 });

@@ -123,6 +123,12 @@
         "relay"
       ]
     },
+    "webrtc-offer-contract.json": {
+      "consumers": [
+        "worker",
+        "client-win"
+      ]
+    },
     "wss-contract.json": {
       "consumers": [
         "client-win",
