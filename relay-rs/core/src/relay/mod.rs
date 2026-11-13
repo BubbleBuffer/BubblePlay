@@ -8,12 +8,18 @@
 //! adapter must carry out. A `Close` action is always followed by `on_close`
 //! for that socket, which is idempotent.
 
+mod admin;
+mod conns;
 mod forward;
 mod hello;
+mod host_hello;
 mod pairing;
 mod pcs;
+mod preauth;
+pub mod reasons;
 mod snapshot;
 mod state;
+mod tickets;
 mod types;
 mod util;
 
@@ -28,10 +34,16 @@ use pairing::{PairFailures, PairWindow};
 use state::{Conn, Kind, Phase, Role, Room, key_for, read_limit};
 
 pub use pcs::{MAX_PCS, PcRecord, PcTable};
-pub use types::{
-    Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, PcListing, Reject, Route,
-    SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig, UpgradeRequest,
+pub use preauth::{
+    EVICTED_CLOSE_CODE, HELLO_TIMEOUT_MS, PRE_AUTH_MAX_PER_PREFIX, PRE_AUTH_MAX_TOTAL,
+    PROOF_TIMEOUT_MS,
 };
+pub use types::{
+    Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, DEFAULT_MAX_CONNECTIONS,
+    PcListing, Reject, Route, SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig,
+    UpgradeRequest, Upgraded,
+};
+pub use util::ct_eq;
 
 /// The routing state for one relay.
 pub struct Relay {
@@ -54,34 +66,6 @@ pub struct Relay {
     client_log_dropped: u64,
     /// When that debug line was last written.
     client_log_logged_ms: Option<u64>,
-}
-
-/// The close reasons clients can show. No secrets, no detail an outsider could use.
-pub mod reasons {
-    /// Malformed or unexpected hello, proof or packet before the session is live.
-    pub const INVALID_HELLO: &str = "invalid hello";
-    /// A live socket sent a packet the relay does not accept.
-    pub const INVALID_PACKET: &str = "invalid packet";
-    /// The viewer's identity proof did not verify.
-    pub const INVALID_PROOF: &str = "invalid proof";
-    /// The viewer is not on the PC's admission list and offered no pairing code.
-    pub const NOT_PAIRED: &str = "not paired";
-    /// The pairing code was wrong, or no pairing window is open.
-    pub const PAIRING_CODE: &str = "pairing code not accepted";
-    /// Too many failed pairing attempts, from this network or against this PC.
-    pub const RATE_LIMITED: &str = "rate limited";
-    /// A media or file socket's ticket or epoch was not accepted.
-    pub const NOT_AUTHORIZED: &str = "not authorized";
-    /// The socket did not finish its hello or proof in time.
-    pub const TIMED_OUT: &str = "timed out";
-    /// The host removed this viewer from the admission list.
-    pub const ACCESS_REMOVED: &str = "access removed";
-    /// The site gate did not approve this browser socket.
-    pub const NOT_APPROVED: &str = "not approved";
-    /// The socket could not be restored after the relay woke from hibernation.
-    pub const SESSION_NOT_RESTORED: &str = "session not restored";
-    /// The PC was removed by the admin.
-    pub const PEER_REMOVED: &str = "peer removed";
 }
 
 impl Relay {
@@ -147,13 +131,14 @@ impl Relay {
 
     /// Accepts an upgrade. Origin and the gate cookie were checked by the
     /// adapter. `client` is the peer address; its prefix keys the pairing rate
-    /// limits. Refusals are `Reject` (HTTP 404), including the connection cap.
+    /// limits. Refusals are `Reject` (HTTP 404), including the connection cap. A full relay closes
+    /// pending sockets to make room (see `preauth`); `Upgraded::evicted` holds those closes.
     pub fn upgrade(
         &mut self,
         req: UpgradeRequest,
         client: IpAddr,
         now_ms: u64,
-    ) -> Result<ConnId, Reject> {
+    ) -> Result<Upgraded, Reject> {
         self.clock_ms = self.clock_ms.max(now_ms);
         let role = req.route.role();
         let kind = role.kind();
@@ -182,7 +167,9 @@ impl Relay {
             }
             epoch
         };
-        if self.conns.len() >= self.config.max_connections {
+        let prefix = Prefix::of(client);
+        let mut evicted = Vec::new();
+        if !self.make_room(prefix, &mut evicted) {
             return Err(self.upgrade_refused("upgrade.connection-cap", role, Some(&pc)));
         }
         let id = ConnId(self.next_id);
@@ -198,14 +185,14 @@ impl Relay {
                 deadline_ms: now_ms + self.config.timings.hello_ms,
                 closing: false,
                 ticket: None,
-                prefix: Prefix::of(client),
+                prefix,
                 device: String::new(),
                 pairing: false,
                 activity_ms: now_ms,
                 saved_activity_ms: now_ms,
             },
         );
-        Ok(id)
+        Ok(Upgraded { id, evicted })
     }
 
     /// Logs an upgrade the relay answers with HTTP 404.
@@ -315,63 +302,6 @@ impl Relay {
         out
     }
 
-    /// The listing for the admin route: every remembered PC, sorted by id.
-    pub fn list_pcs(&self) -> Result<Vec<PcListing>, AdminError> {
-        if !self.healthy {
-            return Err(AdminError::Unavailable);
-        }
-        Ok(self.listing())
-    }
-
-    /// The same rows without the health check: what an adapter that keeps one PC per object reports
-    /// to its directory.
-    pub fn listing(&self) -> Vec<PcListing> {
-        self.pcs
-            .records
-            .iter()
-            .map(|(id, record)| PcListing {
-                id: id.clone(),
-                public: util::b64url(&record.public),
-                first_seen: record.first_seen,
-                last_seen: record.last_seen,
-                online: self.host_online(id),
-                admitted: record.admitted.len(),
-            })
-            .collect()
-    }
-
-    /// Forgets a PC. Persists the table first (the first action), then closes
-    /// its host sockets 1008 "peer removed" and sends peer-left to its viewer.
-    /// An id that is not a device id, or a valid id with no registered PC, is
-    /// `AdminError::NotFound` and nothing is persisted.
-    pub fn delete_pc(&mut self, id: &str) -> Result<Vec<Action>, AdminError> {
-        if !self.healthy {
-            return Err(AdminError::Unavailable);
-        }
-        let pc = util::canonical_pc(id).ok_or(AdminError::NotFound)?;
-        if self.pcs.records.remove(&pc).is_none() {
-            return Err(AdminError::NotFound);
-        }
-        let mut out = vec![Action::PersistPcs(self.pcs.clone())];
-        let hosts: Vec<ConnId> = self
-            .conns
-            .iter()
-            .filter(|(_, c)| c.pc == pc && c.route.is_host_socket())
-            .map(|(id, _)| *id)
-            .collect();
-        for host in hosts {
-            self.close(
-                host,
-                1008,
-                reasons::PEER_REMOVED,
-                "admin.pc-removed",
-                &mut out,
-            );
-            self.forget(host, &mut out);
-        }
-        Ok(out)
-    }
-
     // -- shared bookkeeping, used by the hello and forward paths --------------
 
     /// The socket if it exists and is not closing.
@@ -411,154 +341,6 @@ impl Relay {
             conn.phase = Phase::Live;
             conn.deadline_ms = now_ms + idle;
             conn.activity_ms = now_ms;
-        }
-    }
-
-    /// Marks a socket closing and queues the Close action. Idempotent.
-    /// `class` names why, for the log line: a short dotted word such as
-    /// `pairing.wrong-code`. Every close is logged with its status, reason and class.
-    fn close(
-        &mut self,
-        id: ConnId,
-        code: u16,
-        reason: &str,
-        class: &'static str,
-        out: &mut Vec<Action>,
-    ) {
-        let seen = self.conns.get_mut(&id).filter(|c| !c.closing).map(|conn| {
-            conn.closing = true;
-            // A viewer that has not been admitted yet is known by the id it claimed.
-            let device = match &conn.phase {
-                Phase::ViewerProof { id, .. } if conn.device.is_empty() => id.to_string(),
-                _ => conn.device.clone(),
-            };
-            (conn.role, device, conn.pc.clone())
-        });
-        if let Some((role, device, pc)) = seen {
-            out.push(Action::Close(id, code, reason.to_owned()));
-            let level = if code == 1008 {
-                crate::log::Level::Warn
-            } else {
-                crate::log::Level::Info
-            };
-            let msg = if code == 1008 {
-                "socket refused"
-            } else {
-                "socket closed"
-            };
-            let fields = serde_json::json!({
-                "class": class,
-                "status": code,
-                "reason": reason,
-                "role": role.name(),
-                "peer": (!device.is_empty()).then(|| crate::log::short_id(&device)),
-            });
-            self.log(level, msg, (!pc.is_empty()).then_some(pc.as_str()), fields);
-        }
-    }
-
-    /// Closes a socket and drops it from the peer table without telling its
-    /// peer. Go does this when a socket is replaced or cleared as stale.
-    fn evict(
-        &mut self,
-        id: ConnId,
-        code: u16,
-        reason: &str,
-        class: &'static str,
-        out: &mut Vec<Action>,
-    ) {
-        self.close(id, code, reason, class, out);
-        if let Some(conn) = self.conns.remove(&id) {
-            let key = key_for(conn.role, &conn.epoch, &conn.pc);
-            if self.peers.get(&key) == Some(&id) {
-                self.peers.remove(&key);
-            }
-        }
-    }
-
-    /// Queues a text frame unless the socket is gone.
-    fn send_text(&self, id: ConnId, text: String, out: &mut Vec<Action>) {
-        if self.is_open(id) {
-            out.push(Action::SendText(id, text));
-        }
-    }
-
-    /// Queues a binary frame unless the socket is gone.
-    fn send_binary(&self, id: ConnId, bytes: &[u8], out: &mut Vec<Action>) {
-        if self.is_open(id) {
-            out.push(Action::SendBinary(id, bytes.to_vec()));
-        }
-    }
-
-    /// Go's removePeerLocked: forgets the socket and tells its peer. Safe to
-    /// call for a socket that was already forgotten.
-    fn forget(&mut self, id: ConnId, out: &mut Vec<Action>) {
-        let Some(conn) = self.conns.remove(&id) else {
-            return;
-        };
-        let kind = conn.role.kind();
-        let key = key_for(conn.role, &conn.epoch, &conn.pc);
-        if self.peers.get(&key) == Some(&id) {
-            self.peers.remove(&key);
-            if conn.role == Role::Viewer {
-                self.forget_viewer_state(&conn, out);
-            }
-            if conn.role == Role::Host {
-                // The host's signalling socket closing removes its pairing window.
-                self.pair_windows.remove(&conn.pc);
-            }
-            self.notify_peer_left(&conn, kind, out);
-        }
-        if !conn.pc.is_empty() && !self.conns.values().any(|c| c.pc == conn.pc) {
-            self.rooms.remove(&conn.pc);
-        }
-    }
-
-    /// A viewer left: its pending buffer goes, its epoch is cleared if current,
-    /// and its data sockets for that epoch are closed.
-    fn forget_viewer_state(&mut self, conn: &Conn, out: &mut Vec<Action>) {
-        if let Some(room) = self.rooms.get_mut(&conn.pc) {
-            room.pending.clear();
-            if room.current_epoch.as_deref() == Some(conn.epoch.as_str()) {
-                room.current_epoch = None;
-            }
-        }
-        let departed: Vec<ConnId> = self
-            .peers
-            .iter()
-            .filter(|(k, _)| k.kind != Kind::Signal && k.pc == conn.pc && k.epoch == conn.epoch)
-            .map(|(_, id)| *id)
-            .collect();
-        for id in departed {
-            self.close(id, 1001, "viewer departed", "viewer.left", out);
-        }
-    }
-
-    /// Tells the other side of a departed socket: peer-left for signalling,
-    /// media-peer present=false for media, and file-peer-left (a close) for files.
-    fn notify_peer_left(&mut self, conn: &Conn, kind: Kind, out: &mut Vec<Action>) {
-        let Some(other_role) = conn.role.other() else {
-            return;
-        };
-        let other_key = key_for(other_role, &conn.epoch, &conn.pc);
-        let Some(other) = self.peers.get(&other_key).copied() else {
-            return;
-        };
-        match kind {
-            Kind::Signal => self.send_text(
-                other,
-                serde_json::json!({"type": "peer-left"}).to_string(),
-                out,
-            ),
-            Kind::Media => self.send_text(
-                other,
-                serde_json::json!({"type": Role::peer_event(kind), "present": false}).to_string(),
-                out,
-            ),
-            Kind::File => {
-                self.peers.remove(&other_key);
-                self.close(other, 1001, "file-peer-left", "file.peer-left", out);
-            }
         }
     }
 }

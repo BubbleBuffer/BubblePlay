@@ -13,6 +13,7 @@
 
 pub mod directory;
 pub mod gate;
+pub mod holds;
 pub mod limits;
 pub mod log;
 pub mod presence;
@@ -23,18 +24,16 @@ pub mod rng;
 pub use relay::{
     Action, AdminError, ConnId, ConnPhase, ConnSnapshot, CoreConfig, MAX_PCS, PcListing, PcRecord,
     PcTable, Reject, Relay, Route, SnapshotPairWindow, SnapshotTicket, Timings, TurnConfig,
-    UpgradeRequest,
+    UpgradeRequest, Upgraded,
 };
 pub use rng::RelayRng;
 
 pub use limits::{
     ATTACHMENT_MAX, FILE_HEADER_BYTES, FILE_LIMIT, HELLO_LIMIT, MEDIA_CONTROL_MAX,
-    MEDIA_HEADER_BYTES, MEDIA_LIMIT, PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES,
-    SIGNAL_BINARY_MAX, SIGNAL_BINARY_MIN, SIGNAL_LIMIT,
+    MEDIA_HEADER_BYTES, MEDIA_LIMIT, PENDING_LIMIT, QUEUE_BYTE_LIMIT, QUEUE_FRAMES, SIGNAL_LIMIT,
 };
 pub use protocol::{
     FileKind, FilePacket, FileText, Invalid, MediaControl, Side, SignalKind, SignalMessage,
     validate_epoch, validate_file_binary, validate_file_text, validate_media_binary,
-    validate_media_text, validate_signal_binary, validate_signal_text,
-    validate_signal_text_for_role,
+    validate_media_text, validate_signal_text, validate_signal_text_for_role,
 };
