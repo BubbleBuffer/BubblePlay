@@ -1,5 +1,5 @@
 # Phone APK on the home server, same path as Notes: build01 builds the unsigned
-# release APK and streams it over vmbr1 to linux01, which aligns, release-signs
+# release APK and streams it over SSH to the publish host, which aligns, release-signs
 # with the BubblePlay key and publishes it to the private F-Droid repo. Neither
 # the PC keystore nor a GitHub artifact or secret is involved.
 name: android-apk
@@ -51,9 +51,15 @@ jobs:
         # unsigned; versionCode defaults to epoch minutes (app/build.gradle.kts).
         # android/gradlew is committed without the executable bit, so run it via bash.
         run: bash ./gradlew --no-daemon assembleRelease
-      - name: Sign and publish on linux01
+      - name: Sign and publish
         working-directory: android
+        env:
+          APK_PUBLISH_SSH: ${{ vars.APK_PUBLISH_SSH }}
+          APK_PUBLISH_KEY: ${{ vars.APK_PUBLISH_KEY }}
         run: |
+          for name in APK_PUBLISH_SSH APK_PUBLISH_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::Repository variable is empty: $name (set APK_PUBLISH_SSH and APK_PUBLISH_KEY; see docs/development.md)"; exit 1; fi
+          done
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            -i /home/builder/.ssh/linux01-apk-bubbleplay dev@100.65.1.104 'apk-publish bubbleplay' \
+            -i "$APK_PUBLISH_KEY" "$APK_PUBLISH_SSH" 'apk-publish bubbleplay' \
             < app/build/outputs/apk/release/app-release-unsigned.apk

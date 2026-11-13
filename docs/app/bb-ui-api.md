@@ -1,6 +1,6 @@
 # bb_ui 0.7.0 API cheat sheet
 
-Source: `C:\Users\Admin\AppData\Local\Pub\Cache\git\bb-ui-a7bd22519ca7f55c5b2bf9ddf039d5194dc3dc5d\packages\bb_ui\lib` (barrel `bb_ui.dart`).
+Source: `packages/bb_ui/lib` of the bb-ui git dependency (pinned in `app/pubspec.lock`) (barrel `bb_ui.dart`).
 Tokens: `...\packages\bb_tokens\lib\tokens.dart` (re-exported by bb_ui). Repo root has no CHANGELOG; docs are `README.md`, `packages/bb_ui/README.md`, `docs/verification.md`.
 Signatures copied from source. Every widget class accepts `key` (omitted from the lines below).
 

@@ -1,5 +1,5 @@
 # Phone APK of the Flutter app (app/, de.bubblebuffer.bubbleplay.flutter), same path as android-apk:
-# build01 builds the release APK and streams it over vmbr1 to linux01, which aligns, re-signs it with
+# build01 builds the release APK and streams it over SSH to the publish host, which aligns, re-signs it with
 # the BubblePlay release key (a separate applicationId from the native app) and publishes it to the
 # private F-Droid repo. No keystore, artifact or secret is involved.
 name: flutter-apk
@@ -69,12 +69,18 @@ jobs:
       - name: Build release APK
         working-directory: app
         # The Windows-only Rust core is not part of the Android build. The APK is debug-signed here;
-        # linux01 re-signs it. versionCode = epoch minutes, the scheme of the native app.
+        # The publish host re-signs it. versionCode = epoch minutes, the scheme of the native app.
         run: flutter build apk --release --build-number="$(( $(date +%s) / 60 ))"
-      - name: Sign and publish on linux01
+      - name: Sign and publish
+        env:
+          APK_PUBLISH_SSH: ${{ vars.APK_PUBLISH_SSH }}
+          APK_PUBLISH_KEY: ${{ vars.APK_PUBLISH_KEY_FLUTTER }}
         run: |
+          for name in APK_PUBLISH_SSH APK_PUBLISH_KEY; do
+            if [ -z "${!name}" ]; then echo "::error::Repository variable is empty: $name (set APK_PUBLISH_SSH and APK_PUBLISH_KEY_FLUTTER; see docs/development.md)"; exit 1; fi
+          done
           apk=app/build/app/outputs/flutter-apk/app-release.apk
           test -s "$apk"
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            -i /home/builder/.ssh/linux01-apk-bubbleplay-flutter dev@100.65.1.104 'apk-publish bubbleplay-flutter' \
+            -i "$APK_PUBLISH_KEY" "$APK_PUBLISH_SSH" 'apk-publish bubbleplay-flutter' \
             < "$apk"
