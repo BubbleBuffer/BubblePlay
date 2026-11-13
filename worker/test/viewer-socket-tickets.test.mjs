@@ -1,7 +1,9 @@
+import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { FileTransferClient } from "../public/file-client.js";
 import { b64urlDecode, pcListUrl, registerProof, relayOrigin, viewerHello } from "../public/dk-relay.js";
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
@@ -82,9 +84,8 @@ function signalHarness(identity) {
     BPLog: { log: (...args) => logged.push(args), setContext() {} },
     debugTrace: (...args) => output.push(args), recordSignalingError: (...args) => output.push(args),
     shouldReconnectAfterClose: () => false, restartPeer() {},
-    clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
-    noteConnectionLoss() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
-    recoveryLossMs: null, recoveryAttempts: 0,
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
+    recovery: recoveryStub(), noteSessionAuthenticated() {}, handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
     sendStreamMode: reason => endpoint.push(["stream-mode", reason]), wssSelected: false,
     startPeer: generation => endpoint.push(["start-peer", generation]), peerGeneration: 0,
     requestWssMediaStart: () => endpoint.push(["start-wss"]),
@@ -302,7 +303,7 @@ test("media hello requires authenticated media and a current ticket; obsolete so
   const h = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, usingWssMedia: true, mediaEpoch: epoch,
     wssV4: {}, signalingTicket: null, authenticatedSession: null,
     mediaSocketUrl: () => `wss://relay.test/media-ws?epoch=${epoch}&pc=pc-one`,
-    performance: { now: () => 1 } });
+    performance: { now: () => 1 }, setTimeout: () => 0, clearTimeout() {}, MEDIA_CONNECT_TIMEOUT_MS: 1, viewerLog() {} });
   vm.runInContext(receiverFunction("openWssV4Socket"), h);
   h.openWssV4Socket(); assert.equal(sockets.length, 0);
   h.signalingTicket = ticket;

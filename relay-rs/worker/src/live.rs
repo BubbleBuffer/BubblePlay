@@ -13,6 +13,20 @@ use worker::{Date, State, WebSocket, web_sys};
 /// While the PC store is unhealthy, the alarm wakes this often to retry the write.
 pub const STORE_RETRY_MS: u64 = 1_000;
 
+/// The first wait before a failed directory report is sent again, in milliseconds. It doubles
+/// with each failure.
+pub const REPORT_RETRY_BASE_MS: u64 = 2_000;
+
+/// The longest wait between two attempts to report to the directory, in milliseconds.
+pub const REPORT_RETRY_MAX_MS: u64 = 60_000;
+
+/// The wait before the next report attempt after `failures` failed ones in a row.
+pub fn report_retry_ms(failures: u32) -> u64 {
+    REPORT_RETRY_BASE_MS
+        .saturating_mul(1u64.checked_shl(failures).unwrap_or(u64::MAX))
+        .min(REPORT_RETRY_MAX_MS)
+}
+
 /// What this object last told the directory about its host's presence (memory only: a wake
 /// reports again).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +43,11 @@ pub struct PcLive {
     pub reported: Option<Reported>,
     /// True when the directory has not yet been told the current state (a report failed).
     pub report_pending: bool,
+    /// Directory reports that failed in a row since the last acknowledged one.
+    pub report_failures: u32,
+    /// True once this object's own storage holds the PC's record. Registration of such a PC does
+    /// not wait for the directory.
+    pub stored: bool,
     /// True once this object has asked the front object for a record left by the single-object
     /// relay (memory only: a new start asks again, and the answer is then 404).
     pub legacy_checked: bool,
@@ -43,8 +62,11 @@ impl PcLive {
     pub fn alarm_change(&mut self, now: u64) -> Option<Option<u64>> {
         let mut next = self.core.next_deadline();
         let mut earlier = |at: u64| next = Some(next.map_or(at, |deadline| deadline.min(at)));
-        if !self.pcs_healthy || self.report_pending {
+        if !self.pcs_healthy {
             earlier(now.saturating_add(STORE_RETRY_MS));
+        }
+        if self.report_pending {
+            earlier(now.saturating_add(report_retry_ms(self.report_failures)));
         }
         // An online host's presence is repeated to the directory, so a lost object cannot leave it
         // online for ever.

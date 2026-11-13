@@ -25,6 +25,11 @@ fn phase_of(phase: &Phase) -> ConnPhase {
     }
 }
 
+/// A wake's first connection id is its clock in milliseconds shifted left by this many bits, so
+/// ids stay below 2^53 (an attachment carries them as numbers) and a later wake always starts
+/// above an earlier one unless more than 2^bits connections opened per millisecond.
+const WAKE_ID_SHIFT_BITS: u32 = 10;
+
 impl Relay {
     /// The snapshot of an open socket. None once the socket is closing or gone.
     /// The adapter calls this right after `upgrade` to attach the first snapshot.
@@ -194,9 +199,13 @@ impl Relay {
         snapshots.sort_by_key(|snapshot| snapshot.id);
         let mut relay = Relay::new(config, pcs);
         relay.clock_ms = now_ms;
-        relay.next_id = snapshots
-            .last()
-            .map_or(1, |snapshot| snapshot.id.0.saturating_add(1));
+        // Ids never repeat across wakes. A late event for a socket that is gone carries its old
+        // id, and must not meet a new connection that took it. Every wake starts above the
+        // previous one by its clock, and above every snapshot's id.
+        let wake_floor = now_ms << WAKE_ID_SHIFT_BITS;
+        relay.next_id = snapshots.last().map_or(wake_floor, |snapshot| {
+            snapshot.id.0.saturating_add(1).max(wake_floor)
+        });
         let mut out = Vec::new();
         let mut signalling = Vec::new();
         let mut data = Vec::new();

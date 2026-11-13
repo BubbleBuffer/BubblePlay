@@ -82,3 +82,15 @@ Settings has two groups that matter here.
 
 - `worker/test` runs the unit tests. CI job `browser` runs them. CI has no real browser, so the WSS worker path is covered by `wss-pipeline.test.mjs` (the pipeline against a fake decoder and canvases) and `wss-worker-path.test.mjs` (path selector, worker handshake and source contracts).
 - `worker/test-e2e` runs the browser end-to-end tests against `bp-relay-server`. CI job `browser-e2e` runs them.
+
+## Code layout
+
+`worker/public/receiver.js` is being split into modules that each own their state behind a small interface (plain ES modules, no bundler). Split so far:
+
+- `sharp-session.js`: the sharp-viewport negotiation with the host (requested, committed and pending crop, the transition timeout and the session-wide disable). The receiver supplies the desktop size, viewport geometry and transport through `createSharpSession(env)` and renders the crop the session reports. Crop math stays in `sharp-viewport.js`.
+- `composition-gate.js`: commits secure-desktop Android composition text once, through one pending transaction.
+- `connection-status.js`: pure model of the connection chip (state, label, tooltip, Admin warning).
+- `keyboard-draft.js`: the on-screen keyboard field: diffs the draft against what was sent, chunks text under the packet limit, and sends protected input only on a secure desktop.
+- `wss-audio.js`: the WSS audio player for one media session, its sound-controller sink, and cumulative counters across restarts.
+- `hud-text.js`: the text of the diagnostics HUD overlay (pure formatter).
+- `recovery-tracker.js`: the state of a recovery after a lost signaling connection (loss time, retry budget, attempts, suspended time) and its log line; the decisions are the pure functions in `recovery.js`.

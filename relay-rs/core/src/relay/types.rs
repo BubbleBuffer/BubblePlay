@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::pcs::PcTable;
+use super::preauth::{HELLO_TIMEOUT_MS, PROOF_TIMEOUT_MS};
 
 /// Identifies one upgraded socket. Ids are never reused within a Relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -63,6 +64,16 @@ pub struct UpgradeRequest {
     pub viewer_authorized: bool,
 }
 
+/// An accepted upgrade.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Upgraded {
+    /// The new socket.
+    pub id: ConnId,
+    /// `Close` actions for pending sockets the relay dropped to make room. The adapter carries
+    /// them out like any other close.
+    pub evicted: Vec<Action>,
+}
+
 /// The upgrade is refused. The adapter answers HTTP 404.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reject;
@@ -93,12 +104,15 @@ pub struct PcListing {
     pub admitted: usize,
 }
 
+/// The default for `CoreConfig::max_connections`: sockets per PC object.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 32;
+
 /// Protocol timings. Defaults are the settled values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timings {
-    /// Deadline for the first hello on any socket (10 s).
+    /// Deadline for the first hello on any socket (`HELLO_TIMEOUT_MS`).
     pub hello_ms: u64,
-    /// Deadline for register-proof after register-challenge (30 s, single use).
+    /// Deadline for register-proof after register-challenge (`PROOF_TIMEOUT_MS`, single use).
     pub challenge_ms: u64,
     /// Idle timeout, refreshed by every processed message (90 s).
     pub idle_ms: u64,
@@ -113,8 +127,8 @@ pub struct Timings {
 impl Default for Timings {
     fn default() -> Self {
         Self {
-            hello_ms: 10_000,
-            challenge_ms: 30_000,
+            hello_ms: HELLO_TIMEOUT_MS,
+            challenge_ms: PROOF_TIMEOUT_MS,
             idle_ms: 90_000,
             ticket_ttl_ms: 12 * 60 * 60 * 1000,
             pair_window_ms: 300_000,
@@ -141,7 +155,7 @@ pub struct CoreConfig {
     pub public_origin: String,
     /// TOKEN: the first-registration ticket and version-probe secret.
     pub token: String,
-    /// Maximum sockets in the relay (default 32).
+    /// Maximum sockets in the relay (default `DEFAULT_MAX_CONNECTIONS`).
     pub max_connections: usize,
     /// Optional TURN settings.
     pub turn: Option<TurnConfig>,
@@ -155,7 +169,7 @@ impl CoreConfig {
         Self {
             public_origin: public_origin.into(),
             token: token.into(),
-            max_connections: 32,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             turn: None,
             timings: Timings::default(),
         }

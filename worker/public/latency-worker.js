@@ -20,10 +20,10 @@ function requestKeyframe(reason) {
   lastKeyframeRequest = performance.now();
   Promise.resolve(transformer.sendKeyFrameRequest()).then(() => control("keyframe-requested", { reason })).catch((error) => control("keyframe-request-error", { message: String(error) }));
 }
-function clearRender() { if (renderTimer) clearTimeout(renderTimer); renderTimer = 0; const pending = renderSlot.clear(); if (pending) { try { pending.frame.close(); } catch {} } }
+function clearRender() { if (renderTimer) clearTimeout(renderTimer); renderTimer = 0; const pending = renderSlot.clear(); if (pending) { try { pending.frame.close(); } catch { /* already closed */ } } }
 function reset(reason) {
   stats.resyncs++; stats.lastResetReason = reason; stats.recovering = true; decodePending = 0; waitingForKeyframe = true; baseTimestamp = null; timeline.reset(); clearRender();
-  if (decoder) { try { decoder.close(); } catch {} decoder = null; }
+  if (decoder) { try { decoder.close(); } catch { /* already closed */ } decoder = null; }
   control("resync", { reason }); requestKeyframe(reason);
 }
 function barcode() {
@@ -42,7 +42,7 @@ function render() {
     ctx.drawImage(item.frame, 0, 0); stats.renderedTimestamp = item.frame.timestamp; renderedDue = item.due; stats.framesDrawn++; if (stats.transitionPassed) stats.transitionDrawn++; stats.recovering = false; fpsFrames++;
     if (performance.now() - lastFpsWall >= 1000) { stats.fps = fpsFrames; fpsFrames = 0; lastFpsWall = performance.now(); }
     const now = performance.now(); if (diagnostics && now - lastBarcodeAt >= 100) { lastBarcodeAt = now; barcodeValue = barcode() || barcodeValue; } control("worker-stats", {}, false);
-  } finally { try { item.frame.close(); } catch {} }
+  } finally { try { item.frame.close(); } catch { /* already closed */ } }
 }
 function enqueue(frame) {
   const now = performance.now(); if (baseTimestamp === null) { baseTimestamp = frame.timestamp; baseWall = now; }
@@ -91,7 +91,7 @@ function decode(value) {
   catch { decodePending--; reset("decode-throw"); }
 }
 self.onmessage = ({ data }) => {
-  if (data.type === "capabilities") { let supported = false; try { supported = typeof VideoDecoder !== "undefined" && typeof OffscreenCanvas !== "undefined" && !!new OffscreenCanvas(1, 1).getContext("2d"); } catch {} control("capabilities", { supported }); }
+  if (data.type === "capabilities") { let supported = false; try { supported = typeof VideoDecoder !== "undefined" && typeof OffscreenCanvas !== "undefined" && !!new OffscreenCanvas(1, 1).getContext("2d"); } catch { /* the probe throwing means unsupported */ } control("capabilities", { supported }); }
   else if (data.type === "canvas") { canvas = data.canvas; diagnostics = !!data.diagnostics; ctx = canvas.getContext("2d", { alpha: false, desynchronized: true }); if (ctx) control("worker-ready"); else control("worker-init-error", { message: "OffscreenCanvas 2D context unavailable" }); }
   else if (data.type === "resync") {
     if (data.transition && typeof data.transition.token === "string") {

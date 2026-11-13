@@ -349,7 +349,7 @@ export function createCtlChannel({ sendKey, recvKey }) {
   let queue = Promise.resolve();
   const inOrder = task => {
     const run = queue.then(task);
-    queue = run.catch(() => {});
+    queue = run.catch(() => { /* the caller gets the failure through run; the queue keeps going */ });
     return run;
   };
 

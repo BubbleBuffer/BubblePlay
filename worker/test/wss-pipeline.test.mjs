@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { avcCodecFromSps, createWssPipeline } from "../public/wss-pipeline.js";
+import { V4_DECODE_BACKLOG_LIMIT_FRAMES } from "../public/media-v4.js";
 
 const HEVC_KEY = Uint8Array.of(0, 0, 0, 1, 0x40, 0x01, 0x0c, 0x01, 0xff);
 const HEVC_DELTA = Uint8Array.of(0, 0, 0, 1, 0x02, 0x01, 0xaa, 0xbb, 0xcc);
@@ -65,6 +66,15 @@ test("deltas before a keyframe are dropped and recovery is requested", () => {
   h.pipeline.handleFrame(h.frame({ key: false, data: HEVC_DELTA, sequence: 2, timestampUs: 222 }));
   assert.equal(h.chunks.length, 0);
   assert.ok(h.posts.some((m) => m.type === "drop" && m.recover === "delta-before-keyframe"));
+});
+
+test("a decoder backlog past the limit drops to the next keyframe and requests recovery", () => {
+  const h = harness({ queue: V4_DECODE_BACKLOG_LIMIT_FRAMES });
+  h.pipeline.handleFrame(h.frame());
+  assert.equal(h.chunks.length, 0);
+  assert.ok(h.posts.some((m) => m.type === "drop" && m.recover === "decoder-backpressure"));
+  h.pipeline.handleFrame(h.frame({ key: false, data: HEVC_DELTA, sequence: 2, timestampUs: 222 }));
+  assert.equal(h.chunks.length, 0, "deltas stay dropped until a keyframe is accepted");
 });
 
 test("a decoded frame is drawn immediately to the canvas and reported with its sequence", () => {

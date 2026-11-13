@@ -7,11 +7,16 @@
 // different PCs never share an object, a connection cap or a CPU budget.
 mod assets;
 mod config;
+mod directory;
 mod front;
+mod front_admin;
+mod front_directory;
 mod http;
 mod live;
 mod ntfy;
 mod pc;
+mod pc_sockets;
+mod pc_store;
 mod rng;
 mod routes;
 mod store;

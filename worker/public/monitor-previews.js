@@ -80,8 +80,8 @@ export function createPreviewOverlay({ el, createUrl, revokeUrl, schedule = setT
     cancel(timer); timer = null;
     cancel(safety); safety = null;
     visible = false;
-    if (el) { el.hidden = true; el.style.opacity = "0"; try { el.removeAttribute?.("src"); } catch { /* seam */ } }
-    if (url) { try { revokeUrl(url); } catch { /* ignore */ } url = null; }
+    if (el) { el.hidden = true; el.style.opacity = "0"; try { el.removeAttribute?.("src"); } catch { /* an element without removeAttribute keeps its src */ } }
+    if (url) { try { revokeUrl(url); } catch { /* URL already revoked */ } url = null; }
   };
   const fadeOut = () => {
     if (!visible || timer) return;

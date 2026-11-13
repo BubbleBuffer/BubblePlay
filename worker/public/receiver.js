@@ -1,3 +1,4 @@
+import { describeConnectionStatus } from "/connection-status.js";
 import { RemoteClipboardWriter, sameClipboardImage, pasteHostClipboard } from "/remote-clipboard.js";
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
@@ -5,22 +6,22 @@ import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateI
 import {
   shouldRecoverAfterNetworkRouteProbe,
   shouldReconnectAfterClose,
-  recycledAuthTimeoutMs,
-  connectTimeoutMs,
+  MEDIA_CONNECT_TIMEOUT_MS,
+  OFFER_FAILURE_LIMIT,
   shouldRetryOnWake,
-  shouldRetryAuthTimeout,
   signalingUnanswered,
   mediaHeartbeatStep,
-  createSuspendTracker,
-  splitRecovery,
   rtcPeerEndAction,
 } from "/recovery.js";
+import { createOnceReporter } from "/report.js";
+import { createKeyboardDraft } from "/keyboard-draft.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
- import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, reconcileTextEdit, RemoteCursor, secureTextUnits, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
+ import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, RemoteCursor, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
 import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
-import { cropGain, cropNeedsUpdate, desiredSharpCrop, fullDesktopCrop } from "/sharp-viewport.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, nextBackoffMsV4, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { cropGain } from "/sharp-viewport.js";
+import { createSharpSession } from "/sharp-session.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_KEYFRAME_REQUEST_INTERVAL_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, jitteredBackoffMsV4, nextBackoffMsV4, V4_DECODE_BACKLOG_LIMIT_FRAMES, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
   orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes, selectWssDecoderPath,
@@ -34,7 +35,10 @@ import {
 import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
-import { SoundController, WssAudioPlayer, isAudioPacket, probeOpusDecode, soundButtonView, sumAudioStats } from "/audio.js";
+import { SoundController, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
+import { formatHud } from "/hud-text.js";
+import { createRecoveryTracker } from "/recovery-tracker.js";
+import { createWssAudioSession } from "/wss-audio.js";
 import { FileTransferClient } from "/file-client.js";
 import { touchPc } from "/devicekey-store.js";
 import { pcListUrl, registerProof, relayOrigin, viewerHello } from "/dk-relay.js";
@@ -108,7 +112,7 @@ function replaceTransferredSharpCanvas() {
 }
 
 function releaseWebRtcVideoSink() {
-  try { decoder?.close(); } catch {}
+  try { decoder?.close(); } catch { /* already closed */ }
   decoder = null;
   if (encodedWorker) {
     encodedWorker.terminate();
@@ -179,29 +183,18 @@ let hostCapabilities = { serviceMode: false, coldBoot: false, secureDesktop: fal
 let hostCapabilitiesGeneration = 0;
 // Local PC sound (audio.js). Sinks: the WebRTC <audio> element and the WSS player.
 let hostAudioCapable = false; // host-capabilities.audio === 1
-let wssAudioPlayer = null;
-let wssAudioSinkAttached = false;
-let wssAudioRetired = sumAudioStats(); // counters from players already stopped
 let latestInboundAudio = null; // WebRTC inbound-rtp for the audio track
 const soundController = new SoundController({ target: document, onChange: () => renderSoundSlot() });
+const wssAudio = createWssAudioSession({
+  soundController, onRejected: () => recordWssPacketRejection("audio-invalid-packet"), log: viewerLog,
+});
 let hasPresentedFrame = false;
 let fileDropPresentedGeneration = null;
 let fileDropPresentedViewportRevision = null;
 // rtpGate: on WebRTC, how presentation of the admitted generation is proven
 // (rtcAdmissionGate in monitor-selection.js); null keeps the legacy rule.
 const firstFrameHandshake = { requestId: null, reason: "", transport: null, epoch: null, generation: 0, phase: "idle", retries: 0, admitted: false, presented: false, requireAdmission: false, rtpGate: null, failureReason: "", timer: null };
-let viewportRevision = 0;
-let viewportTimer = null;
-let viewportLast = null;
-let viewportState = { enabled: false, revision: 0, generation: 0 };
-let viewportPending = null;
-let viewportDesired = null;
-let viewportTransitionTimer = null;
-let viewportLastSentAt = -Infinity;
-let viewportConsecutiveTimeouts = 0;
-let sharpDisabledForSession = false;
 let renderedSharpView = null;
-let viewportTelemetry = { state: "full", revision: 0, generation: 0, crop: "1920x1080@0,0" };
 const clientBuild = "native-file-drop-2026-10-05";
 
 function secureDesktopText() {
@@ -452,7 +445,7 @@ function markFirstFramePresented(presentedGeneration = null, presentedViewportRe
   if (firstFrameHandshake.presented) return true;
   if (usingWssMedia) wssStartupRecoveries = 0;
   firstFrameHandshake.presented = true;
-  noteRecovered();
+  recovery.noteRecovered();
   monitorPreviews.onFirstFrame();
   if (!usingWssMedia) {
     rtcStartupFallback?.stop();
@@ -691,31 +684,14 @@ function toggleFollowWindow() {
 // ---- status HUD ------------------------------------------------------------
 const hudState = { ws: "…", ice: "…", route: "…", dc: "…", control: "…", motion: "…", pointer: "desktop", cursorSeq: "…/…", cursorAge: "…", motionSent: 0, motionCoalesced: 0, motionDropped: 0, zoom: 1, touch: "…", dec: "…", fps: 0, recv: 0, queued: 0, dropped: 0, resyncs: 0, keyframes: 0, lag: "…", rtt: "…", jit: "…", jbuf: "…", loss: "…", mbps: "…", presented: 0, frameGap: "…", maxFrameGap: 0, dimensions: "…", mediaGeneration: "…" };
 function renderConnectionStatus() {
-  let state = "connecting";
-  let label = "Connecting…";
-  if (terminalSignalingFailure) { state = "error"; label = "Session unavailable"; }
-  else if (!desktopAvailable) { state = "error"; label = "Desktop unavailable"; }
-  else if (usingWssMedia) {
-    // v4 never reports "waiting for stream" for a static desktop: no frames
-    // is the expected steady state while nothing on screen changes.
-    const v4 = wssV4Status();
-    state = v4 === "connected" || v4 === "paused-static" ? "connected" : "connecting";
-    label = v4 === "connected" ? "Connected · WSS" : v4 === "paused-static" ? "Connected · WSS (static)" :
-      v4 === "reconnecting" ? "Reconnecting media…" : v4 === "starting" ? "Starting stream…" : "Connecting…";
-  }
-  else if (inputReady && usingWssMedia) { state = "connected"; label = "Connected · WSS"; }
-  else if (inputReady && (hudState.ice === "connected" || hudState.ice === "completed" || hudState.ice === "connected/connected")) { state = "connected"; label = "Connected · WebRTC"; }
-  else if (hudState.ws.startsWith("reconnecting") || hudState.ws === "closed") { label = "Reconnecting…"; }
-  else if (hudState.ws === "error") { state = "error"; label = "Connection error"; }
-  connectionStatusDetail = label.replace(" · ", " via ");
-  // The strip shows a short state; transport and round trip go in the tooltip.
-  const warning = desktopAvailable && desktopKind === "default" && !terminalSignalingFailure
-    ? inputStatusReason === "admin-required" ? "This window needs Admin mode — turn it on at the PC"
-      : inputStatusReason === "admin-unavailable" ? "Admin mode helper isn't responding" : "" : "";
-  const shortLabel = warning || label.split(" · ")[0];
-  const detail = [warning, connectionStatusDetail,
-    hudState.rtt !== "…" ? `round trip ${hudState.rtt} ms` : null,
-    monitorList.find(m => m.selected)?.name || null].filter(Boolean).join(" · ");
+  const { state, shortLabel, detail, connectionDetail, warning } = describeConnectionStatus({
+    terminalSignalingFailure, desktopAvailable, usingWssMedia,
+    wssStatus: usingWssMedia ? wssV4Status() : null,
+    inputReady, ice: hudState.ice, ws: hudState.ws, desktopKind, inputStatusReason,
+    rttMs: hudState.rtt === "…" ? null : hudState.rtt,
+    monitorName: monitorList.find(m => m.selected)?.name || null,
+  });
+  connectionStatusDetail = connectionDetail;
   if (connectionStatus.dataset.state !== state) connectionStatus.dataset.state = state;
   if (connectionStatusLabel.textContent !== shortLabel) connectionStatusLabel.textContent = shortLabel;
   if (connectionStatus.title !== detail) connectionStatus.title = detail;
@@ -725,22 +701,11 @@ function renderConnectionStatus() {
   document.getElementById("session-strip").classList.toggle("status-warning", !!warning);
 }
 let connectionStatusDetail = "Connecting…";
-function qualityHudText() {
-  if (!hostQuality) return "quality …";
-  const target = `${Math.round(hostQuality.targetBitrateBps / 1_000)}k`;
-  const bwe = hostQuality.bweBps === null ? "…" : `${Math.round(hostQuality.bweBps / 1_000)}k`;
-  return `quality ${hostQuality.profile} ${hostQuality.width}x${hostQuality.height}@${hostQuality.fps} ${target}/${bwe} ${hostQuality.reason}`;
-}
 setInterval(() => {
   if (cursorReconciler?.feedbackAt !== null && cursorReconciler?.feedbackAt !== undefined) hudState.cursorAge = Math.round(performance.now()-cursorReconciler.feedbackAt);
-  hud.innerHTML =
-    `ws ${hudState.ws} | ice ${hudState.ice} | route ${hudState.route} | control ${hudState.control} motion ${hudState.motion}\n` +
-    `zoom ${hudState.zoom}× | pointer ${hudState.pointer} ${hudState.cursorSeq} ${hudState.cursorAge}ms | motion ${hudState.motionSent}/${hudState.motionCoalesced}/${hudState.motionDropped} | touch ${hudState.touch}\n` +
-    `decoder ${hudState.dec} | recv ${hudState.recv} | queue ${hudState.queued} | drop ${hudState.dropped} | reset ${hudState.resyncs} | key ${hudState.keyframes} | ${hudState.fps} fps\n` +
-    `presented ${hudState.presented} | gap ${hudState.frameGap}/${hudState.maxFrameGap}ms | ${hudState.dimensions}\n` +
-    `lag ${hudState.lag}ms | rtt ${hudState.rtt}ms | jitter ${hudState.jit}ms | jbuf ${hudState.jbuf}ms | loss ${hudState.loss}% | rx ${hudState.mbps}Mbps\n` +
-    `${clientBuild} | ${fullFrameDiagnostic ? "full-frame" : "sharp-zoom"} | media g${hudState.mediaGeneration} | view ${viewportTelemetry.state} r${viewportTelemetry.revision} ${viewportTelemetry.crop}\n` +
-    qualityHudText();
+  hud.innerHTML = formatHud(hudState, {
+    clientBuild, fullFrame: fullFrameDiagnostic, sharp: sharpSession.telemetry, hostQuality,
+  });
   if (diagnosticsOutput && diagnosticsVisible) diagnosticsOutput.textContent = diagnosticsReport();
   renderConnectionStatus();
 }, 250);
@@ -764,23 +729,16 @@ let authenticatedSession = null;
 let pendingRtcTracks = [];
 let signalingGeneration = 0;
 let reconnectTimer = null;
+// Backoff of the signaling reconnect: grows with each loss, resets once a session authenticates.
+let signalingBackoffMs = 0;
 let pendingConnect = null;
 let connectTimer = null;
 let terminalSignalingFailure = false;
-// Recovery after a lost signaling connection. everAuthenticated: this page had a session before,
-// so a silent PC is retried (recovery.js). recoveryLossMs: clock time of the loss, kept until the
-// first frame is shown again. recoveryBudgetStartMs: start of the retry budget, restarted by each
-// authentication. recoveryAttempts: signaling connections opened since the loss.
-let everAuthenticated = false;
-let recoveryLossMs = null;
-let recoverySuspendedAtLossMs = 0;
-const suspendTracker = createSuspendTracker();
+const recovery = createRecoveryTracker({ now: () => performance.now(), log: (...args) => viewerLog(...args) });
 try {
-  document.addEventListener("freeze", () => suspendTracker.freeze(performance.now()));
-  document.addEventListener("resume", () => suspendTracker.resume(performance.now()));
+  document.addEventListener("freeze", () => recovery.freeze());
+  document.addEventListener("resume", () => recovery.resume());
 } catch {}
-let recoveryBudgetStartMs = null;
-let recoveryAttempts = 0;
 // Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
 let signalingPingSentMs = null;
 let signalingInboundMs = 0;
@@ -814,7 +772,9 @@ function sendInput(data, channel) {
   if (!authenticatedSession?.mediaReady) return false;
   if (desktopInputState !== "enabled") return false;
   if (!desktopAvailable || desktopAwaitingFrame) return false;
-  if (!usingWssMedia && authenticatedSession.rtcReady && channel?.readyState === "open") try { channel.send(data); return true; } catch {}
+  if (!usingWssMedia && authenticatedSession.rtcReady && channel?.readyState === "open") {
+    try { channel.send(data); return true; } catch (error) { reportOnce("input-channel-send-failed", error); }
+  }
   // The WSS media fallback deliberately keeps input/cursor on /ws.
   if (usingWssMedia && signalingRegistered && ws?.readyState === WebSocket.OPEN && ws.bufferedAmount <= 16_384) return authenticatedSession.sendInput(data);
   return false;
@@ -861,7 +821,7 @@ let wssStartupRecoveries = 0;
 // WSS v4 single-socket session state.
 const wssV4 = {
   gate: new V4ReceiveGate(), socket: null, socketOpen: false, everOpened: false, hostPresent: false,
-  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, lastSendAt: 0, lastInboundAt: 0, lastPingAt: 0, pingSentMs: null,
+  reconnecting: false, backoffMs: 0, reconnects: 0, heartbeatTimer: null, connectTimer: null, lastSendAt: 0, lastInboundAt: 0, lastPingAt: 0, pingSentMs: null,
   lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity,
   presentSkips: 0, gateDrops: 0, frames: 0,
 };
@@ -925,45 +885,23 @@ function recordSignalingError(kind, message, detail = null) {
 }
 
 // Viewer events go to the local browser log (dk-log.js). Phase B uploads them to the PC.
+const reportOnce = createOnceReporter((level, event, detail) => viewerLog(level, event, detail));
 function viewerLog(level, event, detail = {}) {
   globalThis.BPLog?.log(level, "receiver", event, { attempt: diagnosticAttemptId, build: clientBuild,
     transport: requestedTransport, codec: codecSession.codec, ...detail });
 }
 
-function noteConnectionLoss() {
-  if (!everAuthenticated) return;
-  const now = performance.now();
-  if (recoveryLossMs === null) { recoveryLossMs = now; recoveryAttempts = 0; recoverySuspendedAtLossMs = suspendTracker.totalMs(now); }
-  if (recoveryBudgetStartMs === null) recoveryBudgetStartMs = now;
-}
-
 function noteSessionAuthenticated() {
-  everAuthenticated = true;
-  recoveryBudgetStartMs = null;
-}
-
-// Wait for the PC's auth-host: 10 s for a first connection, shorter and backing off for a recycled session.
-function sessionAuthTimeoutMs() {
-  return everAuthenticated && recoveryLossMs !== null ? recycledAuthTimeoutMs(recoveryAttempts - 1) : undefined;
-}
-
-function noteRecovered() {
-  if (recoveryLossMs === null) return;
-  const now = performance.now();
-  // Frozen or suspended time is reported apart: activeMs is what the recovery target measures.
-  const { recoveryMs, suspendedMs, activeMs } = splitRecovery(now - recoveryLossMs, suspendTracker.totalMs(now) - recoverySuspendedAtLossMs);
-  const attempts = recoveryAttempts;
-  recoveryLossMs = recoveryBudgetStartMs = null;
-  recoveryAttempts = 0;
-  viewerLog("info", `recovered after ${activeMs} ms, ${attempts} attempts`, { recoveryMs, activeMs, suspendedMs, attempts });
+  recovery.noteAuthenticated();
+  signalingBackoffMs = 0;
 }
 
 // A failed session. A silent PC on a recycled session retries on a new signaling connection while
 // the budget lasts; everything else ends the session as before.
 function handleSessionFailure(refusal, reason) {
-  noteConnectionLoss();
-  if (shouldRetryAuthTimeout({ reason, established: everAuthenticated, budgetStartMs: recoveryBudgetStartMs, nowMs: performance.now() })) {
-    viewerLog("info", "auth-timeout-retry", { attempts: recoveryAttempts, sinceLossMs: Math.round(performance.now() - recoveryLossMs) });
+  recovery.noteLoss();
+  if (recovery.shouldRetryAuthTimeout(reason)) {
+    viewerLog("info", "auth-timeout-retry", { attempts: recovery.attempts, sinceLossMs: recovery.sinceLossMs() });
     recycleSignaling("auth-timeout");
     return;
   }
@@ -982,7 +920,7 @@ function reconnectSignaling(reason) {
     authenticatedSession?.close();
     authenticatedSession = null;
     const generation = ++signalingGeneration;
-    if (recoveryLossMs !== null) recoveryAttempts++;
+    recovery.noteConnectionOpened();
     const socketUrl = signalingSocketUrl();
     debugTrace("signaling-construct", {
       path: new URL(socketUrl).pathname,
@@ -1005,7 +943,7 @@ function reconnectSignaling(reason) {
       if (ws !== socket || generation !== signalingGeneration) return;
       clearTimeout(connectTimer);
       const admitted = signalingRegistered;
-      noteConnectionLoss();
+      recovery.noteLoss();
       hudState.ws = "closed";
       latestInputStatus = null;
       inputStatusReason = null;
@@ -1050,22 +988,26 @@ function reconnectSignaling(reason) {
     };
   };
   if (reason === "startup") connect();
-  else { pendingConnect = connect; reconnectTimer = setTimeout(connect, 250); }
+  else {
+    signalingBackoffMs = nextBackoffMsV4(signalingBackoffMs);
+    pendingConnect = connect;
+    reconnectTimer = setTimeout(connect, jitteredBackoffMsV4(signalingBackoffMs));
+  }
 }
 
 // A reconnect of an established session abandons a socket that has not opened in time (5, 7.5, then
 // 10 s) and tries a new one. Handlers are detached first so a late event of the old socket is ignored.
 function armConnectTimeout(socket, generation) {
   clearTimeout(connectTimer);
-  const waitedMs = connectTimeoutMs({ recovering: recoveryLossMs !== null, attempt: recoveryAttempts - 1 });
+  const waitedMs = recovery.connectTimeoutMs();
   if (waitedMs === null) return;
   connectTimer = setTimeout(() => {
     if (ws !== socket || generation !== signalingGeneration || socket.readyState !== WebSocket.CONNECTING) return;
-    viewerLog("info", "signaling-connect-abandoned", { connectAttempt: recoveryAttempts, waitedMs });
+    viewerLog("info", "signaling-connect-abandoned", { connectAttempt: recovery.attempts, waitedMs });
     socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
     ws = null;
     signalingGeneration++;
-    try { socket.close(); } catch {}
+    try { socket.close(); } catch { /* already closed */ }
     reconnectSignaling("connect-timeout");
   }, waitedMs);
 }
@@ -1086,7 +1028,7 @@ function signalingSocketUrl() {
 
 function recycleSignaling(reason) {
   if (terminalSignalingFailure) return;
-  noteConnectionLoss();
+  recovery.noteLoss();
   latestInputStatus = null;
   inputStatusReason = null;
   invalidatePendingMonitorRequest(reason);
@@ -1119,7 +1061,7 @@ function recycleSignaling(reason) {
   authenticatedSession?.close();
   authenticatedSession = null;
   signalingGeneration++;
-  try { socket?.close(1000, reason); } catch {}
+  try { socket?.close(1000, reason); } catch { /* already closed */ }
   reconnectSignaling(reason);
 }
 
@@ -1156,7 +1098,7 @@ async function handleSignal(socket, generation, ev) {
       const current = () => ws === socket && generation === signalingGeneration;
       let logUploader = null;
       const session = createViewerSession({ identity: sessionIdentity, pcId: sessionPc, pinnedPublic: sessionPinnedPublic,
-        relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc", authTimeoutMs: sessionAuthTimeoutMs(),
+        relayOrigin: relayOrigin(location.href), epoch: msg.mediaEpoch, transport: wssSelected ? "wss" : "webrtc", authTimeoutMs: recovery.authTimeoutMs(),
         send: message => current() && sendRelay(message),
         onAuthenticated: () => {
           if (!current()) return;
@@ -1171,7 +1113,7 @@ async function handleSignal(socket, generation, ev) {
                 isActive: () => current() && authenticatedSession === session && ws?.readyState === WebSocket.OPEN });
               logUploader.start();
             }
-          } catch (error) { try { globalThis.BPLog?.warn("receiver", "log upload did not start", { cause: String(error?.message ?? error).slice(0, 160) }); } catch {} }
+          } catch (error) { try { globalThis.BPLog?.warn("receiver", "log upload did not start", { cause: String(error?.message ?? error).slice(0, 160) }); } catch { /* logging never breaks the viewer */ } }
           sendStreamMode("signaling-start");
           if (wssSelected) requestWssMediaStart();
           else startPeer(peerGeneration);
@@ -1250,7 +1192,7 @@ async function handleEndpointSignal(socket, generation, msg) {
       applyBenchStatus(msg);
       break;
     case "media-view":
-      handleMediaView(msg);
+      sharpSession.onMediaView(msg);
       break;
     case "desktop-state":
       handleDesktopState(msg);
@@ -1353,7 +1295,7 @@ async function addRemoteIce(candidate, generation, ice) {
 // Keep the relay's WebSocket alive (15 s idle heartbeat, same as the host), and
 // recycle it silently when the relay stops answering (recovery.js signalingUnanswered).
 setInterval(() => {
-  suspendTracker.tick(performance.now());
+  recovery.tick();
   if (!signalingRegistered) return;
   const now = performance.now();
   if (signalingUnanswered({ pingSentMs: signalingPingSentMs, inboundMs: signalingInboundMs, nowMs: now })) {
@@ -1383,7 +1325,7 @@ function endAuthenticatedSession(refusal) {
   setFileTransferAvailable(false);
   hudState.ws = "error";
   hud.classList.add("bad");
-  try { socket?.close(1000, "session-ended"); } catch {}
+  try { socket?.close(1000, "session-ended"); } catch { /* already closed */ }
   sessionGate?.showRefusal({ ...refusal, actionLabel: "Back to PCs", onAction: () => location.assign(pcListUrl(location.href)) });
 }
 
@@ -1399,7 +1341,7 @@ function updateAuthenticatedInputReady() {
 function openAuthenticatedMedia() {
   if (!authenticatedSession?.mediaReady) return;
   sessionGate?.hide();
-  if (!sessionTouched && sessionPc) { sessionTouched = true; touchPc(sessionPc).catch(() => {}); }
+  if (!sessionTouched && sessionPc) { sessionTouched = true; touchPc(sessionPc).catch(() => { /* the last-used stamp is cosmetic */ }); }
   if (!wssSelected && !usingWssMedia) {
     const tracks = pendingRtcTracks;
     pendingRtcTracks = [];
@@ -1460,19 +1402,19 @@ function cleanupPeer() {
   soundController.detachSink("rtc");
   clearWssTimers();
   authenticatedSession?.resetPeer();
-  resetKeyboardDraft();
+  keyboardDraft.reset();
   resetTouchCursor();
   cursorAppearance.reset();
   inputReady = false;
   connected = false;
-  try { dc?.close(); } catch {}
-  try { motionDc?.close(); } catch {}
+  try { dc?.close(); } catch { /* already closed */ }
+  try { motionDc?.close(); } catch { /* already closed */ }
   dc = null;
   motionDc = null;
-  try { pc?.close(); } catch {}
+  try { pc?.close(); } catch { /* already closed */ }
   pc = null;
   closingPeer = false;
-  try { decoder?.close(); } catch {}
+  try { decoder?.close(); } catch { /* already closed */ }
   decoder = null;
   if (encodedWorker) {
     encodedWorker.terminate();
@@ -1494,15 +1436,16 @@ function clearWssTimers() {
   clearWssKeyframeWatchdog();
   clearInterval(wssV4.heartbeatTimer); wssV4.heartbeatTimer = null;
   clearTimeout(wssReconnectTimer); wssReconnectTimer = null;
+  clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
 }
 
 function stopWssMedia() {
   usingWssMedia = false;
   teardownWssWorker();
   clearWssTimers();
-  stopWssAudio();
+  wssAudio.stop();
   wssDecoderEpoch++;
-  try { wssV4.socket?.close(1000, "switch"); } catch {}
+  try { wssV4.socket?.close(1000, "switch"); } catch { /* already closed */ }
   Object.assign(wssV4, { socket: null, socketOpen: false, everOpened: false, hostPresent: false, reconnecting: false,
     backoffMs: 0, lastFrameAt: null, lastSeq: 0, decodedSeq: undefined, lastPresentAt: -Infinity });
   wssV4.gate.reset("start");
@@ -1517,14 +1460,7 @@ function stopWssMedia() {
   wssRecoveryPending = false;
   wssRecoveryState = "awaiting-keyframe";
   wssLastRecoveryAt = -Infinity;
-  viewportState = { enabled: false, revision: viewportRevision, generation: 0 };
-  viewportPending = null;
-  viewportDesired = null;
-  viewportLast = null;
-  clearTimeout(viewportTimer); viewportTimer = null;
-  clearTimeout(viewportTransitionTimer); viewportTransitionTimer = null;
-  viewportConsecutiveTimeouts = 0;
-  sharpDisabledForSession = false;
+  sharpSession.reset();
   renderedSharpView = null;
   sharpScreen.classList.remove("active");
 }
@@ -1547,7 +1483,7 @@ function scheduleWssV4Reconnect(reason) {
     if (!usingWssMedia) return;
     wssV4.reconnects++;
     openWssV4Socket();
-  }, wssV4.backoffMs);
+  }, jitteredBackoffMsV4(wssV4.backoffMs));
 }
 
 function openWssV4Socket() {
@@ -1559,6 +1495,16 @@ function openWssV4Socket() {
   wssV4.socketOpen = false;
   wssV4.hostPresent = false;
   const current = () => usingWssMedia && wssV4.socket === socket && signalingTicket === ticket && authenticatedSession?.mediaReady;
+  clearTimeout(wssV4.connectTimer);
+  wssV4.connectTimer = setTimeout(() => {
+    wssV4.connectTimer = null;
+    if (!current() || wssV4.socketOpen) return;
+    viewerLog("warn", "wss-v4-connect-timeout", { waitedMs: MEDIA_CONNECT_TIMEOUT_MS, reconnects: wssV4.reconnects });
+    socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+    wssV4.socket = null;
+    try { socket.close(); } catch {} // already closing or closed
+    scheduleWssV4Reconnect("connect-timeout");
+  }, MEDIA_CONNECT_TIMEOUT_MS);
   socket.onopen = () => {
     if (!current()) return;
     socket.send(JSON.stringify({ type: "hello", role: "media-viewer", ticket }));
@@ -1575,6 +1521,7 @@ function openWssV4Socket() {
     let message;
     try { message = JSON.parse(event.data); } catch { return; }
     if (message.type === "hello-ok") {
+      clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
       const reconnect = wssV4.everOpened;
       wssV4.socketOpen = true;
       wssV4.everOpened = true;
@@ -1594,24 +1541,25 @@ function openWssV4Socket() {
   };
   socket.onclose = (event) => {
     if (!current()) return;
+    clearTimeout(wssV4.connectTimer); wssV4.connectTimer = null;
     wssV4.socketOpen = false;
     wssV4.hostPresent = false;
     wssV4.socket = null;
-    stopWssAudio();
+    wssAudio.stop();
     hudState.ice = "wss v4 reconnecting";
     debugTrace("media-v4-close", { code: event.code, reason: event.reason || "", wasClean: event.wasClean });
     scheduleWssV4Reconnect("socket-close");
   };
   socket.onerror = () => {
     if (!current()) return;
-    try { socket.close(); } catch {}
+    try { socket.close(); } catch { /* already closed */ }
   };
 }
 
 function onWssV4Packet(data) {
   // BPA1 audio shares the media socket. It skips the v4 counters, ACK and gate.
   if (isAudioPacket(data)) {
-    onWssAudioPacket(data);
+    wssAudio.push(data);
     return;
   }
   wssMediaReceivedBytes += data.byteLength;
@@ -1651,48 +1599,12 @@ function onWssV4Packet(data) {
   });
 }
 
-function onWssAudioPacket(data) {
-  wssAudioPlayer ??= createWssAudioPlayer();
-  if (wssAudioPlayer.push(data) === "rejected") {
-    recordWssPacketRejection("audio-invalid-packet");
-    return;
-  }
-  if (!wssAudioSinkAttached) {
-    wssAudioSinkAttached = true;
-    const player = wssAudioPlayer;
-    soundController.attachSink("wss", {
-      start: () => player.resume(),
-      setMuted: muted => player.setMuted(muted),
-      stop: () => player.stop(),
-    });
-  }
-}
-
-function createWssAudioPlayer() {
-  return new WssAudioPlayer({
-    createContext: () => new AudioContext({ latencyHint: "interactive", sampleRate: 48000 }),
-    createDecoder: init => new AudioDecoder(init),
-    createChunk: init => new EncodedAudioChunk(init),
-    onError: error => viewerLog("warn", "wss-audio-error", { name: error?.name || "error" }),
-  });
-}
-
-function stopWssAudio() {
-  if (wssAudioPlayer) wssAudioRetired = sumAudioStats(wssAudioRetired, wssAudioPlayer.stats());
-  wssAudioPlayer?.stop();
-  wssAudioPlayer = null;
-  if (wssAudioSinkAttached) {
-    wssAudioSinkAttached = false;
-    soundController.detachSink("wss");
-  }
-}
-
 // Diagnostics: "off" without the host capability, otherwise the controller state.
 function audioSnapshot() {
   return {
     announced: hostAudioCapable,
     controller: hostAudioCapable ? soundController.state : "off",
-    wss: sumAudioStats(wssAudioRetired, wssAudioPlayer?.stats()),
+    wss: wssAudio.stats(),
     webrtc: latestInboundAudio ? { ...latestInboundAudio } : null,
   };
 }
@@ -1709,7 +1621,7 @@ function startWssV4() {
     if (step === "ping") sendWssV4('{"type":"ping"}');
     else if (step === "dead") {
       viewerLog("warn", "wss-v4-silent-socket", { silentMs: Math.round(now - wssV4.lastInboundAt), unansweredMs: Math.round(now - wssV4.pingSentMs) });
-      try { wssV4.socket?.close(4000, "silent"); } catch {}
+      try { wssV4.socket?.close(4000, "silent"); } catch { /* already closed */ }
     }
   }, 1_000);
   openWssV4Socket();
@@ -1943,12 +1855,12 @@ async function maybeStartWssHost() {
     codec, streamMode: streamModeValue(), reason: "client-start",
     quality: qualityPreset === "auto" ? "high" : qualityPreset, ...(audioDecodable ? { audio: 1 } : {}) });
   startFirstFrameHandshake("wss-host-start");
-  scheduleSharpViewport(fullFrameDiagnostic ? "diagnostic-full-frame" : "wss-start");
+  sharpSession.schedule(fullFrameDiagnostic ? "diagnostic-full-frame" : "wss-start");
 }
 
 function requestWssKeyframe(reason, requestId = null) {
   const now = performance.now();
-  if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < 250) return false;
+  if (!requestId && requestWssKeyframe.lastAt && now - requestWssKeyframe.lastAt < V4_KEYFRAME_REQUEST_INTERVAL_MS) return false;
   requestWssKeyframe.lastAt = now;
   viewerLog("warn", "wss-keyframe-request", { reason, requestId });
   if (usingWssMedia && !requestId) return sendWssV4(keyframeMessageV4(reason));
@@ -1978,7 +1890,7 @@ function resyncWssDecoder(reason) {
   clearWssKeyframeWatchdog();
   wssDecoderEpoch++;
   wssWorker?.post({ type: "resync", epoch: wssDecoderEpoch, reason });
-  try { decoder?.close(); } catch {} decoder = null;
+  try { decoder?.close(); } catch { /* already closed */ } decoder = null;
   latencyGuard.reset(reason);
   resetRenderPacing();
   wssDecodeSequenceByTimestamp.clear(); wssFrameMeta = new WeakMap();
@@ -2046,11 +1958,11 @@ function endRtcPeerOnly(reason) {
   if (!pc) return;
   soundController.detachSink("rtc");
   closingPeer = true;
-  try { dc?.close(); } catch {}
-  try { motionDc?.close(); } catch {}
+  try { dc?.close(); } catch { /* already closed */ }
+  try { motionDc?.close(); } catch { /* already closed */ }
   dc = null;
   motionDc = null;
-  try { pc.close(); } catch {}
+  try { pc.close(); } catch { /* already closed */ }
   pc = null;
   closingPeer = false;
   rtcStartupFallback?.stop(); rtcStartupFallback = null;
@@ -2190,7 +2102,7 @@ function postWssFrameToWorker(frame) {
     hevcCodec: activeWssHevcCodec(),
     hybridMode: activeWssHybridModeName(),
     desktopAvailable,
-    view: viewportForGeneration(frame.generation),
+    view: sharpSession.cropForGeneration(frame.generation),
     frameTrace: frame.frameTrace,
   }, [bytes.buffer]);
 }
@@ -2269,6 +2181,47 @@ function decodeWssFrame(frame) {
   if (frame.key && decoder?.state === "configured") armWssKeyframeWatchdog();
 }
 
+// Builds the peer connection. A server-specific ICE URI the validator accepted but the browser
+// rejects gets one retry on the plain STUN fallback. Returns null when construction still throws.
+function openPeerConnection(peerOptions) {
+  try {
+    return new RTCPeerConnection(peerOptions);
+  } catch (firstError) {
+    viewerLog("warn", "rtc-construct-failed", { error: String(firstError?.message || firstError), stunFallback: currentIceServers === STUN_FALLBACK });
+    if (currentIceServers === STUN_FALLBACK) return null;
+  }
+  currentIceServers = STUN_FALLBACK;
+  try {
+    return new RTCPeerConnection({ ...peerOptions, iceServers: STUN_FALLBACK });
+  } catch (error) {
+    viewerLog("error", "rtc-construct-failed", { error: String(error?.message || error), stunFallback: true });
+    return null;
+  }
+}
+
+// WebRTC cannot start in this browser. Auto mode moves to WSS at once; a forced WebRTC page has no
+// other transport to use, so it shows the error.
+function peerConstructionFailed() {
+  if (requestedTransport === TRANSPORT.AUTO) {
+    switchToWss("rtc-construct-failed");
+    return;
+  }
+  hudState.ice = "ice-config-error";
+  hud.classList.add("bad");
+}
+
+let offerFailures = 0;
+
+// A failed offer restarts the peer, up to OFFER_FAILURE_LIMIT in a row (reset by a sent offer). After
+// that auto mode moves to WSS; a forced WebRTC page shows the error instead of looping.
+function offerFailed(error) {
+  offerFailures++;
+  if (offerFailures < OFFER_FAILURE_LIMIT) { restartPeer(`offer:${error?.message || error}`); return; }
+  viewerLog("error", "offer-failed-giving-up", { failures: offerFailures, error: String(error?.message || error) });
+  if (requestedTransport === TRANSPORT.AUTO) switchToWss("offer-failed");
+  else { hudState.ice = "offer-failed"; hud.classList.add("bad"); }
+}
+
 async function startPeer(generation = peerGeneration) {
   if (requestedTransport === TRANSPORT.WSS || usingWssMedia) return;
   if (!authenticatedSession?.controlReady) return;
@@ -2283,25 +2236,11 @@ async function startPeer(generation = peerGeneration) {
   // This must be set during construction, but only the opt-in WebCodecs path
   // needs it. The native path keeps browser decode/render untouched.
   if (useWebCodecs) peerOptions.encodedInsertableStreams = true;
-  let candidate;
-  try {
-    candidate = new RTCPeerConnection(peerOptions);
-  } catch {
-    // The validator should prevent this, but retain a safe direct fallback
-    // if a browser rejects a server-specific ICE URI we accepted.
-    if (currentIceServers === STUN_FALLBACK) {
-      offerSent = false;
-      hudState.ice = "ice-config-error";
-      return;
-    }
-    currentIceServers = STUN_FALLBACK;
-    try {
-      candidate = new RTCPeerConnection({ ...peerOptions, iceServers: STUN_FALLBACK });
-    } catch {
-      offerSent = false;
-      hudState.ice = "ice-config-error";
-      return;
-    }
+  const candidate = openPeerConnection(peerOptions);
+  if (!candidate) {
+    offerSent = false;
+    peerConstructionFailed();
+    return;
   }
   pc = candidate;
   rtcStartupFallback?.stop();
@@ -2345,7 +2284,7 @@ async function startPeer(generation = peerGeneration) {
       transceiver.setCodecPreferences(codec);
     } else if (codecSession.codec === "hevc" && codecSession.fallbackToH264()) {
       offerSent = false;
-      try { candidate.close(); } catch {}
+      try { candidate.close(); } catch { /* already closed */ }
       startPeer(generation);
       return;
     }
@@ -2426,11 +2365,12 @@ async function startPeer(generation = peerGeneration) {
     await candidate.setLocalDescription(offer);
     if (!isCurrentPeer(generation, candidate)) return;
     if (sendControl({ type: "offer", sdp: offer.sdp })) {
+      offerFailures = 0;
       rtcOfferSignaled = true;
       startFirstFrameHandshake("offer-sent");
     }
   } catch (e) {
-    if (isCurrentPeer(generation, candidate)) restartPeer(`offer:${e.message || e}`);
+    if (isCurrentPeer(generation, candidate)) offerFailed(e);
   }
 }
 
@@ -2470,7 +2410,7 @@ export function endSession() {
   signalingRegistered = false;
   signalingPc = signalingTicket = null;
   signalingGeneration++;
-  try { socket?.close(1000, "session-ended"); } catch {}
+  try { socket?.close(1000, "session-ended"); } catch { /* already closed */ }
 }
 
 function showNotAdmitted(reason = "") {
@@ -2621,7 +2561,7 @@ if (diagnosticsEnabled) {
       viewport.setZoom(1, center);
       viewport.setZoom(value, center);
       renderViewport();
-      scheduleSharpViewport("diagnostic-fixed-zoom");
+      sharpSession.schedule("diagnostic-fixed-zoom");
       return true;
     },
     panFixedViewport(dx, dy) {
@@ -2733,7 +2673,7 @@ if (diagnosticsEnabled) {
           decoderPath: wssWorker?.ready ? "worker" : "main",
         },
         audio: audioSnapshot(),
-        viewport: viewportHealthSnapshot(),
+        viewport: sharpSession.health(renderedSharpView, viewport.zoom, pointerMode),
         signaling: {
           registered: signalingRegistered,
           registeredAtMs: signalingRegisteredAtMs,
@@ -2770,7 +2710,7 @@ function resetRenderPacing() {
   RENDER.cadenceMs = 16.67;
   RENDER.prevTs = null;
   RENDER.prevWall = 0;
-  for (const f of RENDER.queue) { try { f.frame.close(); } catch {} }
+  for (const f of RENDER.queue) { try { f.frame.close(); } catch { /* already closed */ } }
   RENDER.queue = [];
   RENDER.rafPending = false;
   lastRenderedTimestamp = null;
@@ -2833,7 +2773,7 @@ function onDecodedFrame(frame) {
       const stale = RENDER.queue.shift();
       retained = stale.frame !== frame;
       framePresentationTelemetry.noteRafCoalesced();
-      try { stale.frame.close(); } catch {}
+      try { stale.frame.close(); } catch { /* already closed */ }
     }
     if (!RENDER.rafPending) {
       RENDER.rafPending = true;
@@ -2842,7 +2782,7 @@ function onDecodedFrame(frame) {
   } catch (e) {
     hudState.dec = `render:${e.message}`;
   } finally {
-    if (!retained) { try { frame.close(); } catch {} }
+    if (!retained) { try { frame.close(); } catch { /* already closed */ } }
   }
 }
 
@@ -2854,7 +2794,7 @@ function renderTick() {
     // fresher frame arrives.
     while (RENDER.queue.length > 1) {
       framePresentationTelemetry.noteRafCoalesced();
-      try { RENDER.queue.shift().frame.close(); } catch {}
+      try { RENDER.queue.shift().frame.close(); } catch { /* already closed */ }
     }
     const front = RENDER.queue[0];
     if (!front) return;
@@ -3299,6 +3239,9 @@ function attachRtcAudio(track, generation = peerGeneration) {
   });
 }
 
+// The document-level tap that resumes a blocked autoplay. One at a time: a new session replaces it.
+let nativePlayGesture = null;
+
 function startNativeVideo(track, generation = peerGeneration) {
   const video = document.createElement("video");
   video.autoplay = true;
@@ -3386,11 +3329,13 @@ function startNativeVideo(track, generation = peerGeneration) {
   }
   video.addEventListener("loadeddata", () => { if (video.videoWidth && video.videoHeight) markFirstFramePresented(); }, { once: true });
   video.addEventListener("playing", () => { if (video.videoWidth && video.videoHeight) markFirstFramePresented(); }, { once: true });
-  const tryPlay = () => video.play().catch(() => {});
+  const tryPlay = () => video.play().catch(() => { /* autoplay blocked: the next tap retries */ });
   tryPlay();
   // Mobile browsers (iOS especially) may refuse autoplay until a user
   // gesture; resume on the first tap anywhere.
-  document.addEventListener("pointerdown", tryPlay, { once: true });
+  nativePlayGesture?.abort();
+  nativePlayGesture = new AbortController();
+  document.addEventListener("pointerdown", tryPlay, { once: true, signal: nativePlayGesture.signal });
   video.addEventListener("click", tryPlay);
   hudState.dec = "native video";
 }
@@ -3403,7 +3348,7 @@ function startEncodedStreams(receiver, generation = peerGeneration) {
     for (;;) {
       const { value: chunk, done } = await reader.read();
       if (done) break;
-      if (generation !== peerGeneration) { try { chunk.close(); } catch {} break; }
+      if (generation !== peerGeneration) { try { chunk.close(); } catch { /* already closed */ } break; }
       const metadata = typeof chunk.getMetadata === "function" ? chunk.getMetadata() : {};
       const wrapped = {
         type: chunk.type,
@@ -3463,7 +3408,7 @@ function followDecoderCodec(codec) {
   if (!codecSession.followBitstreamCodec(codec)) return;
   clearWssKeyframeWatchdog();
   wssDecoderEpoch++;
-  try { decoder?.close(); } catch {}
+  try { decoder?.close(); } catch { /* already closed */ }
   decoder = null;
   // Keep the admitted keyframe's generation and ordering gate. A full resync
   // would request another keyframe and discard the one that proves the codec.
@@ -3517,7 +3462,7 @@ function feedDecoder(chunk, generation) {
     const decoderEpoch = ++wssDecoderEpoch;
     decoder = new VideoDecoder({
       output: (frame) => {
-        if (decoderEpoch !== wssDecoderEpoch) { try { frame.close(); } catch {} return; }
+        if (decoderEpoch !== wssDecoderEpoch) { try { frame.close(); } catch { /* already closed */ } return; }
         clearWssKeyframeWatchdog();
         wssNoOutputFailures = 0;
         if (usingWssMedia && !debugFirstDecoderOutput) {
@@ -3575,7 +3520,7 @@ function feedDecoder(chunk, generation) {
     } catch (e) {
       viewerLog("error", "decoder-config-error", { message: String(e?.message || e), codec });
       hudState.dec = `cfg:${e.message}`;
-      try { decoder.close(); } catch {}
+      try { decoder.close(); } catch { /* already closed */ }
       decoder = null;
       if (usingWssMedia) noteWssFailure("configure-unsupported");
       return;
@@ -3592,9 +3537,9 @@ function feedDecoder(chunk, generation) {
   decoder.sawKeyframe = decoder.sawKeyframe || isKey;
   const decodeLimit = usingWssMedia ? (streamModeValue() === "game" ? 4 : 8) : 2;
   const decodeHardLimit = usingWssMedia ? decodeLimit + 2 : decodeLimit;
-  // v4 never drops a chunk for decoder backpressure: every frame is decoded
-  // and only presentation is skipped while the decoder catches up.
-  if (!latencyGuard.admitDecode(usingWssMedia ? Infinity : decodeHardLimit)) {
+  // v4 decodes every frame and skips only presentation while the decoder catches up, up to a
+  // backlog limit; past it the decoder is wedged and recovery resumes from the next keyframe.
+  if (!latencyGuard.admitDecode(usingWssMedia ? V4_DECODE_BACKLOG_LIMIT_FRAMES : decodeHardLimit)) {
     if (usingWssMedia) { hudState.dropped++; beginWssRecovery("decoder-backpressure"); }
     else dropAndResync("decoder-backpressure");
     return;
@@ -3627,7 +3572,7 @@ function drawFrame(frame, due = performance.now()) {
     const w = frame.displayWidth, h = frame.displayHeight;
     lastDecodedDimensions = { width: w, height: h };
     const metadata = usingWssMedia ? wssFrameMeta.get(frame) : null;
-    const view = metadata ? viewportForGeneration(metadata.generation) : null;
+    const view = metadata ? sharpSession.cropForGeneration(metadata.generation) : null;
     if (usingWssMedia && (!metadata || !view)) return; // never render a generation with stale geometry
     let hybridTilesDrawn = 0;
     let presentedCanvas = screen;
@@ -3688,7 +3633,7 @@ function drawFrame(frame, due = performance.now()) {
     hudState.presented = framesDrawn;
     if (usingWssMedia && metadata !== undefined) wssPresentedSequence = metadata.sequence >>> 0;
   } finally {
-    try { frame.close(); } catch {}
+    try { frame.close(); } catch { /* already closed */ }
   }
 }
 
@@ -3886,11 +3831,11 @@ function resolveNativeFileDrop(event) {
   if (!nativeFileDropAvailable || mobilePointerDevice || pointerMode !== "desktop" ||
       event.pointerType === "touch" || event.sourceCapabilities?.firesTouchEvents || event.target !== inputSurface) return { purpose: "save" };
   if (!fileTransferAvailable() || !connected || !desktopAvailable || desktopAwaitingFrame ||
-      desktopInputState !== "enabled" || !hasPresentedFrame || viewportPending || transitionNeedsKeyframe) return { error: "drop-not-ready" };
+      desktopInputState !== "enabled" || !hasPresentedFrame || sharpSession.isPending || transitionNeedsKeyframe) return { error: "drop-not-ready" };
   // The base full-desktop canvas remains the coordinate plane while a sharp
   // crop is overlaid. A committed crop without its matching rendered overlay
   // is transitional geometry and must not become a native drop target.
-  if (viewportState.enabled && (!renderedSharpView || renderedSharpView.revision !== viewportState.revision ||
+  if (sharpSession.committed.enabled && (!renderedSharpView || renderedSharpView.revision !== sharpSession.committed.revision ||
       renderedSharpView.generation !== fileDropPresentedGeneration)) return { error: "drop-not-ready" };
   const media = activeVideo || screenMedia();
   const width = activeVideo ? activeVideo.videoWidth : screenDims().width;
@@ -3902,14 +3847,14 @@ function resolveNativeFileDrop(event) {
   const generation = fileDropPresentedGeneration;
   if (!Number.isInteger(generation) || generation <= 0 || generation > 0xffff_ffff) return { error: "drop-not-ready" };
   return { purpose: "drop", drop: { ...drop, generation,
-    viewportRevision: fileDropPresentedViewportRevision ?? (viewportState.revision || 0) } };
+    viewportRevision: fileDropPresentedViewportRevision ?? (sharpSession.committed.revision || 0) } };
 }
 function updateKeyboardLock() {
   const keyboard = navigator.keyboard;
   if (!keyboard?.lock) return;
   // Fullscreen streams receive system shortcuts (Ctrl+W, Alt+Tab where the
   // browser allows it, Esc) instead of the local browser.
-  if (document.fullscreenElement && settings.keyboardLock) keyboard.lock().catch(() => {}); else keyboard.unlock?.();
+  if (document.fullscreenElement && settings.keyboardLock) keyboard.lock().catch(() => { /* lock refused: keys stay with the browser */ }); else keyboard.unlock?.();
 }
 document.addEventListener("fullscreenchange", updateKeyboardLock);
 
@@ -3964,45 +3909,10 @@ document.addEventListener("keyup", (e) => {
 });
 const keyboardInput = document.getElementById("keyboard-input");
 const keyboardStatus = document.getElementById("keyboard-status");
-let keyboardShadow = "";
-let keyboardComposing = false;
-// BEGIN secure-composition-gate
-function createCompositionCommitGate(commit, schedule = setTimeout, cancel = clearTimeout) {
-  let pending = null;
-  return {
-    stage(text) {
-      this.reset();
-      const value = String(text ?? "");
-      if (!value) return false;
-      const transaction = { value, timer: null };
-      transaction.timer = schedule(() => {
-        if (pending !== transaction) return;
-        pending = null;
-        commit(transaction.value);
-      }, 50);
-      pending = transaction;
-      return true;
-    },
-    consume(text) {
-      if (!pending) return false;
-      const transaction = pending;
-      pending = null;
-      cancel(transaction.timer);
-      commit(String(text ?? "") || transaction.value);
-      return true;
-    },
-    reset() {
-      if (pending) cancel(pending.timer);
-      pending = null;
-    },
-  };
-}
-// END secure-composition-gate
-const secureCompositionCommit = createCompositionCommitGate(text => {
-  if (!inputReady || desktopKind !== "secure") { resetKeyboardDraft(); return; }
-  handleSecureKeyboardInput({ data: text, inputType: "insertCompositionText" });
+const keyboardDraft = createKeyboardDraft({
+  input, field: keyboardInput, inputReady: () => inputReady, desktopKind: () => desktopKind,
+  desktopInputState: () => desktopInputState, setStatus: text => { keyboardStatus.textContent = text; },
 });
-const modifierVks = new Map([["Ctrl", 0x11], ["Alt", 0x12], ["Shift", 0x10], ["Win", 0x5B]]);
 // Keys popover (touch), after the Android app: navigation and editing keys,
 // then function keys. Arrows live in their own popover.
 const specialKeys = [
@@ -4108,74 +4018,11 @@ function renderShortcutList() {
     return row;
   }));
 }
-function resetKeyboardDraft() {
-  keyboardComposing = false;
-  secureCompositionCommit.reset();
-  keyboardShadow = "";
-  keyboardInput.value = "";
-}
-function sendKeyboardText(text) {
-  let chunk = "";
-  let sent = 0;
-  for (const character of String(text)) {
-    const candidate = chunk + character;
-    if (new TextEncoder().encode(candidate).byteLength > 500 && chunk) {
-      if (input.text(chunk)) sent += Array.from(chunk).length;
-      chunk = character;
-    } else chunk = candidate;
-  }
-  if (chunk && input.text(chunk)) sent += Array.from(chunk).length;
-  return sent;
-}
-function reconcileKeyboardValue(nextValue) {
-  const next = String(nextValue ?? "");
-  const edit = reconcileTextEdit(keyboardShadow, next);
-   if (inputReady) {
-    for (let i = 0; i < edit.deleteCount; i++) {
-      input.key(0x08, false);
-      input.key(0x08, true);
-    }
-    const inserted = sendKeyboardText(edit.insert);
-    if (edit.deleteCount || inserted) {
-      keyboardStatus.textContent = edit.deleteCount
-        ? `Applied correction: ${edit.deleteCount} delete${edit.deleteCount === 1 ? "" : "s"}${inserted ? ` + ${inserted} character${inserted === 1 ? "" : "s"}` : ""}.`
-        : `Sent ${inserted} character${inserted === 1 ? "" : "s"}.`;
-    }
-  }
-  keyboardShadow = next;
-}
-function handleSecureKeyboardInput(event) {
-  if (desktopInputState !== "enabled") { resetKeyboardDraft(); return; }
-  if (event.inputType === "deleteContentBackward") {
-    input.key(0x08, false); input.key(0x08, true);
-    keyboardStatus.textContent = "Protected input sent.";
-    resetKeyboardDraft();
-    return;
-  }
-  const source = event.data ?? keyboardInput.value;
-  const units = secureTextUnits(source, event.inputType || "insertText");
-  for (const unit of units) input.text(unit);
-  keyboardStatus.textContent = units.length ? "Protected input sent." : "Paste and automatic corrections are disabled on secure desktop.";
-  resetKeyboardDraft();
-}
-keyboardInput.addEventListener("compositionstart", () => { secureCompositionCommit.reset(); keyboardComposing = true; });
-keyboardInput.addEventListener("input", event => {
-  if (!inputReady || event.isComposing || keyboardComposing) return;
-  if (desktopKind === "secure" && secureCompositionCommit.consume(event.data ?? keyboardInput.value)) return;
-  if (desktopKind === "secure") { handleSecureKeyboardInput(event); return; }
-  reconcileKeyboardValue(keyboardInput.value);
-});
-keyboardInput.addEventListener("compositionend", event => {
-  keyboardComposing = false;
-  if (desktopKind === "secure") {
-    if (inputReady) secureCompositionCommit.stage(event.data ?? keyboardInput.value);
-    else resetKeyboardDraft();
-    return;
-  }
-  if (inputReady) reconcileKeyboardValue(keyboardInput.value);
-});
+keyboardInput.addEventListener("compositionstart", () => keyboardDraft.compositionStart());
+keyboardInput.addEventListener("input", event => keyboardDraft.input(event));
+keyboardInput.addEventListener("compositionend", event => keyboardDraft.compositionEnd(event));
 window.addEventListener("blur", () => {
-  releaseInput(); held.clear(); resetKeyboardDraft();
+  releaseInput(); held.clear(); keyboardDraft.reset();
 });
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") { releaseInput(); resetTouchCursor(); } });
 
@@ -4230,7 +4077,7 @@ function showContextHint() {
   if (!hasPresentedFrame || !contextHint || !contextHintCopy) return;
   const mode = pointerMode === "game" ? "game" : "work";
   let dismissed = false;
-  try { dismissed = localStorage.getItem(`bp_hint_${mode}_dismissed`) === "1"; } catch {}
+  try { dismissed = localStorage.getItem(`bp_hint_${mode}_dismissed`) === "1"; } catch { /* storage unavailable */ }
   contextHint.hidden = dismissed;
   contextHint.dataset.mode = mode;
   contextHintCopy.textContent = mode === "game"
@@ -4291,7 +4138,7 @@ function setPointerMode(next, persist=true) {
     if (input.cursorSync()) cursorReconciler.noteSent(input.lastCursorSequence);
     if (pointerMode === "desktop") cursorSyncTimer=setTimeout(requestCursorSync,500);
    }
-   scheduleSharpViewport("pointer-mode");
+   sharpSession.schedule("pointer-mode");
    showContextHint();
  }
 function streamModeValue() { return pointerMode === "game" ? "game" : "work"; }
@@ -4307,116 +4154,20 @@ function syncViewport() { const area = streamArea(); viewport.resize(area.width,
 function renderTouchCursor() { cursorAppearance.render({ pointerMode, inputReady, point: remoteCursor.screenPoint(viewport), overlayVisible: touchCursorVisible, mousePointerActive }); }
 function centerCameraOnCursor() { if (shouldCenterCameraOnCursor({ zoom: viewport.zoom, pointerMode, synced: cursorReconciler.synced, locallyAuthoritative: locallyAuthoritativeCursor })) viewport.centerOnNormalized(remoteCursor.snapshot()); }
 function syncViewportAndFollow() { syncViewport(); centerCameraOnCursor(); renderViewport(); }
-function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("cursor-follow"); }
+function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); sharpSession.schedule("cursor-follow"); }
 function showTouchCursor() { touchCursorVisible=shouldShowCursorOverlay({pointerMode, ...cursorReconciler}); renderTouchCursor(); }
 function resetTouchCursor() { clearCursorSyncTimer(); touchCursorVisible=false; gestures.reset(); cursorReconciler.reset(); renderTouchCursor(); }
-function mediaViewCrop(message) {
-  const desktopWidth = Number(message?.desktopWidth) || remoteDesktop.width;
-  const desktopHeight = Number(message?.desktopHeight) || remoteDesktop.height;
-  const width = Number(message?.sourceWidth) || desktopWidth;
-  const height = Number(message?.sourceHeight) || desktopHeight;
-  return { enabled: message?.state !== "full" && (width < desktopWidth || height < desktopHeight),
-    x: Number(message?.sourceX) || 0, y: Number(message?.sourceY) || 0, width, height,
-    desktopWidth, desktopHeight, revision: Number(message?.revision) || 0,
-    generation: Number(message?.generation) || 0, source: message };
-}
-function viewportHealthSnapshot() {
-  const crop = renderedSharpView || activeViewportCrop();
-  const gain = cropGain(crop, lastDecodedDimensions?.width || 1920, lastDecodedDimensions?.height || 1080);
-  return { state: viewportTelemetry.state, revision: viewportTelemetry.revision, generation: viewportTelemetry.generation,
-    crop: viewportTelemetry.crop, zoom: Number(viewport.zoom.toFixed(2)), pointer: pointerMode,
-    pending: viewportPending?.revision || null,
-    transitionMs: viewportPending ? Math.round(performance.now() - viewportPending.sentAt) : 0,
-    gainX: Number(gain.x.toFixed(2)), gainY: Number(gain.y.toFixed(2)), requested: viewportLast };
-}
-function activeViewportCrop() {
-  return viewportState.source ? mediaViewCrop(viewportState.source) : fullDesktopCrop(remoteDesktop.width, remoteDesktop.height);
-}
-function computeDesiredViewport() {
-  if (streamModeValue() === "game" || !sharpZoomEnabled || sharpDisabledForSession) return fullDesktopCrop(remoteDesktop.width, remoteDesktop.height);
-  return desiredSharpCrop({ viewport: viewport.snapshot(), viewportWidth: innerWidth, viewportHeight: innerHeight,
-    content: viewport.content, desktopWidth: remoteDesktop.width, desktopHeight: remoteDesktop.height,
-    wasEnabled: viewportState.enabled || !!viewportPending?.requested?.enabled });
-}
-function q16(value, extent) { return Math.max(0, Math.min(65535, Math.round(value / Math.max(1, extent) * 65535))); }
-function armViewportTransitionTimeout(revision) {
-  clearTimeout(viewportTransitionTimer);
-  viewportTransitionTimer = setTimeout(() => {
-    if (!viewportPending || viewportPending.revision !== revision) return;
-    if (!viewportPending.recoveryRequested) {
-      viewportPending.recoveryRequested = true;
-      beginWssRecovery("viewport-transition-timeout");
-      armViewportTransitionTimeout(revision);
-      return;
-    }
-    viewerLog("warn", "viewport-transition-failed", { revision, requested: viewportPending.requested });
-    viewportConsecutiveTimeouts++;
-    viewportPending = null;
-    if (viewportConsecutiveTimeouts >= 2) sharpDisabledForSession = true;
-    sendViewportRequest(fullDesktopCrop(remoteDesktop.width, remoteDesktop.height), "viewport-timeout-full", true);
-  }, 1_500);
-}
-function sendViewportRequest(crop, reason, force = false) {
-  // The crop travels out of band (media-control viewport / media-view); frames carry only a generation.
-  if (!usingWssMedia || !wssStartedHost || viewportPending) return false;
-  const active = activeViewportCrop();
-  if (!force && !cropNeedsUpdate(active, crop, remoteDesktop.width, remoteDesktop.height)) return false;
-  const revision = viewportRevision = (viewportRevision + 1) >>> 0;
-  viewportLastSentAt = performance.now();
-  viewportLast = { enabled: crop.enabled, x: crop.x, y: crop.y, width: crop.width, height: crop.height };
-  viewportPending = { revision, requested: crop, reason, sentAt: viewportLastSentAt, recoveryRequested: false, generation: 0, source: null };
-  viewportTelemetry = { state: "refining", revision, generation: 0, crop: `${crop.width}x${crop.height}@${crop.x},${crop.y}` };
-  sendControl({ type: "media-control", action: "viewport", protocol: WSS_PROTOCOL, epoch: mediaEpoch,
-    revision, enabled: crop.enabled, xQ16: q16(crop.x, remoteDesktop.width), yQ16: q16(crop.y, remoteDesktop.height),
-    widthQ16: q16(crop.width, remoteDesktop.width), heightQ16: q16(crop.height, remoteDesktop.height), reason });
-  armViewportTransitionTimeout(revision);
-  return true;
-}
-function flushSharpViewport(reason = "sharp-viewport") {
-  viewportTimer = null;
-  viewportDesired = computeDesiredViewport();
-  if (viewportPending) return;
-  sendViewportRequest(viewportDesired, reason);
-}
-function scheduleSharpViewport(reason = "sharp-viewport") {
-  if (!usingWssMedia || !wssStartedHost) return;
-  viewportDesired = computeDesiredViewport();
-  if (viewportPending) return;
-  clearTimeout(viewportTimer);
-  const wait = Math.max(0, 100 - (performance.now() - viewportLastSentAt));
-  viewportTimer = setTimeout(() => flushSharpViewport(reason), wait);
-}
-function handleMediaView(message) {
-  if (!Number.isInteger(message.revision)) return;
-  const minimumRevision = Math.max(viewportState.revision || 0, viewportPending?.revision || 0);
-  if (message.revision < minimumRevision) return;
-  viewportTelemetry = { state: message.state || "?", revision: message.revision, generation: message.generation || 0,
-    crop: `${message.sourceWidth || "?"}x${message.sourceHeight || "?"}@${message.sourceX || 0},${message.sourceY || 0}` };
-  if (message.state === "pending") {
-    if (viewportPending?.revision === message.revision) Object.assign(viewportPending, { source: message, generation: message.generation || 0 });
-    return;
-  }
-  const crop = mediaViewCrop(message);
-  const completed = viewportPending?.revision === message.revision ? viewportPending : null;
-  viewportState = { enabled: crop.enabled, revision: message.revision, generation: message.generation || 0, source: message };
-  if (completed) {
-    viewportPending = null;
-    if (crop.enabled || completed.reason !== "viewport-timeout-full") viewportConsecutiveTimeouts = 0;
-    clearTimeout(viewportTransitionTimer); viewportTransitionTimer = null;
-  }
-  const gain = cropGain(crop, lastDecodedDimensions?.width || 1920, lastDecodedDimensions?.height || 1080);
-  viewportTelemetry = { state: crop.enabled ? `sharp ${gain.x.toFixed(1)}x/${gain.y.toFixed(1)}x` : "full",
-    revision: message.revision, generation: message.generation || 0,
-    crop: `${crop.width}x${crop.height}@${crop.x},${crop.y}` };
-  scheduleSharpViewport("viewport-committed");
-}
-function viewportForGeneration(generation) {
-  if (viewportPending?.source && viewportPending.generation === generation) return mediaViewCrop(viewportPending.source);
-  if (viewportState.source && viewportState.generation === generation) return mediaViewCrop(viewportState.source);
-  if (!viewportPending && viewportState.source) return { ...mediaViewCrop(viewportState.source), generation };
-  if (!viewportPending && !viewportState.enabled) return { ...fullDesktopCrop(remoteDesktop.width, remoteDesktop.height), generation };
-  return null;
-}
+const sharpSession = createSharpSession({
+  enabled: sharpZoomEnabled,
+  desktop: () => remoteDesktop,
+  geometry: () => ({ snapshot: viewport.snapshot(), content: viewport.content, innerWidth, innerHeight }),
+  streamMode: streamModeValue,
+  canSend: () => usingWssMedia && wssStartedHost,
+  send: fields => sendControl({ type: "media-control", action: "viewport", protocol: WSS_PROTOCOL, epoch: mediaEpoch, ...fields }),
+  recover: reason => beginWssRecovery(reason),
+  decoded: () => lastDecodedDimensions,
+  log: viewerLog,
+});
 function layoutSharpCanvas(crop) {
   if (!crop?.enabled) { sharpScreen.classList.remove("active"); renderedSharpView = null; return; }
   const content = viewport.content;
@@ -4431,8 +4182,8 @@ function layoutSharpCanvas(crop) {
   renderedSharpView = crop;
 }
 function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = `${-visual.offsetLeft}px ${-visual.offsetTop}px`; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); renderZoomChip(s.zoom); if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
-function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); scheduleSharpViewport("zoom"); }
-function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); scheduleSharpViewport("pan"); }
+function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); sharpSession.schedule("zoom"); }
+function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); sharpSession.schedule("pan"); }
 addEventListener("resize", syncViewportAndFollow);
 function setTouchButtons(mask) { touchButtons=mask; if (inputReady) input.buttons(mask); }
 function setTouchButtonsAtCursor(mask) { const point=remoteCursor.absolutePoint(); touchButtons=mask; if (inputReady && input.buttonsAt(point.x,point.y,mask)) cursorReconciler.noteSent(input.lastCursorSequence); updatePointerHud(); }
@@ -4455,7 +4206,7 @@ function dispatchGesture(actions) {
 // or outside the browser window still reach the mousemove handler (clamped
 // to the picture's edge, so the remote cursor reaches the monitor edge for
 // edge hold), and the release is never lost.
-inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "mouse" && pointerMode === "desktop") { try { inputSurface.setPointerCapture(e.pointerId); } catch {} } if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "mouse") mousePointerActive = false; if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
+inputSurface.addEventListener("pointerdown", e => { if (e.pointerType === "mouse" && pointerMode === "desktop") { try { inputSurface.setPointerCapture(e.pointerId); } catch { /* pointer is no longer active */ } } if (e.pointerType === "pen") lastNonMousePointerAt = performance.now(); if (e.pointerType !== "mouse") mousePointerActive = false; if (e.pointerType !== "touch") return; lastNonMousePointerAt = performance.now(); showTouchCursor(); inputSurface.setPointerCapture(e.pointerId); dispatchGesture(gestures.down(e.pointerId,{x:e.clientX,y:e.clientY},e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointermove", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.move(e.pointerId,{x:e.clientX,y:e.clientY})); e.preventDefault(); });
 inputSurface.addEventListener("pointerup", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.up(e.pointerId,e.timeStamp)); e.preventDefault(); });
 inputSurface.addEventListener("pointercancel", e => { if (e.pointerType !== "touch") return; dispatchGesture(gestures.cancel(e.pointerId)); releaseInput(); resetTouchCursor(); hudState.touch = "cancelled"; e.preventDefault(); });
@@ -4595,7 +4346,7 @@ function renderKeyboardButton() {
 }
 function toggleTouchKeyboard() {
   popovers.close({ restore: false });
-  if (document.activeElement === keyboardInput) { keyboardInput.blur(); resetKeyboardDraft(); releaseLatchedModifiers(); }
+  if (document.activeElement === keyboardInput) { keyboardInput.blur(); keyboardDraft.reset(); releaseLatchedModifiers(); }
   else keyboardInput.focus({ preventScroll: true });
   renderKeyboardButton();
 }
@@ -4695,7 +4446,7 @@ function renderAbout(update = {}) {
 
 let diagnosticsVisible = diagnosticsEnabled;
 function diagnosticsReport() {
-  const view = viewportHealthSnapshot();
+  const view = sharpSession.health(renderedSharpView, viewport.zoom, pointerMode);
   return [
     "TRANSPORT",
     `state       ${connectionStatusDetail}`,
@@ -4753,7 +4504,7 @@ document.getElementById("copy-diagnostics").onclick = async e => {
 document.getElementById("dismiss-context-hint").onclick = e => {
   e.stopPropagation();
   const mode = contextHint.dataset.mode === "game" ? "game" : "work";
-  try { localStorage.setItem(`bp_hint_${mode}_dismissed`, "1"); } catch {}
+  try { localStorage.setItem(`bp_hint_${mode}_dismissed`, "1"); } catch { /* storage unavailable */ }
   contextHint.hidden = true;
   inputSurface.focus({ preventScroll: true });
 };
@@ -4782,4 +4533,3 @@ renderKeyboardModifiers();
 renderKeyboardButton();
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-function clamp16(v) { return clamp(v, -32768, 32767); }

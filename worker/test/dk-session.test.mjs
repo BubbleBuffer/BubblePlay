@@ -1,8 +1,10 @@
+import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, hkdfSync, sign } from "node:crypto";
 import vm from "node:vm";
+import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { createViewerSession, browserDeviceName, sessionRefusal } from "../public/dk-session.js";
 import { createCtlChannel } from "../public/dk-crypto.js";
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
@@ -46,7 +48,7 @@ async function harness(options = {}) {
       authenticatedSession: null, signalingPc: null, signalingTicket: null, Date, JSON,
       mediaEpoch: null, wssSelected: sessionOptions.transport === "wss", hudState: {},
       location: { href: hs.relayOrigin }, validateIceServers: value => value, relayOrigin: () => hs.relayOrigin,
-      debugTrace() {}, renderAbout() {}, noteFileEpoch() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure: (refusal) => events.failures.push(refusal),
+      debugTrace() {}, renderAbout() {}, noteFileEpoch() {}, recovery: recoveryStub(), noteSessionAuthenticated() {}, handleSessionFailure: (refusal) => events.failures.push(refusal),
       endAuthenticatedSession: refusal => events.failures.push(refusal),
       // Observe real session traffic while the actual receiver handler supplies
       // the epoch from hello-ok. Test hooks replace only I/O and observation.
@@ -390,7 +392,7 @@ test("receiver drops plaintext endpoint frames and preserves mediaEpoch string i
     authenticatedSession: null, signalingPc: null, signalingTicket: null,
     sessionGate: {}, Date, JSON, currentIceServers: null, mediaEpoch: null, wssSelected: false,
     hudState: {}, console: { info() {} }, location: { href: hs.relayOrigin }, validateIceServers: value => value,
-    debugTrace() {}, noteFileEpoch() {}, renderAbout() {}, noteSessionAuthenticated() {}, sessionAuthTimeoutMs: () => undefined, handleSessionFailure() {}, relayOrigin: () => hs.relayOrigin,
+    debugTrace() {}, noteFileEpoch() {}, renderAbout() {}, recovery: recoveryStub(), noteSessionAuthenticated() {}, handleSessionFailure() {}, relayOrigin: () => hs.relayOrigin,
     viewerLog() {}, sendStreamMode() {}, startPeer() {}, peerGeneration: 0,
     endAuthenticatedSession: refusal => errors.push(refusal),
     createViewerSession: config => { configs.push(config); return { async start() {}, receive: message => received.push(message) }; },
@@ -518,7 +520,7 @@ test("receiver failure closes authentication, media, pending tracks and input wi
     soundController: { detachSink() {} }, clearWssTimers() {}, closingPeer: false,
     releaseInput: () => cleanupCalls.push("release-input"),
   });
-  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  resetKeyboardDraft();", source.indexOf("function cleanupPeer(")));
+  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  keyboardDraft.reset();", source.indexOf("function cleanupPeer(")));
   vm.runInContext(cleanupPrefix + "\n}\ncleanupPeer();", cleanupContext);
   assert.deepEqual(cleanupCalls, ["track-stop", "release-input", "peer-reset"]);
   assert.equal(cleanupContext.pendingRtcTracks.length, 0);
@@ -533,13 +535,13 @@ test("receiver drains a final encrypted refusal before processing socket close o
     constructor() { this.readyState = 0; sockets.push(this); }
   }
   const context = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, Promise, performance: { now: () => 1 },
-    authenticatedSession: null, recoveryLossMs: null, recoveryAttempts: 0, noteConnectionLoss() {}, terminalSignalingFailure: false, reconnectTimer: null,
+    authenticatedSession: null, recovery: recoveryStub(), noteSessionAuthenticated() {}, terminalSignalingFailure: false, reconnectTimer: null,
     ws: null, signalingGeneration: 0, signalingRegistered: true, signalingPc: hs.pc.id, signalingTicket: "ticket",
     latestInputStatus: null, inputStatusReason: null, hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, cleanupPeer: () => calls.push("cleanup"),
     recordSignalingError() {}, shouldReconnectAfterClose: (_code, terminal) => !terminal,
     restartPeer: () => calls.push("restart"),
-    clearTimeout() {}, connectTimeoutMs: () => null, connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     handleSignal: async () => { calls.push("decrypt-start"); await decrypting; context.terminalSignalingFailure = true; calls.push("refusal"); },
   });
   const fn = source.slice(source.indexOf("function reconnectSignaling("), source.indexOf("\nfunction signalingSocketUrl("));
@@ -574,7 +576,7 @@ test("WSS teardown releases through ctl and cannot authorize an unbound DataChan
     stopWssMedia: () => { context.usingWssMedia = false; }, soundController: { detachSink() {} }, clearWssTimers() {},
   });
   const inputFns = source.slice(source.indexOf("function inputControlState("), source.indexOf("\nlet motionFrame"));
-  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  resetKeyboardDraft();", source.indexOf("function cleanupPeer(")));
+  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  keyboardDraft.reset();", source.indexOf("function cleanupPeer(")));
   vm.runInContext(inputFns + "\n" + cleanupPrefix + "\n}\ncleanupPeer();", context);
   assert.deepEqual(sent, ["ctl-input"]);
   assert.equal(vm.runInContext("sendInput(data, dc)", context), false);
@@ -619,6 +621,18 @@ test("a ctl sealed for the previous session, arriving before auth-host, is dropp
   await h.authenticate();
   assert.equal(h.events.authenticated, 1);
   assert.deepEqual(h.events.failures, []);
+  h.session.close();
+});
+
+test("an authentic control message that its handler cannot process is dropped; the session survives", async () => {
+  const delivered = [];
+  const h = await harness({ onMessage: message => { if (message.type === "malformed") throw new TypeError("bad shape"); delivered.push(message.type); } });
+  await h.authenticate();
+  await h.session.receive(await h.pcCtl.sealJson({ type: "malformed" }));
+  await h.session.receive(await h.pcCtl.sealJson({ type: "after" }));
+  assert.deepEqual(h.events.failures, []);
+  assert.equal(h.session.controlReady, true);
+  assert.deepEqual(delivered, ["after"]);
   h.session.close();
 });
 
