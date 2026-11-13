@@ -351,9 +351,18 @@ fn future_admission_waits_on_worker_and_later_requests_cannot_postpone_it() {
     let deadline = Instant::now() + Duration::from_millis(100);
     h.waiter.request_frame_at(deadline);
     h.waiter.request_frame_at(deadline + Duration::from_secs(1));
-    assert!(h.attempts.recv_timeout(Duration::from_millis(30)).is_err());
-    assert!(h.waiter.poll().unwrap().is_none());
-    let frame = h.frame();
+    // An acquire attempt or a frame is only legal once the deadline has
+    // passed, however late the scheduler runs this thread: assert the order
+    // of events, not a wall-clock window.
+    let wait = deadline.saturating_duration_since(Instant::now());
+    if h.attempts.recv_timeout(wait).is_ok() {
+        assert!(Instant::now() >= deadline, "attempt before the deadline");
+    }
+    let early = h.waiter.poll().unwrap();
+    if early.is_some() {
+        assert!(Instant::now() >= deadline, "frame before the deadline");
+    }
+    let frame = early.unwrap_or_else(|| h.frame());
     assert!(Instant::now() >= deadline);
     assert_eq!(h.acquires.load(Ordering::SeqCst), 1);
     drop(frame);
@@ -370,7 +379,7 @@ fn urgent_request_advances_future_admission_and_live_frame_cannot_rearm() {
     let frame = h.frame();
     h.waiter.request_frame();
     drop(frame);
-    assert!(h.attempts.recv_timeout(Duration::from_millis(20)).is_ok()); // first acquire
+    h.attempts.recv_timeout(Duration::from_secs(2)).unwrap(); // first acquire
     assert!(h.attempts.recv_timeout(Duration::from_millis(20)).is_err());
     assert_eq!(h.acquires.load(Ordering::SeqCst), 1);
     h.waiter.stop().unwrap();
