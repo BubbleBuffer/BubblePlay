@@ -92,19 +92,22 @@
     "no-magic-numbers": 2
   },
   "worker/public/receiver.js": {
-    "max-lines-per-function": 8,
+    "max-lines-per-function": 7,
     "no-empty": 1,
-    "no-magic-numbers": 141,
-    "no-unused-vars": 4
+    "no-magic-numbers": 138,
+    "no-unused-vars": 7
   },
   "worker/public/recovery.js": {
-    "no-magic-numbers": 4
+    "no-magic-numbers": 3
   },
   "worker/public/remote-clipboard.js": {
     "no-magic-numbers": 6
   },
   "worker/public/report.js": {
     "no-magic-numbers": 1
+  },
+  "worker/public/session-state.js": {
+    "max-lines-per-function": 1
   },
   "worker/public/settings.js": {
     "no-magic-numbers": 4
@@ -114,6 +117,9 @@
   },
   "worker/public/sharp-viewport.js": {
     "no-magic-numbers": 3
+  },
+  "worker/public/signaling-socket.js": {
+    "max-lines-per-function": 1
   },
   "worker/public/transport.js": {
     "no-useless-assignment": 1
@@ -156,6 +162,9 @@
     "no-unused-vars": 1
   },
   "worker/test/media.test.mjs": {
+    "no-unused-vars": 1
+  },
+  "worker/test/reconnect-recovery.test.mjs": {
     "no-unused-vars": 1
   },
   "worker/test/viewer-robustness.test.mjs": {

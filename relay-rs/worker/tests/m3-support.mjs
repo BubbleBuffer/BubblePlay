@@ -592,7 +592,20 @@ export async function approveBrowser(relay, ntfy, ip = freshClientIp()) {
 // config rejection (500) fails the start, so the cause shows up in the log instead of in a test.
 // `ntfy` (from startNtfy) turns approvals on, and `turn` adds the TURN ICE server. `gateHoldMs`
 // shortens the gate's 30 s hold (the test-only GATE_HOLD_MS var).
-export async function startRelay({ persistDir, maxConnections = 256, ntfy = null, turn = false, gateHoldMs = null }) {
+// The free port is probed and released before wrangler binds it, so another process can take it in
+// between ("Address already in use"). That start is retried on a fresh port, a bounded number of times.
+const START_ATTEMPTS = 3;
+export async function startRelay(options) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await startRelayOnce(options);
+    } catch (err) {
+      if (attempt >= START_ATTEMPTS || !String(err).includes('Address already in use')) throw err;
+    }
+  }
+}
+
+async function startRelayOnce({ persistDir, maxConnections = 256, ntfy = null, turn = false, gateHoldMs = null }) {
   if (!existsSync(path.join(crateRoot, 'build', 'worker', 'shim.mjs'))) {
     throw new Error('build/worker/shim.mjs is missing: run worker-build --release first');
   }

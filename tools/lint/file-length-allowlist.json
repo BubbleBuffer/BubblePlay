@@ -124,7 +124,7 @@
   "relay-rs/server/src/runtime.rs": 540,
   "relay-rs/server/tests/common/mod.rs": 534,
   "relay-rs/server/tests/e2e_gate_and_data.rs": 727,
-  "relay-rs/worker/tests/m3-support.mjs": 677,
+  "relay-rs/worker/tests/m3-support.mjs": 690,
   "relay-rs/worker/tests/relay.test.mjs": 914,
   "worker/public/devicekey-ui.js": 620,
   "worker/public/devicekey.js": 592,
@@ -133,11 +133,11 @@
   "worker/public/file-client.js": 666,
   "worker/public/input.js": 577,
   "worker/public/media.js": 841,
-  "worker/public/receiver.js": 4435,
+  "worker/public/receiver.js": 4222,
   "worker/test-e2e/harness.mjs": 515,
-  "worker/test/cdp-boundary.test.mjs": 561,
+  "worker/test/cdp-boundary.test.mjs": 521,
   "worker/test/devicekey.test.mjs": 1014,
   "worker/test/dk-session.test.mjs": 685,
-  "worker/test/dk-upload.test.mjs": 530,
+  "worker/test/dk-upload.test.mjs": 531,
   "worker/test/media.test.mjs": 823
 }
