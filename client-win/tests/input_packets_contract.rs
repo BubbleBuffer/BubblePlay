@@ -18,11 +18,15 @@ fn field(decoded: &Value, name: &str) -> i64 {
 }
 
 fn encode(decoded: &Value) -> Option<String> {
-    let kind = decoded["kind"].as_str().expect("kind");
+    let kind = decoded["kind"]
+        .as_str()
+        .unwrap_or_else(|| panic!("kind missing"));
     let bytes = match kind {
         "key" => key(
             field(decoded, "vk") as u16,
-            decoded["up"].as_bool().expect("up"),
+            decoded["up"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("up missing")),
         )
         .to_vec(),
         "buttons" => buttons(field(decoded, "mask") as u8).to_vec(),
