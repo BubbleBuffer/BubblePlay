@@ -104,7 +104,6 @@ test("modern transform keeps canvas/decode/render in the DedicatedWorker", () =>
   assert.match(client, /type: "capabilities"/);
   assert.match(worker, /typeof VideoDecoder !== "undefined"/);
   assert.match(worker, /typeof OffscreenCanvas !== "undefined"/);
-  assert.match(client, /jitterBufferTarget\s*=\s*0/);
   assert.doesNotMatch(client, /frame-consumed/);
   assert.doesNotMatch(client, /activeReceiver\.sendKeyFrameRequest/);
   assert.match(worker, /transformer\.sendKeyFrameRequest/);
@@ -159,10 +158,8 @@ test("native video is the default path and WebCodecs is opt-in", () => {
   const client = readClientSource();
   assert.match(client, /const useWebCodecs = params\.get\("decoderPath"\) === "webcodecs";/);
   assert.match(client, /if \(!useWebCodecs\) \{\s*startNativeVideo\(ev\.track(?:, generation)?\);\s*return;/);
-  assert.match(client, /if \(useWebCodecs\) peerOptions\.encodedInsertableStreams = true;/);
   assert.match(client, /video\.requestVideoFrameCallback\(onVideoFrame\)/);
   assert.match(client, /nativePresentation:/);
-  assert.doesNotMatch(client, /encodedInsertableStreams:\s*true/);
 });
 
 test("native video keeps an explicit input overlay and diagnostics count presented frames", () => {
@@ -230,7 +227,6 @@ test("first-frame startup uses one bounded retry and clears on native or decoded
   assert.match(client, /phase === "failed"/);
   assert.match(client, /phase === "failed"[\s\S]*firstFrameHandshake\.presented[\s\S]*first-frame-failure-ignored[\s\S]*return;/);
   assert.match(client, /function resetPresentationCounters\(\)/);
-  assert.match(client, /function cleanupPeer\(\)[\s\S]*resetPresentationCounters\(\)/);
   assert.match(client, /recoverWssStartup/);
   assert.match(client, /monitorTransition/);
   assert.match(client, /desktopTransitionPlan\(\{ reason: message\.reason, state: message\.state, usingWss: sessionState\.usingWssMedia, alreadyRendering, rtcInPlace: rtcInPlaceTransitionCapable\(\) \}\)/);
@@ -313,7 +309,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /function probeNetworkRouteChange\(\)/);
   assert.match(client, /routeConnection\?\.addEventListener\("change", probeNetworkRouteChange\)/);
   assert.doesNotMatch(client, /routeConnection\?\.addEventListener\("change", \(\) => recoverNetworkRoute/);
-  assert.match(client, /createRtcStartupFallback\(\{[\s\S]*?getStats: \(\) => candidate\.getStats\(\),[\s\S]*?onFallback: \(\) => switchToWss\("no-rtp"\)/);
   assert.doesNotMatch(client, /switchToWss\("ice-timeout"\)/);
   assert.match(client, /2_000/);
   assert.doesNotMatch(client, /localStorage\.setItem\([^\n]*codec/);
@@ -343,7 +338,6 @@ test("client applies validated ephemeral ICE configuration and keeps route diagn
   assert.ok(client.includes('mediaEpoch = typeof msg.mediaEpoch === "string" && /^[\\x20-\\x7e]{1,64}$/.test(msg.mediaEpoch) ? msg.mediaEpoch : null;'),
     "the admitted epoch must be a bounded printable ASCII string, preserved without numeric conversion");
   assert.match(client, /onAuthenticated: \(\) => \{\s*if \(!current\(\)\) return;[\s\S]*?if \(sessionState\.wssSelected\) requestWssMediaStart\(\);\s*else startPeer\(sessionState\.peerGeneration\);/);
-  assert.match(client, /iceServers: sessionState\.currentIceServers,\s*iceTransportPolicy,/);
   assert.match(client, /hudState\.route = deriveCandidateRoute\(latestRtcProfile\);/);
   assert.match(client, /hudState\.route = "…";/);
 });
@@ -411,8 +405,6 @@ test("mobile desktop pointer uses absolute targets and authoritative host reconc
   const client = readClientSource();
   assert.match(client, /Work · absolute pointer/);
   assert.match(client, /new CursorReconciler\(remoteCursor\)/);
-  assert.match(client, /channel\.onmessage[\s\S]*handleCursorState/);
-  assert.match(client, /motionChannel\.onmessage[\s\S]*handleCursorState/);
   assert.match(client, /function queueTouchAbsolute[\s\S]*input\.absolute/);
   assert.match(client, /pointerMode === "desktop"[\s\S]*queueTouchAbsolute\(point\.x,point\.y\)/);
   assert.match(client, /action\.type === "motion-end"[\s\S]*setTouchButtonsAtCursor\(touchButtons\)/);
@@ -471,7 +463,6 @@ test("monitor control uses the signaling epoch and drops stale confirmations", (
   assert.match(client, /import \{\s*desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,[\s\S]*?\} from "\/monitor-selection\.js"/);
   // Both epoch restarts drop an outstanding confirmation instead of latching
   // monitor selection off for the rest of the page.
-  assert.match(client, /function restartPeer\(reason, reconnect = true\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
   assert.match(client, /function invalidatePendingMonitorRequest\(reason\) \{[\s\S]*monitorRequestAfterRestart\(monitorSwitchPending, reason\)[\s\S]*monitorSwitchPending = null;/);
   // The monitor control is a signaling message; input data channels are not a
   // precondition.

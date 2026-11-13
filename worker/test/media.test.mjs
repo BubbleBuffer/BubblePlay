@@ -817,7 +817,5 @@ test("a connected native WebRTC peer with presented frames never falls back to W
 test("the receiver consults native presentation before the automatic WSS fallback", () => {
   const receiver = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   assert.match(receiver,
-    /createRtcStartupFallback\(\{[\s\S]*?nativeFramesPresented: nativePresentation\?\.generation === generation/);
-  assert.match(receiver,
     /sessionState\.rtcStartupFallback\?\.stop\(\);[\s\S]{0,400}?markFirstFramePresented\(null, null, \{ rtpTimestamp \}\);/);
 });

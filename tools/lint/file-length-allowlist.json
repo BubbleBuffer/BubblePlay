@@ -133,11 +133,11 @@
   "worker/public/file-client.js": 666,
   "worker/public/input.js": 577,
   "worker/public/media.js": 841,
-  "worker/public/receiver.js": 4222,
+  "worker/public/receiver.js": 4030,
   "worker/test-e2e/harness.mjs": 515,
-  "worker/test/cdp-boundary.test.mjs": 521,
+  "worker/test/cdp-boundary.test.mjs": 512,
   "worker/test/devicekey.test.mjs": 1014,
-  "worker/test/dk-session.test.mjs": 685,
+  "worker/test/dk-session.test.mjs": 665,
   "worker/test/dk-upload.test.mjs": 531,
-  "worker/test/media.test.mjs": 823
+  "worker/test/media.test.mjs": 821
 }

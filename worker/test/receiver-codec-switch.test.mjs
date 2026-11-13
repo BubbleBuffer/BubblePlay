@@ -79,7 +79,7 @@ function harness(usingWssMedia = true) {
   const extract = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
   vm.runInContext([
     extract("function clearWssKeyframeWatchdog(", "function resyncWssDecoder("),
-    extract("function decodeWssFrame(", "async function startPeer("),
+    extract("function decodeWssFrame(", "export function startSession("),
     extract("function followDecoderCodec(", "function drawFrame("),
   ].join("\n"), context);
   return { context, decoders, decoded, failures, timers,
