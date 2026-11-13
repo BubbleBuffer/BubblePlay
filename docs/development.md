@@ -24,7 +24,11 @@ Start with the affected module's checks. Changes to packet semantics should incl
 
 The relay is in `relay-rs/`, the only relay in the repository. It serves the browser assets from `worker/public/`; Windows capture and encoding remain in the Rust host. Run its tests from `relay-rs/` as CI does (`cargo test --locked --workspace`), then follow [its setup guide](../relay-rs/README.md) for a separate development instance. Never reuse production credentials for fixtures.
 
-The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, the relay-rs tests, clippy, fmt and wasm32 builds and a container build, the host's Rust tests, clippy and fmt on a hosted Windows runner, and Android unit tests and lint on a hosted Ubuntu runner. The host job links against generated NVENC/NVDEC import libraries without an NVIDIA driver, so it does not establish an NVENC encode or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
+Every job of the Checks and App workflows runs on a GitHub-hosted runner (`ubuntu-latest` or `windows-latest`), for pushes and for pull requests including forks: the repository is public, so no self-hosted runner may run code from a pull request. The workflows grant a read-only token (`permissions: contents: read`), use no secrets, and do not use `pull_request_target`. The `changes` job (`tools/ci-changes.mjs`) skips the jobs a change cannot affect.
+
+The CI definition covers browser checks on Node 22/24, synthetic Windows packaging/setup checks in both PowerShell versions, the relay-rs tests, clippy, fmt and wasm32 builds and a container build, the host's and the Windows client's Rust tests, clippy and fmt on a hosted Windows runner, Android unit tests and lint on a hosted Ubuntu runner, and the Flutter app's analysis, golden tests and debug APK on a hosted Ubuntu runner.
+
+The phone APK workflows (`android-apk.yml`, `flutter-apk.yml`) are the exception: they run on the home server because it holds the key that publishes the APK. They start only from a manual `workflow_dispatch` or after a successful push run of Checks on `master` of `BubbleBuffer/BubblePlay`, never from a pull request. The publish step reads the repository variables `APK_PUBLISH_SSH` (user@host of the publish host), `APK_PUBLISH_KEY` (native app) and `APK_PUBLISH_KEY_FLUTTER` (Flutter app) (private key file path on the runner), and fails when one is empty. The host job links against generated NVENC/NVDEC import libraries without an NVIDIA driver, so it does not establish an NVENC encode or a physical desktop-stream test: those need the Windows/NVIDIA build environment and explicit runtime evidence.
 
 From the root, run the release tooling checks separately:
 
@@ -98,7 +102,7 @@ The checker uses the current Node executable directly. Missing dependencies fail
 `worker-build`, stamps `relay-rs/worker/build/BUILD_INFO.json` with the commit, refuses a dirty tree or a bundle
 older than HEAD, and runs a `wrangler deploy --dry-run`. `--deploy` publishes with the commit as the
 `BUILD_COMMIT` var and the deployment message. `--skip-build` uses the bundle already in `relay-rs/worker/build`,
-for example the `relay-worker-bundle` artifact of the CI run for the same commit. `--plan` prints the steps only.
+for example the `relay-worker-bundle` artifact of the CI run for the same commit (uploaded by master and manual runs, not by pull requests). `--plan` prints the steps only.
 The production config is an input and stays untracked.
 
 ## Desktop tray deployment
