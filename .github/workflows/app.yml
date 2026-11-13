@@ -138,7 +138,7 @@ jobs:
           name: bubbleplay-app-debug-apk
           path: app/build/app/outputs/flutter-apk/app-debug.apk
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
       - name: Upload golden failures
         if: failure()
         continue-on-error: true
