@@ -768,6 +768,7 @@
   "pointerKeyTextPackets": {
     "note": "Browser to host packets of types 0, 1, 4, 6 to 11, as bytes (hex, little-endian) and decoded fields. Encoders (browser, Kotlin, client-win) must produce hex from decoded; decoders (client-win, host) must produce decoded from hex. seq is a u16 and wraps; dx, dy, wheelX and wheelY are i16; x and y are u16. Types 2, 3 and 5 are legacy, decoded by the host only. Types 12 and 13 are in packets above.",
     "textMaxBytes": 512,
+    "textChunkBytes": 500,
     "vectors": [
       { "name": "key-down", "hex": "004100", "decoded": { "kind": "key", "vk": 65, "up": false } },
       { "name": "key-up-high-vk", "hex": "01a501", "decoded": { "kind": "key", "vk": 421, "up": true } },

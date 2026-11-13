@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { TEXT_CHUNK_BYTES } from "../public/keyboard-draft.js";
 import { packet } from "../public/input.js";
 
 // fixtures/input-contract.json "pointerKeyTextPackets": the browser's encoders against the shared vectors.
@@ -27,5 +28,7 @@ test("browser input encoders produce the contract bytes", () => {
 test("browser text packets stop at the contract limit", () => {
   assert.ok(packet.text("x".repeat(contract.textMaxBytes)));
   assert.equal(packet.text("x".repeat(contract.textMaxBytes + 1)), null);
+  assert.equal(TEXT_CHUNK_BYTES, contract.textChunkBytes);
+  assert.ok(TEXT_CHUNK_BYTES <= contract.textMaxBytes);
   assert.equal(packet.text(""), null);
 });

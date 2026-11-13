@@ -39,6 +39,13 @@
         "host"
       ]
     },
+    "close-codes-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "relay"
+      ]
+    },
     "cursor-types.json": {
       "consumers": [
         "worker",
