@@ -88,6 +88,11 @@
         "host"
       ]
     },
+    "install-names-contract.json": {
+      "consumers": [
+        "host"
+      ]
+    },
     "media-control-contract.json": {
       "consumers": [
         "client-win",
