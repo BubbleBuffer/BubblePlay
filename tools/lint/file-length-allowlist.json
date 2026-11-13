@@ -56,7 +56,7 @@
   "host/src/admin_agent/session.rs": 671,
   "host/src/benchmark.rs": 983,
   "host/src/bin/bubbleplay_admin_agent.rs": 745,
-  "host/src/bin/bubbleplay_lab_helper.rs": 2950,
+  "host/src/bin/bubbleplay_lab_helper.rs": 2864,
   "host/src/bin/bubbleplay_tray.rs": 1865,
   "host/src/bin/probe_encoder_color.rs": 1196,
   "host/src/bin/probe_mf.rs": 1580,
