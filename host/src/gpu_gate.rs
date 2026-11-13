@@ -21,15 +21,32 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::panic::Location;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
+use tracing::warn;
 use windows::core::{IUnknown, Interface};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Multithread};
 
+/// A waiter that has not got the gate after this long logs who holds it, and
+/// repeats the line every interval.
+pub const GPU_GATE_STALL_REPORT_MS: u64 = 2_000;
+/// Longest a teardown path waits for the gate before it leaks its native
+/// objects instead of hanging behind a wedged driver call.
+pub const GPU_GATE_TEARDOWN_TIMEOUT_MS: u64 = 3_000;
+
+/// Who holds the gate: the `lock` call site and when it got the gate.
+struct Holder {
+    site: &'static Location<'static>,
+    since: Instant,
+}
+
 /// Serializes native GPU calls made on one D3D11 device.
 pub struct GpuGate {
-    lock: Mutex<()>,
+    holder: Mutex<Option<Holder>>,
+    released: Condvar,
     /// A typed device reference keeps the canonical `IUnknown` identity alive
     /// while the gate exists, so its address cannot be reused for another
     /// device under the same registry key. `None` for test-only keys.
@@ -42,32 +59,96 @@ thread_local! {
 
 /// Proof that the current thread holds a device gate.
 pub struct GpuGuard<'a> {
-    _guard: MutexGuard<'a, ()>,
+    gate: &'a GpuGate,
     key: usize,
 }
 
 impl GpuGate {
     fn new(device: Option<ID3D11Device>) -> Self {
         Self {
-            lock: Mutex::new(()),
+            holder: Mutex::new(None),
+            released: Condvar::new(),
             _device: device,
         }
     }
 
-    /// Blocks until this device's native calls are free. Panics on same-thread
-    /// re-entry, which would otherwise deadlock forever.
+    fn holder(&self) -> MutexGuard<'_, Option<Holder>> {
+        self.holder
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Blocks until this device's native calls are free, logging the holder's
+    /// call site every [`GPU_GATE_STALL_REPORT_MS`] while it waits. Panics on
+    /// same-thread re-entry, which would otherwise deadlock forever.
+    #[track_caller]
     pub fn lock(&self) -> GpuGuard<'_> {
+        let site = Location::caller();
+        loop {
+            if let Some(guard) = self.acquire(site, None) {
+                return guard;
+            }
+        }
+    }
+
+    /// Like [`Self::lock`], but gives up after `timeout` and logs the holder.
+    /// For teardown paths that can leak instead of waiting.
+    #[track_caller]
+    pub fn lock_timeout(&self, timeout: Duration) -> Option<GpuGuard<'_>> {
+        self.acquire(Location::caller(), Some(timeout))
+    }
+
+    fn acquire(
+        &self,
+        site: &'static Location<'static>,
+        timeout: Option<Duration>,
+    ) -> Option<GpuGuard<'_>> {
         let key = self as *const Self as usize;
         assert!(
             !HELD.with(|held| held.borrow().contains(&key)),
             "GPU gate re-entered on the same thread"
         );
-        let guard = self
-            .lock
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let report = Duration::from_millis(GPU_GATE_STALL_REPORT_MS);
+        let started = Instant::now();
+        let mut holder = self.holder();
+        while let Some(current) = holder.as_ref() {
+            let waited = started.elapsed();
+            let remaining = timeout.map(|limit| limit.saturating_sub(waited));
+            if remaining.is_some_and(|left| left.is_zero()) {
+                warn!(
+                    waiter = %site,
+                    holder = %current.site,
+                    held_ms = current.since.elapsed().as_millis() as u64,
+                    waited_ms = waited.as_millis() as u64,
+                    "GPU gate wait timed out"
+                );
+                return None;
+            }
+            let slice = remaining.map_or(report, |left| left.min(report));
+            let (next, result) = self
+                .released
+                .wait_timeout(holder, slice)
+                .unwrap_or_else(|poison| poison.into_inner());
+            holder = next;
+            if let (true, Some(current)) = (result.timed_out(), holder.as_ref()) {
+                if timeout.is_none() {
+                    warn!(
+                        waiter = %site,
+                        holder = %current.site,
+                        held_ms = current.since.elapsed().as_millis() as u64,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "GPU gate still held"
+                    );
+                }
+            }
+        }
+        *holder = Some(Holder {
+            site,
+            since: Instant::now(),
+        });
+        drop(holder);
         HELD.with(|held| held.borrow_mut().push(key));
-        GpuGuard { _guard: guard, key }
+        Some(GpuGuard { gate: self, key })
     }
 }
 
@@ -79,6 +160,8 @@ impl Drop for GpuGuard<'_> {
                 held.remove(position);
             }
         });
+        *self.gate.holder() = None;
+        self.gate.released.notify_one();
     }
 }
 
@@ -295,5 +378,24 @@ mod tests {
         let gate = for_device_key(0x6000);
         drop(gate.lock());
         let _again = gate.lock();
+    }
+
+    #[test]
+    fn lock_timeout_gives_up_on_a_held_gate_and_succeeds_once_it_is_released() {
+        const WAIT: Duration = Duration::from_secs(5);
+        let gate = for_device_key(0x7000);
+        let (ready, wait_ready) = std::sync::mpsc::channel::<()>();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let holder_gate = gate.clone();
+        let holder = thread::spawn(move || {
+            let _guard = holder_gate.lock();
+            ready.send(()).unwrap();
+            wait_release.recv_timeout(WAIT).unwrap();
+        });
+        wait_ready.recv_timeout(WAIT).unwrap();
+        assert!(gate.lock_timeout(Duration::from_millis(50)).is_none());
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(gate.lock_timeout(Duration::from_millis(50)).is_some());
     }
 }

@@ -209,7 +209,7 @@ export class FileTransferClient extends EventTarget {
     row.error = error;
     row.finishedAt = this.now();
     if (row.transferId !== null) this.byTransferId.delete(row.transferId);
-    if (row.sink && state !== "done") { const sink = row.sink; row.sink = null; Promise.resolve().then(() => sink.abort?.()).catch(() => {}); }
+    if (row.sink && state !== "done") { const sink = row.sink; row.sink = null; Promise.resolve().then(() => sink.abort?.()).catch(() => { /* a sink that cannot abort has nothing left to release */ }); }
     row.file = null;
     this.wake();
     this.changed();
@@ -284,7 +284,7 @@ export class FileTransferClient extends EventTarget {
     clearTimeout(this.peerTimer);
     clearTimeout(this.idleTimer);
     this.ackTimer = null;
-    if (ws) { try { ws.close(1000, "idle"); } catch {} }
+    if (ws) { try { ws.close(1000, "idle"); } catch { /* already closed */ } }
   }
 
   onSocketClosed() {

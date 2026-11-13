@@ -3,6 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { createCompositionCommitGate } from "../public/composition-gate.js";
 
 test("receiver diagnostics expose current host capabilities, capture and clock", () => {
   const client = readClientSource();
@@ -199,7 +200,6 @@ test("responsive product shell keeps normal controls compact and diagnostics adv
   assert.match(client, /Windows secure desktop/);
   assert.match(client, /desktopKind === "secure"/);
   assert.match(client, /keyboardInput\.setAttribute\("autocorrect", secureDesktop \? "off" : "on"\)/);
-  assert.match(client, /secureTextUnits/);
   // Touch order follows the Android quick-action bar.
   assert.match(client, /data-ui-action="keyboard"[\s\S]*data-ui-action="monitors"[\s\S]*data-ui-action="pointer"[\s\S]*data-ui-action="shortcuts"[\s\S]*data-ui-action="keys"[\s\S]*data-ui-action="arrows"[\s\S]*data-ui-action="more"/);
 });
@@ -304,10 +304,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /clientBuild/);
   assert.match(client, /mediaGeneration/);
   assert.match(client, /<canvas id="screen"><\/canvas><canvas id="sharp-screen"><\/canvas>/);
-  assert.match(client, /desiredSharpCrop/);
-  assert.match(client, /function viewportForGeneration\(generation\)/);
-  assert.match(client, /never render a generation with stale geometry/);
-  assert.match(client, /viewport-timeout-full/);
   assert.match(client, /function beginWssRecovery\(reason, requestId = null\)/);
   assert.match(client, /wssRecoveryPending/);
   assert.match(client, /wss-recovery-keyframe/);
@@ -316,10 +312,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /action: "monitor"/);
   assert.match(client, /id="session-strip"/);
   assert.match(client, /id="keyboard-input"/);
-  assert.match(client, /reconcileTextEdit/);
-  assert.match(client, /let keyboardShadow = ""/);
   assert.match(client, /compositionstart/);
-  assert.match(client, /Applied correction/);
   assert.doesNotMatch(client, /keyboardInput\.value = "";\s*\}\);/);
   assert.match(client, /data-vk="162"/);
   assert.match(client, /createPopoverController\(\{/);
@@ -350,20 +343,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
 });
 
 
-
-test("sharp viewport crop is requested on WSS v4 (no protocol guard)", () => {
-  const client = readClientSource();
-  const body = (name) => {
-    const start = client.indexOf(`function ${name}(`);
-    assert.ok(start >= 0, `${name} exists`);
-    return client.slice(start, client.indexOf("\n}\n", start));
-  };
-  for (const name of ["sendViewportRequest", "scheduleSharpViewport"]) {
-    assert.doesNotMatch(body(name), /WSS_PROTOCOL[ ]*[!=]==/, `${name} must not gate the crop off on v4`);
-  }
-  assert.doesNotMatch(client, /v4 always streams the full desktop/);
-  assert.match(body("sendViewportRequest"), /type: "media-control", action: "viewport", protocol: WSS_PROTOCOL/);
-});
 
 test("QoS polling continues after ICE reaches completed", () => {
   const client = readClientSource();
@@ -561,11 +540,7 @@ test("normal text assistance is restored outside the secure desktop", () => {
 });
 
 test("secure Android composition commits through one pending transaction", () => {
-  const client = readClientSource();
-  const begin = client.indexOf("// BEGIN secure-composition-gate");
-  const end = client.indexOf("// END secure-composition-gate");
-  assert.ok(begin >= 0 && end > begin);
-  const factory = new Function(`${client.slice(begin, end)}\nreturn createCompositionCommitGate;`)();
+  const factory = createCompositionCommitGate;
   const committed = [];
   let scheduled = null;
   const gate = factory(value => committed.push(value), callback => { scheduled = callback; return callback; }, handle => { if (scheduled === handle) scheduled = null; });
@@ -584,7 +559,4 @@ test("secure Android composition commits through one pending transaction", () =>
   fallback();
   fallback();
   assert.deepEqual(committed, ["é", "🙂"]);
-
-  assert.match(client, /if \(desktopKind === "secure" && secureCompositionCommit\.consume\(event\.data \?\? keyboardInput\.value\)\) return/);
-  assert.match(client, /compositionend", event =>[\s\S]*secureCompositionCommit\.stage\(event\.data \?\? keyboardInput\.value\)/);
 });

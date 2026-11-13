@@ -164,7 +164,7 @@ test("receiver wires physical keys, keyboard lock, wheel accumulation and clipbo
   assert.doesNotMatch(client, /const KEY = \{/);
   // Scroll speed and the keyboard-lock preference come from the saved session settings.
   assert.match(client, /wheelAccumulator\.add\(e\.deltaX \* settings\.scrollSpeed, e\.deltaY \* settings\.scrollSpeed, e\.deltaMode\)/);
-  assert.match(client, /if \(document\.fullscreenElement && settings\.keyboardLock\) keyboard\.lock\(\)\.catch\(\(\) => \{\}\); else keyboard\.unlock\?\.\(\);/);
+  assert.match(client, /if \(document\.fullscreenElement && settings\.keyboardLock\) keyboard\.lock\(\)\.catch\(\(\) => \{[^}]*\}\); else keyboard\.unlock\?\.\(\);/);
   assert.match(client, /keyboardLockSwitch\.onchange = \(\) => \{ settings\.keyboardLock = keyboardLockSwitch\.checked; persistSettings\(\); updateKeyboardLock\(\); \}/);
   assert.match(client, /document\.addEventListener\("fullscreenchange", updateKeyboardLock\)/);
   assert.match(client, /case "clipboard":\s*receiveRemoteClipboard\(msg\);/);
@@ -178,7 +178,7 @@ test("desktop mouse drags stay captured and clamp to the picture edge", () => {
   const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   // A held button keeps the pointer on the input surface even over the strip
   // or outside the browser window (edge hold needs the remote cursor at the edge).
-  assert.match(client, /inputSurface\.addEventListener\("pointerdown", e => \{ if \(e\.pointerType === "mouse" && pointerMode === "desktop"\) \{ try \{ inputSurface\.setPointerCapture\(e\.pointerId\); \} catch \{\} \}/);
+  assert.match(client, /inputSurface\.addEventListener\("pointerdown", e => \{ if \(e\.pointerType === "mouse" && pointerMode === "desktop"\) \{ try \{ inputSurface\.setPointerCapture\(e\.pointerId\); \} catch \{[^}]*\} \}/);
   // Absolute moves outside the picture (letterbox, outside the window) are clamped, not dropped.
   assert.match(client, /const x = clamp\(\(e\.clientX - r\.left\) \/ r\.width, 0, 1\);\s*const y = clamp\(\(e\.clientY - r\.top\) \/ r\.height, 0, 1\);/);
 });

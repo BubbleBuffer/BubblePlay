@@ -6,12 +6,6 @@
 /// Read limit of a signaling socket (`signalLimit`): 512 KiB of text.
 pub const SIGNAL_LIMIT: usize = 512 * 1024;
 
-/// Smallest binary frame on a signaling socket.
-pub const SIGNAL_BINARY_MIN: usize = 1;
-
-/// Largest binary frame on a signaling socket (16384 bytes).
-pub const SIGNAL_BINARY_MAX: usize = 16 * 1024;
-
 /// Length of the host's media frame header (magic, version, flags, codec,
 /// channels, sample rate, timestamps, ...).
 pub const MEDIA_HEADER_BYTES: usize = 28;
@@ -27,6 +21,9 @@ pub const FILE_HEADER_BYTES: usize = 16;
 /// Read limit of a file socket (`fileLimit`): one 64 KiB data packet plus the
 /// 16-byte packet header.
 pub const FILE_LIMIT: usize = 64 * 1024 + FILE_HEADER_BYTES;
+
+/// The shortest bearer secret an adapter accepts (RELAY_TOKEN, ADMIN_TOKEN, TURN secret), in bytes.
+pub const MIN_SECRET_BYTES: usize = 32;
 
 /// Hello and any other pre-authentication message: 16 KiB.
 pub const HELLO_LIMIT: usize = 16 * 1024;

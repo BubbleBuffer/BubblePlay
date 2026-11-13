@@ -15,12 +15,11 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header}
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use bp_relay_core::gate::{
-    Hold, HoldCheck, Request as GateRequest, Response as GateResponse, Verdict,
+    Hold, HoldCheck, Prefix, Request as GateRequest, Response as GateResponse, Verdict,
 };
 use bp_relay_core::presence::PRESENCE_PATH;
-use bp_relay_core::relay::{AdminError, UpgradeRequest};
+use bp_relay_core::relay::{AdminError, UpgradeRequest, ct_eq};
 use serde_json::{Value, json};
-use subtle::ConstantTimeEq;
 use url::form_urlencoded;
 
 use crate::assets::serve_asset;
@@ -112,6 +111,14 @@ async fn dispatch(
         }
         Verdict::Hold(hold, effects) => {
             state.run_gate_effects(effects).await;
+            let prefix = Prefix::of(client);
+            if !state.limits.acquire_hold(prefix) {
+                return dropped();
+            }
+            let _held = HeldNavigation {
+                state: state.clone(),
+                prefix,
+            };
             hold_navigation(&state, hold).await
         }
         Verdict::Drop => dropped(),
@@ -149,6 +156,19 @@ async fn dispatch(
             }
             serve_asset(&state.assets_dir, &parts.method, path, parts.uri.query()).await
         }
+    }
+}
+
+/// One counted held navigation. Dropping it, whether the hold ended or the client left and the
+/// request was cancelled, gives the slot back.
+struct HeldNavigation {
+    state: AppState,
+    prefix: Prefix,
+}
+
+impl Drop for HeldNavigation {
+    fn drop(&mut self) {
+        self.state.limits.release_hold(self.prefix);
     }
 }
 
@@ -292,7 +312,7 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     else {
         return false;
     };
-    bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
+    ct_eq(presented.as_bytes(), expected.as_bytes())
 }
 
 /// The admin API, behind the admin bearer. Anything wrong with the bearer, the route or the id is

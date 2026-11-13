@@ -11,24 +11,27 @@
 //! count and whether its host is online. The report is the only way a PC enters the directory, and
 //! the directory refuses a new PC once it holds `MAX_PCS`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use bp_relay_core::directory::{CapReached, DirEntry, Directory, PcReport};
+use bp_relay_core::directory::{DirEntry, Directory};
 use bp_relay_core::gate::{
-    Gate, GateEffect, GateSnapshot, Hold, HoldCheck, Request as GateRequest, Verdict,
+    Gate, GateEffect, GateSnapshot, Hold, HoldCheck, Prefix, Request as GateRequest, Verdict,
 };
+use bp_relay_core::holds::HoldCounter;
 use bp_relay_core::presence::{self, PRESENCE_PATH, PresenceLimiter};
 use bp_relay_core::relay::{PcTable, reasons};
-use serde_json::{Value, json};
+use serde_json::json;
 use worker::js_sys;
 use worker::wasm_bindgen::JsValue;
 use worker::worker_sys::WebSocketRequestResponsePair;
 use worker::{
-    Delay, Error, ListOptions, Method, Request, RequestInit, Response, Result, ScheduledTime,
-    Storage, Url, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    Delay, Error, ListOptions, Method, Request, Response, Result, ScheduledTime, Storage, Url,
+    WebSocket, WebSocketIncomingMessage, WebSocketPair,
 };
 
+use crate::WS_CHECK_HEADER;
 use crate::assets;
 use crate::config::{self, Settings};
 use crate::http;
@@ -37,35 +40,51 @@ use crate::ntfy;
 use crate::rng::WebCrypto;
 use crate::routes::{client_ip, route_for_path};
 use crate::store;
-use crate::{INTERNAL_PREFIX, PC_RELAY_BINDING, WS_CHECK_HEADER};
 
 const GATE_KEY: &str = "gate";
 /// One storage key per registered PC: `pc:<canonical id>` holds its `DirEntry` as JSON.
-const DIR_PREFIX: &str = "pc:";
+pub(crate) const DIR_PREFIX: &str = "pc:";
 /// How often a held navigation looks at the gate's in-memory state.
 const HOLD_CHECK_MS: u64 = 250;
 const REPORT_PATH: &str = "/__internal/dir/report";
 const CLAIM_PATH: &str = "/__internal/dir/claim";
 /// The single-object relay PC table: this object still holds it until each PC own object has
 /// taken its record (`claim`).
-const LEGACY_KEY: &str = "pcs";
+pub(crate) const LEGACY_KEY: &str = "pcs";
 
 /// The in-memory state: the gate, the presence limiter and the directory.
 pub struct FrontLive {
-    gate: Gate,
+    pub(crate) gate: Gate,
     /// Per-prefix counter for `GET /presence`. Memory only: eviction resets it.
-    presence: PresenceLimiter,
-    directory: Directory,
+    pub(crate) presence: PresenceLimiter,
+    /// Navigations held open for approval, in total and per client prefix.
+    pub(crate) holds: HoldCounter,
+    pub(crate) directory: Directory,
     /// PC records from before the per-PC split that no PC object has taken yet.
-    legacy: PcTable,
+    pub(crate) legacy: PcTable,
     /// The canonical public origin, for the browser-socket check.
-    origin: String,
+    pub(crate) origin: String,
     /// The admin bearer, for the admin API and healthz.
-    admin_token: String,
+    pub(crate) admin_token: String,
     /// The public origin's host, lowercase, without a port. The healthz Host check uses it.
-    public_host: String,
+    pub(crate) public_host: String,
     /// The alarm time last set, if known. The outer None means unknown. Some(None) means none.
-    armed: Option<Option<u64>>,
+    pub(crate) armed: Option<Option<u64>>,
+}
+
+/// One counted held navigation. Dropping it, whether the hold ended or the request was cancelled,
+/// gives the slot back.
+struct HeldNavigation<'a> {
+    live: &'a RefCell<Option<FrontLive>>,
+    prefix: Prefix,
+}
+
+impl Drop for HeldNavigation<'_> {
+    fn drop(&mut self) {
+        if let Some(live) = self.live.borrow_mut().as_mut() {
+            live.holds.release(self.prefix);
+        }
+    }
 }
 
 impl FrontLive {
@@ -179,6 +198,20 @@ impl crate::Relay {
             }
             Verdict::Hold(hold, effects) => {
                 self.run_gate_effects(effects).await;
+                let prefix = Prefix::of(client);
+                let acquired = {
+                    let mut guard = self.live.borrow_mut();
+                    guard
+                        .as_mut()
+                        .is_some_and(|live| live.holds.acquire(prefix))
+                };
+                if !acquired {
+                    return http::dropped();
+                }
+                let _held = HeldNavigation {
+                    live: &self.live,
+                    prefix,
+                };
                 return self.hold_navigation(hold).await;
             }
             Verdict::Drop => return http::dropped(),
@@ -234,104 +267,6 @@ impl crate::Relay {
         }
     }
 
-    /// A PC object's report. Only the objects reach this path: the Worker answers 404 to a request
-    /// from outside that names it.
-    async fn directory_report(&self, req: Request, method: &Method) -> Result<Response> {
-        if *method != Method::Post {
-            return not_found();
-        }
-        let Some(body) = http::read_body(&req).await? else {
-            return http::status(413);
-        };
-        let Ok(report) = serde_json::from_slice::<PcReport>(&body) else {
-            return http::status(400);
-        };
-        if !report.is_valid() {
-            return http::status(400);
-        }
-        let stored = {
-            let mut guard = self.live.borrow_mut();
-            let Some(live) = guard.as_mut() else {
-                return server_error();
-            };
-            live.directory.report(&report, now_ms())
-        };
-        let entry = match stored {
-            Ok(entry) => entry,
-            Err(CapReached) => return http::status(409),
-        };
-        let Ok(text) = serde_json::to_string(&entry) else {
-            return http::status(503);
-        };
-        match self
-            .state
-            .storage()
-            .put(&format!("{DIR_PREFIX}{}", report.id), text)
-            .await
-        {
-            Ok(()) => {
-                self.drop_legacy(&report.id).await;
-                http::status(204)
-            }
-            Err(_) => http::status(503),
-        }
-    }
-
-    /// A PC object asks for its record from the single-object relay table (a POST whose body is
-    /// the canonical device id; the answer is that one record in the table format). The record
-    /// stays here until the object reports it (`drop_legacy`), so a crash in between loses nothing.
-    async fn claim(&self, req: Request, method: &Method) -> Result<Response> {
-        if *method != Method::Post {
-            return not_found();
-        }
-        let Some(body) = http::read_body(&req).await? else {
-            return http::status(413);
-        };
-        let id = String::from_utf8_lossy(&body).into_owned();
-        let text = {
-            let guard = self.live.borrow();
-            let Some(live) = guard.as_ref() else {
-                return server_error();
-            };
-            live.legacy.records.get(&id).and_then(|record| {
-                let mut one = PcTable::new();
-                one.records.insert(id.clone(), record.clone());
-                store::encode_pcs(&one).ok()
-            })
-        };
-        match text {
-            Some(text) => Response::ok(text),
-            None => not_found(),
-        }
-    }
-
-    /// Forgets the old-table record of a PC whose own object has saved it, and deletes the old
-    /// table key when it is empty.
-    async fn drop_legacy(&self, id: &str) {
-        let text = {
-            let mut guard = self.live.borrow_mut();
-            let Some(live) = guard.as_mut() else {
-                return;
-            };
-            if live.legacy.records.remove(id).is_none() {
-                return;
-            }
-            if live.legacy.is_empty() {
-                None
-            } else {
-                store::encode_pcs(&live.legacy).ok()
-            }
-        };
-        let storage = self.state.storage();
-        let result = match text {
-            Some(text) => storage.put(LEGACY_KEY, text).await,
-            None => storage.delete(LEGACY_KEY).await.map(|_| ()),
-        };
-        if result.is_err() {
-            worker::console_error!("the old PC table could not be updated");
-        }
-    }
-
     /// Holds an unapproved navigation open until the gate admits it (a 302 with the cookie) or
     /// drops it. Each check reads in-memory state only, and the timer between checks leaves the
     /// object free to handle other events, the decision among them.
@@ -356,105 +291,6 @@ impl crate::Relay {
                 }
                 HoldCheck::Drop => return http::dropped(),
             }
-        }
-    }
-
-    /// The admin API, behind the admin bearer. A wrong bearer, route or id is 404, as native.
-    async fn admin(
-        &self,
-        method: &Method,
-        path: &str,
-        authorization: Option<&str>,
-    ) -> Result<Response> {
-        let allowed = {
-            let guard = self.live.borrow();
-            let Some(live) = guard.as_ref() else {
-                return server_error();
-            };
-            http::bearer_matches(authorization, &live.admin_token)
-        };
-        if !allowed {
-            return not_found();
-        }
-        if *method == Method::Get && path == "/__gate/manage/pcs" {
-            let rows = {
-                let guard = self.live.borrow();
-                let Some(live) = guard.as_ref() else {
-                    return server_error();
-                };
-                live.directory.listing(now_ms())
-            };
-            let rows: Vec<Value> = rows
-                .into_iter()
-                .map(|row| {
-                    json!({
-                        "id": row.id,
-                        "public": row.public,
-                        "first_seen": row.first_seen,
-                        "last_seen": row.last_seen,
-                        "online": row.online,
-                        "admitted": row.admitted,
-                    })
-                })
-                .collect();
-            return http::json(&Value::Array(rows));
-        }
-        if let Some(id) = path.strip_prefix("/__gate/manage/pcs/")
-            && *method == Method::Delete
-            && !id.is_empty()
-            && !id.contains('/')
-        {
-            return self.delete_pc(id).await;
-        }
-        not_found()
-    }
-
-    /// Forgets a PC: its object drops the record and closes its host, then the directory forgets
-    /// it. An id that is not a device id, or one the directory does not hold, is 404.
-    async fn delete_pc(&self, id: &str) -> Result<Response> {
-        let Ok(parsed) = bp_device_key::DeviceId::parse(id) else {
-            return not_found();
-        };
-        let id = parsed.to_string();
-        let known = {
-            let guard = self.live.borrow();
-            let Some(live) = guard.as_ref() else {
-                return server_error();
-            };
-            live.directory.is_registered(&id)
-        };
-        if !known {
-            return not_found();
-        }
-        // The PC's object answers 404 when it holds no record (a PC that never reported a record
-        // there): the directory entry still goes.
-        let object = bp_relay_core::directory::session_object_name(Some(&id));
-        let stub = self
-            .env
-            .durable_object(PC_RELAY_BINDING)?
-            .id_from_name(&object)?
-            .get_stub()?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post);
-        let request = Request::new_with_init(
-            &format!("https://relay.internal{INTERNAL_PREFIX}pc/delete"),
-            &init,
-        )?;
-        let status = stub.fetch_with_request(request).await?.status_code();
-        if status != 204 && status != 404 {
-            return http::status(503);
-        }
-        if let Some(live) = self.live.borrow_mut().as_mut() {
-            live.directory.remove(&id);
-        }
-        match self
-            .state
-            .storage()
-            .delete(&format!("{DIR_PREFIX}{id}"))
-            .await
-        {
-            Ok(_) => http::status(204),
-            Err(_) => http::status(503),
         }
     }
 
@@ -628,6 +464,7 @@ async fn wake_state(
     Ok(FrontLive {
         gate,
         presence: PresenceLimiter::new(),
+        holds: HoldCounter::default(),
         directory: Directory::new(entries),
         legacy,
         origin,
@@ -637,11 +474,11 @@ async fn wake_state(
     })
 }
 
-fn not_found() -> Result<Response> {
+pub(crate) fn not_found() -> Result<Response> {
     http::status(404)
 }
 
-fn server_error() -> Result<Response> {
+pub(crate) fn server_error() -> Result<Response> {
     http::status(500)
 }
 

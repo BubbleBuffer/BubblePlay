@@ -8,6 +8,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use bp_device_key::DeviceIdentity;
 use bp_relay_core::limits::{ADMIT_VIEWERS_MAX, AUTH_MAX, CTL_DATA_MAX};
+use bp_relay_core::relay::PROOF_TIMEOUT_MS;
 use bp_relay_core::{Action, ConnId, Invalid, Relay, Route, Side, validate_signal_text};
 use relay_harness::*;
 use serde_json::{Value, json};
@@ -357,7 +358,7 @@ fn m2_challenge_expires_after_30_seconds() {
 }
 
 #[test]
-fn m2_proof_at_29_seconds_is_accepted() {
+fn m2_proof_just_before_the_deadline_is_accepted() {
     let mut h = Harness::new();
     let host = host_up(&mut h);
     let (id, nonce) = viewer_start(
@@ -365,7 +366,7 @@ fn m2_proof_at_29_seconds_is_accepted() {
         &host.pc,
         &viewer_hello_msg(&viewer_identity(), false),
     );
-    h.advance(29_000);
+    h.advance(PROOF_TIMEOUT_MS - 1);
     let actions = h.text(id, &viewer_proof_msg(&viewer_identity(), ORIGIN, &nonce));
     assert!(hello_ok(&actions, id).get("ticket").is_some());
 }

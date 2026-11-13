@@ -118,62 +118,6 @@ export function createLatencyGuard({ now = () => performance.now(), onReset = ()
   };
 }
 
-// The transform Worker owns this state. Keeping it pure lets tests cover the
-// identity-aware ACK and delayed-post races without a Chromium runtime.
-export function createEncodedWorkerState({ now = () => performance.now(), onResync = () => {} } = {}) {
-  let generation = 0;
-  let nextSequence = 0;
-  let pending = new Map();
-  let waitingForKeyframe = false;
-  let lastKeyframeRequest = -Infinity;
-  const key = (g, s) => `${g}:${s}`;
-  function resync(reason, requestedGeneration) {
-    if (Number.isInteger(requestedGeneration)) {
-      // Repeating the same control message is idempotent (main and Worker
-      // echo a resync to ensure both sides converge on one generation).
-      if (requestedGeneration <= generation) return generation;
-      generation = requestedGeneration;
-    } else {
-      generation++;
-    }
-    pending = new Map();
-    waitingForKeyframe = true;
-    onResync({ generation, reason });
-    return generation;
-  }
-  return {
-    get generation() { return generation; },
-    get pending() { return pending.size; },
-    get waitingForKeyframe() { return waitingForKeyframe; },
-    reserve(type) {
-      // Once a reference frame is discarded, no following H.264 delta is
-      // independently decodable. Quietly drain deltas until the requested
-      // keyframe arrives; do not create a new generation for each delta.
-      if (waitingForKeyframe && type !== "key") return null;
-      if (pending.size >= 2) {
-        resync("worker-drop");
-        return null;
-      }
-      if (type === "key") waitingForKeyframe = false;
-      const record = { generation, sequence: ++nextSequence };
-      pending.set(key(record.generation, record.sequence), record);
-      return record;
-    },
-    canPost(record) { return pending.has(key(record.generation, record.sequence)) && record.generation === generation; },
-    ack({ generation: ackGeneration, sequence }) {
-      // A delayed ACK may only remove its exact in-flight reservation.
-      return pending.delete(key(ackGeneration, sequence));
-    },
-    resync,
-    requestKeyframeAllowed() {
-      const at = now();
-      if (at - lastKeyframeRequest < 500) return false;
-      lastKeyframeRequest = at;
-      return true;
-    },
-  };
-}
-
 export function annexBHasIdr(bytes) {
   for (let index = 0; index + 4 < bytes.length; index++) {
     const start3 = bytes[index] === 0 && bytes[index + 1] === 0 && bytes[index + 2] === 1;

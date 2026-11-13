@@ -407,7 +407,7 @@ Decided 2026-10-22 for the Rust relay (`relay-rs/`, lane rust-relay, M2). Consta
 **Viewer hello on `/ws?pc=<id>`** (the same exchange as host registration):
 
 1. The viewer sends `{"type":"hello","role":"viewer","id","public","turn"?,"pair"?}`. Unknown keys are refused. `id` is canonical and must match `public`; `pair` is 32 bytes. The old roles `client`, `media-client` and `file-client` are refused (decision 12, no aliases).
-2. The relay answers `{"type":"register-challenge","nonce"}`. The nonce is 32 random bytes for this socket only. It is valid for one answer and 30 s.
+2. The relay answers `{"type":"register-challenge","nonce"}`. The nonce is 32 random bytes for this socket only. It is valid for one answer and 10 s (`PROOF_TIMEOUT_MS`).
 3. The viewer answers `{"type":"register-proof","signature"}`, a relay proof with role `viewer` and the relay's configured public origin, checked with strict Ed25519 verification.
 4. The relay checks admission (below). Only then does it rotate the epoch, send the host `{"type":"peer-joined","mediaEpoch","pairing"}` (the same opaque `mediaEpoch` string the viewer gets) and then send the viewer `hello-ok`. Until admission the socket receives nothing but the challenge, and it neither takes the viewer slot nor causes peer events.
 

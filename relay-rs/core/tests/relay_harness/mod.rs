@@ -94,7 +94,13 @@ impl Harness {
     }
 
     pub fn try_upgrade(&mut self, req: UpgradeRequest) -> Result<ConnId, Reject> {
-        self.relay.upgrade(req, self.client, self.now)
+        let upgraded = self.relay.upgrade(req, self.client, self.now)?;
+        for action in upgraded.evicted {
+            if let Action::Close(id, ..) = action {
+                self.relay.on_close(id);
+            }
+        }
+        Ok(upgraded.id)
     }
 
     pub fn upgrade(&mut self, req: UpgradeRequest) -> ConnId {
