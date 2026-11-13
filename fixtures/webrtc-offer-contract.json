@@ -1,0 +1,8 @@
+{
+  "mediaOrder": ["video", "audio", "application"],
+  "directions": { "video": "recvonly", "audio": "recvonly" },
+  "dataChannels": [
+    { "label": "input-control", "ordered": true, "maxRetransmits": null },
+    { "label": "input-motion", "ordered": false, "maxRetransmits": 0 }
+  ]
+}
