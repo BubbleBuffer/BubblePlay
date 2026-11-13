@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -54,7 +55,7 @@ function harness(usingWssMedia = true) {
       this.callbacks.output({ timestamp: chunk.timestamp, close() {} });
     }
   }
-  const context = vm.createContext({
+  const context = createSessionContext({
     Uint8Array, WeakMap, Map, VideoDecoder: Decoder, V4_DECODE_BACKLOG_LIMIT_FRAMES: 30,
     EncodedVideoChunk: class { constructor(chunk) { Object.assign(this, chunk); } },
     performance: { now: () => 100 }, usingWssMedia, decoder: null,

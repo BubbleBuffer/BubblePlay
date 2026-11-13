@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -8,7 +9,7 @@ const SOURCE = readFileSync(new URL("../public/dk-log.js", import.meta.url), "ut
 /** Loads dk-log.js into a fresh context, like a classic script. */
 function loadScript(globals = {}) {
   const listeners = {};
-  const context = vm.createContext({
+  const context = createSessionContext({
     console: { warn() {}, error() {}, log() {} },
     addEventListener: (type, fn) => (listeners[type] ??= []).push(fn),
     setTimeout: () => 1,

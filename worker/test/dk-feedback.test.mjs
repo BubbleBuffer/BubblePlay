@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -11,7 +12,7 @@ const SOURCE = readFileSync(new URL("../public/dk-log.js", import.meta.url), "ut
 const plain = value => JSON.parse(JSON.stringify(value ?? null));
 
 function makeLog({ persisted = false } = {}) {
-  const context = vm.createContext({ console: { warn() {}, error() {} }, addEventListener() {}, setTimeout: () => 1,
+  const context = createSessionContext({ console: { warn() {}, error() {} }, addEventListener() {}, setTimeout: () => 1,
     Date, JSON, Error, Promise, Set, Math, Number, String, Array, Object, RegExp, indexedDB: undefined });
   context.globalThis = context;
   vm.runInContext(SOURCE, context);

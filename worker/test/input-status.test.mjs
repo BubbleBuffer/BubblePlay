@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -16,7 +17,7 @@ test("browser shows and clears Admin warnings without changing input readiness",
   const classes = new Map();
   const retry = { hidden: true };
   const logs = [];
-  const context = vm.createContext({
+  const context = createSessionContext({
     latestInputStatus: null, inputStatusReason: null, connectionStatusDetail: "",
     desktopAvailable: true, desktopKind: "default", terminalSignalingFailure: false,
     usingWssMedia: false, inputReady: true, hudState: { ice: "connected", ws: "open", rtt: "…" },

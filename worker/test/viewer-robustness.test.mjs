@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -22,7 +23,7 @@ function peerHarness(requestedTransport) {
   const calls = { constructed: [], wss: [], logged: [] };
   const STUN_FALLBACK = [{ urls: "stun:fallback.test" }];
   class ThrowingPeer { constructor(options) { calls.constructed.push(options); throw new Error("resource limit"); } }
-  const context = vm.createContext({ RTCPeerConnection: ThrowingPeer, STUN_FALLBACK, currentIceServers: [{ urls: "turn:x.test" }],
+  const context = createSessionContext({ RTCPeerConnection: ThrowingPeer, STUN_FALLBACK, currentIceServers: [{ urls: "turn:x.test" }],
     requestedTransport, TRANSPORT, hudState: {}, hud: { classList: { add() {} } },
     viewerLog: (level, name) => calls.logged.push(`${level}:${name}`), switchToWss: reason => calls.wss.push(reason) });
   vm.runInContext(receiverFunctions("openPeerConnection", "peerConstructionFailed"), context);

@@ -103,7 +103,7 @@ test("receiver wires v4: media-socket keyframes, in-order decode, reconnect back
   const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   assert.match(source, /from "\/media-v4\.js";/);
   assert.match(source, /const WSS_PROTOCOL = V4_VERSION;/);
-  assert.match(source, /if \(usingWssMedia && !requestId\) return wssSocket\.send\(keyframeMessageV4\(reason\)\);/);
+  assert.match(source, /if \(sessionState\.usingWssMedia && !requestId\) return wssSocket\.send\(keyframeMessageV4\(reason\)\);/);
   assert.match(source, /shouldPresentDecodedV4\(/);
   assert.match(source, /recycleSignaling\("signaling-silent"\);[\s\S]{0,200}sendRelay\(\{ type: "ping" \}\);\s*\}, V4_HEARTBEAT_MS\);/);
   // v4 has no deadline expiry timer.
@@ -119,10 +119,10 @@ test("receiver input stays on the signaling socket and the media socket carries 
   };
   // Input goes to the RTC data channel or, under WSS, sealed as ctl "input" on the signaling socket.
   const sendInput = body("sendInput");
-  assert.match(sendInput, /authenticatedSession\.sendInput\(data\)/);
-  assert.doesNotMatch(sendInput, /ws\.send\(data\)/);
+  assert.match(sendInput, /sessionState\.authenticatedSession\.sendInput\(data\)/);
+  assert.doesNotMatch(sendInput, /sessionState\.ws\.send\(data\)/);
   assert.doesNotMatch(sendInput, /wssV4|wssSocket/);
-  assert.match(body("inputControlState"), /ws\.bufferedAmount/);
+  assert.match(body("inputControlState"), /sessionState\.ws\.bufferedAmount/);
   assert.doesNotMatch(body("inputControlState"), /wssV4/);
   // Every media-socket send is an ACK, keyframe request, heartbeat or hello.
   const calls = [...source.matchAll(/wssSocket\.send\(([^)]*)/g)].map(match => match[1]).filter(arg => arg !== "text");
