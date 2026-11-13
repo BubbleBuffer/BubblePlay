@@ -37,6 +37,7 @@ Shared fixtures are the cross-language contract; update them and the affected im
 | [`audio-contract.json`](../../fixtures/audio-contract.json) | PC sound packets, opt-in and capability ([audio](audio.md)) |
 | [`media-control-contract.json`](../../fixtures/media-control-contract.json) | Viewer start, first-frame and keyframe-request messages |
 | [`session-timing-contract.json`](../../fixtures/session-timing-contract.json) | Heartbeats, dead-detection limits, reconnect backoff and auth waits per implementation ([session timing](session-timing.md)) |
+| [`close-codes-contract.json`](../../fixtures/close-codes-contract.json) | Every close code and reason, and what each implementation does on it ([close codes](close-codes.md)) |
 
 See [file transfer](file-transfer.md), [monitor following](follow-active-window.md), [session UI](session-ui.md), and [secure desktop](secure-desktop.md) for the behavior behind these contracts. [Unattended access](unattended-access.md) is approved (2026-10-13) for access before sign-in and waits for [device IDs and keys](device-keys.md), approved 2026-10-13: per-device key files, pairing, routing by ID and the ntfy site gate. The Rust relay's tests also read [browser-generated packet fixtures](../../relay-rs/core/tests/data/worker-contract.json); the Go relay that used them was deleted at CUT-1.
 

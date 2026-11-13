@@ -49,11 +49,14 @@ class TimingContractTest {
         assertEquals(SignalLiveness.Action.NONE, liveness.check(heartbeat + limit))
         assertEquals(SignalLiveness.Action.DEAD, liveness.check(heartbeat + limit + 1))
 
-        val probing = SignalLiveness(V4.HEARTBEAT_MS)
-        probing.opened(0)
-        probing.input(0)
-        assertEquals(SignalLiveness.Action.NONE, probing.check(values.getLong("inputProbeAfterMs") - 1))
-        assertEquals(SignalLiveness.Action.PING, probing.check(values.getLong("inputProbeAfterMs")))
+        // check() consumes the pending input mark, so each probe point needs a fresh instance.
+        val probeAfter = values.getLong("inputProbeAfterMs")
+        for ((at, action) in listOf(probeAfter - 1 to SignalLiveness.Action.NONE, probeAfter to SignalLiveness.Action.PING)) {
+            val probing = SignalLiveness(V4.HEARTBEAT_MS)
+            probing.opened(0)
+            probing.input(0)
+            assertEquals(action, probing.check(at))
+        }
     }
 
     @Test
