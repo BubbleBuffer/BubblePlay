@@ -23,7 +23,8 @@ import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
   rememberedRtcFailure, rtcFailureStorage, selectWssDecoderPath,
 } from "/transport.js";
-import { createWssWorkerClient, wssWorkerSupported } from "/wss-worker-client.js";
+import { wssWorkerSupported } from "/wss-worker-client.js";
+import { createWssDecode } from "/wss-decode.js";
 import { avcCodecFromSps } from "/wss-pipeline.js";
 import {
   desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,
@@ -747,9 +748,6 @@ function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, 
 function queueTouchAbsolute(x, y) { const before = input.lastCursorSequence; input.absolute(x, y); const sent = input.flushMotion(); if (input.lastCursorSequence !== before) cursorReconciler?.noteSent(input.lastCursorSequence); retryMotionTail(); updateMotionHud(); return sent; }
 function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
 function releaseInput(send = true) { sessionState.inputTransitionHold = false; input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (sessionState.motionFrame !== null) cancelAnimationFrame(sessionState.motionFrame); sessionState.motionFrame = null; renderKeyboardModifiers?.(); }
-// WSS video decode+draw in a Worker (wss-worker.js). Null on the main-thread path.
-// While set, the canvases belong to the worker: sizes come from its messages.
-const wssCaptureWaiters = new Map();
 // WSS v4 per-session frame state; the socket itself is wssSocket (wss-media-socket.js).
 const wssV4 = {
   gate: new V4ReceiveGate(),
@@ -1222,7 +1220,7 @@ function clearWssTimers() {
 
 function stopWssMedia() {
   sessionState.usingWssMedia = false;
-  teardownWssWorker();
+  wssDecode.teardown();
   clearWssTimers();
   wssAudio.stop();
   sessionState.wssDecoderEpoch++;
@@ -1338,62 +1336,6 @@ function selectedWssDecoderPath() {
   });
 }
 
-// Hand both canvases to the WSS worker. Until it answers, maybeStartWssHost
-// waits, so no media arrives before the path is settled; if the worker cannot
-// run, the canvases come back and decode stays on the main thread.
-function beginWssWorker() {
-  const client = createWssWorkerClient({
-    onMessage: onWssWorkerMessage,
-    onFatal: (reason) => failWssWorker(reason),
-  });
-  sessionState.wssWorker = client;
-  sessionState.wssCanvasDims = { width: 0, height: 0 };
-  sessionState.wssWorkerHybrid = null;
-  sessionState.wssWorkerInit = client.start({
-    canvases: { main: screen, sharp: sharpScreen },
-    epoch: sessionState.wssDecoderEpoch,
-    codec: codecSession.codec,
-  }).then((result) => {
-    if (sessionState.wssWorker !== client) return false; // stopped while starting
-    if (result.ok) {
-      // A resync during the handshake moved the epoch the worker was started with.
-      client.post({ type: "resync", epoch: sessionState.wssDecoderEpoch, reason: "worker-start" });
-      hudState.dec = `${codecSession.codec} wss (worker)`;
-      debugTrace("wss-worker-ready", {});
-      return true;
-    }
-    viewerLog("warn", "wss-worker-unavailable", { reason: result.reason });
-    teardownWssWorker();
-    ensureMainCanvas();
-    return false;
-  });
-}
-
-function teardownWssWorker() {
-  const client = sessionState.wssWorker;
-  if (!client) return;
-  sessionState.wssWorker = null;
-  sessionState.wssCanvasDims = null;
-  sessionState.wssWorkerHybrid = null;
-  const transferred = client.transferred;
-  client.stop();
-  for (const waiter of wssCaptureWaiters.values()) waiter(null);
-  wssCaptureWaiters.clear();
-  if (transferred) {
-    replaceTransferredCanvas();
-    replaceTransferredSharpCanvas();
-    renderedSharpView = null;
-  }
-}
-
-function failWssWorker(reason) {
-  viewerLog("error", "wss-worker-failure", { reason });
-  sessionState.wssWorkerDisabled = true;
-  hudState.dec = `worker:${reason}`;
-  stopWssMedia();
-  setTimeout(requestWssMediaStart, 0);
-}
-
 function requestWssMediaStart() {
   if (sessionState.usingWssMedia) return;
   if (!sessionState.authenticatedSession?.controlReady || !sessionState.signalingTicket) return;
@@ -1402,7 +1344,7 @@ function requestWssMediaStart() {
   // WebRTC transform worker may still own the visible canvas. Release only
   // that video sink before WSS reclaims a main-thread 2D context.
   releaseWebRtcVideoSink();
-  if (selectedWssDecoderPath() === "worker") beginWssWorker(); else ensureMainCanvas();
+  if (selectedWssDecoderPath() === "worker") wssDecode.begin(); else ensureMainCanvas();
   stage.classList.remove("native-video-input");
   sessionState.wssSelected = true;
   sessionState.usingWssMedia = true;
@@ -1766,36 +1708,10 @@ function noteWssFailure(reason) {
   hudState.dec = `waiting keyframe (${reason})`;
 }
 
-// Worker path: the worker does the codec/hybrid checks, decode and draw. This
-// only forwards the frame with the main-thread state it needs (hybrid mode,
-// geometry for the frame's generation, desktop availability); the bytes move,
-// they are not copied. The epoch lets the worker drop frames sent before a resync.
-function postWssFrameToWorker(frame) {
-  sessionState.rtcStartupFallback?.stop();
-  hudState.mediaGeneration = frame.generation;
-  const bytes = frame.data;
-  sessionState.wssWorker.post({
-    type: "frame",
-    epoch: sessionState.wssDecoderEpoch,
-    codec: frame.codec,
-    generation: frame.generation,
-    sequence: frame.sequence,
-    key: frame.key,
-    timestampUs: frame.timestampUs,
-    buffer: bytes.buffer,
-    byteOffset: bytes.byteOffset,
-    byteLength: bytes.byteLength,
-    hevcCodec: activeWssHevcCodec(),
-    hybridMode: activeWssHybridModeName(),
-    desktopAvailable: sessionState.desktopAvailable,
-    view: sharpSession.cropForGeneration(frame.generation),
-    frameTrace: frame.frameTrace,
-  }, [bytes.buffer]);
-}
-
+// Worker path: the worker does the codec/hybrid checks, decode and draw.
 function decodeWssFrame(frame) {
   if (sessionState.wssWorker) {
-    if (sessionState.wssWorker.ready) postWssFrameToWorker(frame);
+    if (sessionState.wssWorker.ready) wssDecode.postFrame(frame);
     return;
   }
   if (typeof VideoDecoder === "undefined") { noteWssFailure("webcodecs-unsupported"); return; }
@@ -1975,24 +1891,9 @@ function screenMedia() {
 function captureFromWorker() {
   const dims = screenDims();
   if (!sessionState.usingWssMedia || !sessionState.wssWorker?.ready || !dims.width || !dims.height || !sessionState.wssLatestFrameTrace) return Promise.resolve(null);
-  const id = ++sessionState.wssCaptureId;
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => { wssCaptureWaiters.delete(id); resolve(null); }, 5_000);
-    wssCaptureWaiters.set(id, (m) => {
-      clearTimeout(timer);
-      if (!m || m.error) { resolve(null); return; }
-      resolve({
-        pngDataUrl: m.pngDataUrl,
-        diagnostics: {
-          glassToGlass: m.glassToGlass,
-          renderedTimestamp: lastRenderedTimestamp,
-          framesDrawn,
-          frameTrace: { ...sessionState.wssLatestFrameTrace },
-          frameTraceHistory: [...sessionState.wssPresentedFrameTraces.values()].map(trace => ({ ...trace })),
-        },
-      });
-    });
-    sessionState.wssWorker.post({ type: "capture", id, sharp: sharpScreen.classList.contains("active") });
+  return wssDecode.capture({
+    sharp: sharpScreen.classList.contains("active"),
+    diagnostics: () => ({ renderedTimestamp: lastRenderedTimestamp, framesDrawn }),
   });
 }
 
@@ -2510,107 +2411,47 @@ setInterval(async () => {
   }
 }, 1000);
 
-// ---- WSS worker results ------------------------------------------------------
-function onWssWorkerMessage(m) {
-  if (!sessionState.wssWorker) return;
-  switch (m.type) {
-    case "log": viewerLog(m.level, m.name, m.fields); return;
-    case "trace": debugTrace(m.name, m.fields); return;
-    case "capture-result": {
-      const waiter = wssCaptureWaiters.get(m.id);
-      if (waiter) { wssCaptureWaiters.delete(m.id); waiter(m); }
-      return;
+// ---- WSS decode worker --------------------------------------------------------
+const wssDecode = createWssDecode({
+  state: sessionState, hudState, codecSession, wssV4,
+  frameTelemetry: framePresentationTelemetry,
+  canvases: () => ({ main: screen, sharp: sharpScreen }),
+  log: viewerLog, trace: debugTrace,
+  setTimeout: (fn, delay) => setTimeout(fn, delay), clearTimeout: timer => clearTimeout(timer),
+  defer: fn => setTimeout(fn, 0),
+  stopMedia: () => stopWssMedia(), requestMediaStart: () => requestWssMediaStart(),
+  ensureMainCanvas: () => ensureMainCanvas(),
+  restoreCanvases: () => { replaceTransferredCanvas(); replaceTransferredSharpCanvas(); renderedSharpView = null; },
+  noteFailure: reason => noteWssFailure(reason),
+  beginRecovery: reason => beginWssRecovery(reason),
+  armKeyframeWatchdog: () => armWssKeyframeWatchdog(),
+  clearKeyframeWatchdog: () => clearWssKeyframeWatchdog(),
+  resetRenderPacing: () => resetRenderPacing(),
+  hevcCodec: () => activeWssHevcCodec(),
+  hybridModeName: () => activeWssHybridModeName(),
+  cropForGeneration: generation => sharpSession.cropForGeneration(generation),
+  layoutSharpCanvas: crop => layoutSharpCanvas(crop),
+  syncViewportAndFollow: () => syncViewportAndFollow(),
+  noteDecodedDimensions: dimensions => { lastDecodedDimensions = dimensions; },
+  noteFrameReceived: m => { framesReceived++; hudState.recv = framesReceived; hudState.queued = m.queued; },
+  firstFramePresented: m => markFirstFramePresented(m.generation ?? null, m.cropRevision ?? null,
+    { gatePassed: sessionState.transitionGatePassedToken !== null && sessionState.transitionGatePassedToken === firstFrameHandshake.requestId }),
+  notePresented: m => {
+    const renderedAt = m.renderedAt;
+    if (lastFrameDrawnAt !== null) {
+      const frameGap = Math.max(0, Math.round(renderedAt - lastFrameDrawnAt));
+      hudState.frameGap = frameGap;
+      hudState.maxFrameGap = Math.max(Number(hudState.maxFrameGap) || 0, frameGap);
     }
-    case "worker-error": failWssWorker(m.message || "worker-error"); return;
-    default: break;
-  }
-  // Everything else describes decoder state: ignore what predates the last resync.
-  if (m.epoch !== sessionState.wssDecoderEpoch) return;
-  switch (m.type) {
-    case "decoder-configured": hudState.dec = `${m.codec} (worker)`; break;
-    case "failure":
-      if (m.hud) hudState.dec = m.hud;
-      noteWssFailure(m.reason);
-      break;
-    case "drop":
-      hudState.dropped++;
-      if (m.recover) beginWssRecovery(m.recover);
-      break;
-    case "key-accepted":
-      if (sessionState.wssRecoveryState === "awaiting-keyframe") {
-        sessionState.wssRecoveryPending = true;
-        sessionState.wssRecoveryState = "awaiting-keyframe-output";
-        viewerLog("info", "wss-recovery-keyframe", { generation: m.generation, sequence: m.sequence, codec: m.codec });
-      }
-      break;
-    case "key-fed": armWssKeyframeWatchdog(); break;
-    case "codec-follow": {
-      if (!codecSession.followBitstreamCodec(m.codec)) break;
-      clearWssKeyframeWatchdog();
-      resetRenderPacing();
-      sessionState.wssPresentedFrameTraces.clear();
-      sessionState.wssNoOutputFailures = 0;
-      if (sessionState.wssRecoveryState === "awaiting-keyframe-output") sessionState.wssRecoveryState = "awaiting-keyframe";
-      viewerLog("info", "decoder-keyframe-codec-change", { previousCodec: m.previousCodec, codec: m.codec });
-      break;
-    }
-    case "out": onWssWorkerFrameOut(m); break;
-    default: break;
-  }
-}
-
-// The worker decoded (and maybe drew) a frame: the receiver-side bookkeeping that
-// onDecodedFrame/drawFrame do on the main-thread path.
-function onWssWorkerFrameOut(m) {
-  clearWssKeyframeWatchdog();
-  sessionState.wssNoOutputFailures = 0;
-  if (m.decodedSequence !== null) wssV4.decodedSeq = m.decodedSequence;
-  if (m.key && sessionState.wssRecoveryState === "awaiting-keyframe-output") {
-    sessionState.wssRecoveryPending = false;
-    sessionState.wssRecoveryState = "healthy";
-  }
-  framesReceived++;
-  hudState.recv = framesReceived;
-  hudState.queued = m.queued;
-  if (!m.attempted) { wssV4.presentSkips++; return; }
-  framePresentationTelemetry.noteImmediateAttempt();
-  if (m.hybrid) sessionState.wssWorkerHybrid = m.hybrid;
-  if (m.width) lastDecodedDimensions = { width: m.width, height: m.height };
-  if (!m.presented) return;
-  const w = m.width, h = m.height;
-  if (m.sharp) {
-    layoutSharpCanvas(m.view);
-    const gain = cropGain(m.view, w, h);
-    hudState.dimensions = `${m.view.width}x${m.view.height}→${w}x${h} ${gain.x.toFixed(1)}x/${gain.y.toFixed(1)}x`;
-  } else {
-    if (m.resized) {
-      sessionState.wssCanvasDims = { width: w, height: h };
-      syncViewportAndFollow();
-    }
-    layoutSharpCanvas(null);
-    hudState.dimensions = `${w}x${h}`;
-  }
-  markFirstFramePresented(m.generation ?? null, m.cropRevision ?? null,
-    { gatePassed: sessionState.transitionGatePassedToken !== null && sessionState.transitionGatePassedToken === firstFrameHandshake.requestId });
-  framePresentationTelemetry.noteImmediatePresented();
-  const renderedAt = m.renderedAt;
-  sessionState.wssLatestFrameTrace = { ...m.trace };
-  sessionState.wssPresentedFrameTraces.set(m.trace.sequence >>> 0, { ...m.trace });
-  while (sessionState.wssPresentedFrameTraces.size > 64) sessionState.wssPresentedFrameTraces.delete(sessionState.wssPresentedFrameTraces.keys().next().value);
-  if (lastFrameDrawnAt !== null) {
-    const frameGap = Math.max(0, Math.round(renderedAt - lastFrameDrawnAt));
-    hudState.frameGap = frameGap;
-    hudState.maxFrameGap = Math.max(Number(hudState.maxFrameGap) || 0, frameGap);
-  }
-  lastFrameDrawnAt = renderedAt;
-  lastRenderedTimestamp = m.timestamp;
-  lastRenderedDueMs = renderedAt;
-  hudState.lag = 0;
-  fpsWindow++;
-  framesDrawn++;
-  hudState.presented = framesDrawn;
-  sessionState.wssPresentedSequence = m.sequence;
-}
+    lastFrameDrawnAt = renderedAt;
+    lastRenderedTimestamp = m.timestamp;
+    lastRenderedDueMs = renderedAt;
+    hudState.lag = 0;
+    fpsWindow++;
+    framesDrawn++;
+    hudState.presented = framesDrawn;
+  },
+});
 
 function onTrack(ev, generation = sessionState.peerGeneration) {
   if (generation !== sessionState.peerGeneration) return;
