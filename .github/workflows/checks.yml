@@ -147,8 +147,11 @@ jobs:
           cargo fmt --all -- --check
       - name: Clippy ratchet (relay-rs, bp-device-key)
         run: |
-          node tools/lint/gates.mjs clippy relay-rs
-          node tools/lint/gates.mjs clippy bp-device-key
+          # Both gates run even if the first fails, so one run shows every miss.
+          status=0
+          node tools/lint/gates.mjs clippy relay-rs || status=1
+          node tools/lint/gates.mjs clippy bp-device-key || status=1
+          exit $status
       - name: bp-relay-core builds for wasm32
         working-directory: relay-rs
         run: cargo check --locked -p bp-relay-core --target wasm32-unknown-unknown
@@ -169,6 +172,7 @@ jobs:
           cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
           cargo fmt --check
       - name: Clippy ratchet (relay worker)
+        if: ${{ !cancelled() }}
         run: node tools/lint/gates.mjs clippy relay-worker
       - name: bp-relay-worker builds (worker-build --release)
         working-directory: relay-rs/worker
@@ -326,8 +330,12 @@ jobs:
             $cred = [pscredential]::new($user, (ConvertTo-SecureString $plain -AsPlainText -Force))
             $log = Join-Path $env:RUNNER_TEMP 'admin-agent-e2e.log'
             icacls $env:RUNNER_TEMP /grant "${user}:(OI)(CI)M" | Out-Null
+            # The standard user has no usable profile temp dir; give it one it can write.
+            $scratch = Join-Path $env:RUNNER_TEMP 'bpe2e-tmp'
+            New-Item -ItemType Directory -Force $scratch | Out-Null
+            icacls $scratch /grant "${user}:(OI)(CI)F" | Out-Null
             $proc = Start-Process -FilePath $exe -ArgumentList '--test-threads=1' -Credential $cred -LoadUserProfile `
-              -Environment @{ BUBBLEPLAY_E2E_REQUIRE_UNELEVATED = '1' } `
+              -Environment @{ BUBBLEPLAY_E2E_REQUIRE_UNELEVATED = '1'; TEMP = $scratch; TMP = $scratch } `
               -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
             if (-not $proc.WaitForExit(300000)) { $proc.Kill(); throw 'admin_agent_e2e did not finish in 5 minutes' }
             Get-Content $log, "$log.err" -ErrorAction SilentlyContinue

@@ -528,5 +528,74 @@
   "host/tests/admin_agent_e2e.rs": {
     "clippy::let_underscore_must_use": 8,
     "clippy::unwrap_used": 7
+  },
+  "relay-rs/core/src/gate.rs": {
+    "clippy::expect_used": 1
+  },
+  "relay-rs/core/src/presence.rs": {
+    "clippy::expect_used": 1
+  },
+  "relay-rs/core/tests/relay_harness/mod.rs": {
+    "clippy::expect_used": 8
+  },
+  "relay-rs/core/tests/relay_presence.rs": {
+    "clippy::expect_used": 1
+  },
+  "relay-rs/core/tests/common/mod.rs": {
+    "clippy::expect_used": 1
+  },
+  "relay-rs/core/tests/gate_support/mod.rs": {
+    "clippy::expect_used": 7
+  },
+  "relay-rs/core/tests/relay_logging.rs": {
+    "clippy::expect_used": 1
+  },
+  "relay-rs/core/tests/relay_m3.rs": {
+    "clippy::expect_used": 2
+  },
+  "relay-rs/server/src/app.rs": {
+    "clippy::too_many_lines": 1,
+    "clippy::let_underscore_must_use": 1
+  },
+  "relay-rs/server/src/log.rs": {
+    "clippy::let_underscore_must_use": 1
+  },
+  "relay-rs/server/src/runtime.rs": {
+    "clippy::expect_used": 1,
+    "clippy::let_underscore_must_use": 2
+  },
+  "relay-rs/server/src/server.rs": {
+    "clippy::let_underscore_must_use": 1
+  },
+  "relay-rs/server/src/socket.rs": {
+    "clippy::let_underscore_must_use": 3
+  },
+  "relay-rs/server/src/store.rs": {
+    "clippy::let_underscore_must_use": 1
+  },
+  "relay-rs/server/tests/state_and_import.rs": {
+    "clippy::expect_used": 1
+  },
+  "relay-rs/server/tests/router.rs": {
+    "clippy::unwrap_used": 24
+  },
+  "relay-rs/server/tests/common/mod.rs": {
+    "clippy::unwrap_used": 31,
+    "clippy::expect_used": 8,
+    "clippy::let_underscore_must_use": 1
+  },
+  "relay-rs/server/tests/e2e_m2.rs": {
+    "clippy::unwrap_used": 3,
+    "clippy::expect_used": 3
+  },
+  "relay-rs/server/tests/e2e_presence.rs": {
+    "clippy::unwrap_used": 1
+  },
+  "relay-rs/server/tests/e2e_gate_and_data.rs": {
+    "clippy::expect_used": 1,
+    "clippy::unwrap_used": 4
+  },
+  "relay-rs/core/tests/relay_m2.rs": {
+    "clippy::expect_used": 5
   }
 }
