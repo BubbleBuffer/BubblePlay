@@ -55,7 +55,7 @@ function harness(usingWssMedia = true) {
     }
   }
   const context = vm.createContext({
-    Uint8Array, WeakMap, Map, VideoDecoder: Decoder,
+    Uint8Array, WeakMap, Map, VideoDecoder: Decoder, V4_DECODE_BACKLOG_LIMIT_FRAMES: 30,
     EncodedVideoChunk: class { constructor(chunk) { Object.assign(this, chunk); } },
     performance: { now: () => 100 }, usingWssMedia, decoder: null,
     detectAnnexBCodec, prepareHybridWssFrame, CODEC, avcCodecFromSps, wssWorker: null, codecSession: createCodecSession({ transport: "wss" }),

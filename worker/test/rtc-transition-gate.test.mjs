@@ -1,3 +1,4 @@
+import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -94,7 +95,7 @@ function receiverHarness({ path = "native", reason = "desktop-source-transition"
   const restarts = [], signals = [], resyncs = [];
   const handshake = { requestId: "firstFrame_test1", reason, transport: "webrtc", epoch: null, generation: 0, phase: "starting",
     retries: 0, admitted: false, presented: false, requireAdmission: true, rtpGate: null, failureReason: "", timer: null };
-  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, noteRecovered() {},
+  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, recovery: recoveryStub(),
     rtcAdmissionGate, rtcGateOpens, rtcInPlaceCapable, rtpTimestampAtOrAfter,
     firstFrameHandshake: handshake, usingWssMedia: false, useWebCodecs: path !== "native",
     activeVideo: path === "native" ? {} : null, encodedWorker: path === "worker" ? {} : null, peerGeneration: 3,
