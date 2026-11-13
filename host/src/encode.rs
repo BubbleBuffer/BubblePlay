@@ -24,6 +24,7 @@
 use std::ffi::{c_void, CStr};
 use std::ptr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
 use nvidia_video_codec_sdk::safe::ENCODE_API;
@@ -130,7 +131,7 @@ use crate::frame_damage::{
     analyze_hevc_qp_delta_map, analyze_hevc_text_edge_qp_delta_map, expand_ctb_map_to_macroblocks,
     DamageRect, HevcQpDeltaMap, HevcQpMapDecision, QpMapRejectReason,
 };
-use crate::gpu_gate::{self, GpuGate};
+use crate::gpu_gate::{self, GpuGate, GPU_GATE_TEARDOWN_TIMEOUT_MS};
 
 #[cfg(test)]
 mod codec_policy_tests;
@@ -1802,7 +1803,11 @@ impl Drop for Nvenc {
     fn drop(&mut self) {
         // Destroy every registration and the session under the device gate.
         let gate = self.gate.clone();
-        let _gpu = gate.lock();
+        let Some(_gpu) = gate.lock_timeout(Duration::from_millis(GPU_GATE_TEARDOWN_TIMEOUT_MS))
+        else {
+            warn!("NVENC teardown skipped: GPU gate stayed held; the session is leaked");
+            return;
+        };
         self.unmap_recon_output();
         self.unmap_current();
         let mut timings = EncodeStageTimings::default();
