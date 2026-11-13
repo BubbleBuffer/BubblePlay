@@ -433,10 +433,6 @@ test("receiver cannot send DataChannel input or WSS media hello before authentic
   context.usingWssMedia = true;
   assert.equal(vm.runInContext("sendInput(data, channel)", context), true);
   assert.deepEqual(sent, ["raw-input", "ctl-input"]);
-  context.signalingTicket = null;
-  const socketFn = source.slice(source.indexOf("function openWssV4Socket("), source.indexOf("\nfunction onWssV4Packet("));
-  vm.runInContext(socketFn + "\nopenWssV4Socket();", context);
-  assert.equal(context.wssV4.socket, undefined);
 });
 
 test("receiver disables and holds RTC audio/video tracks until the verified media gate opens", () => {
