@@ -6,8 +6,8 @@ import { spawnSync } from "node:child_process";
 // Run from any directory, without relying on a globally installed npm launcher.
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const profile = process.argv[2] ?? "full";
-if (!["full", "client", "host", "syntax"].includes(profile)) {
-  console.error("Usage: node tools/check.mjs [full|client|host|syntax]");
+if (!["full", "client", "host", "syntax", "lint"].includes(profile)) {
+  console.error("Usage: node tools/check.mjs [full|client|host|syntax|lint]");
   process.exit(2);
 }
 function run(command, args, options = {}) {
@@ -42,6 +42,7 @@ if (["full", "client", "syntax"].includes(profile)) {
   console.log(`Syntax passed: ${checked} scripts.`);
   if (profile !== "syntax") run(process.execPath, ["--test", ...files(join(root, "worker/test")).filter(file => file.endsWith(".test.mjs"))]);
 }
+if (["full", "lint"].includes(profile)) run(process.execPath, ["tools/lint/gates.mjs"]);
 if (["full", "host"].includes(profile)) {
   const env = { ...process.env, NVIDIA_VIDEO_CODEC_SDK_PATH:
     process.env.NVIDIA_VIDEO_CODEC_SDK_PATH || join(root, "host/sdk-stub/") };

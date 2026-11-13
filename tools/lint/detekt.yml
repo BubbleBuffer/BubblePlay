@@ -1,0 +1,37 @@
+# detekt rules for the Kotlin the Flutter app keeps, on top of the detekt defaults
+# (`--build-upon-default-config`). Run through `node tools/lint/gates.mjs detekt`; violations are
+# ratcheted per file and rule in detekt-baseline.json. Lane `android` wires the job.
+style:
+  MagicNumber:
+    active: true
+    ignoreNumbers: ['-1', '0', '1']
+    ignoreHashCodeFunction: true
+    ignorePropertyDeclaration: true
+    ignoreCompanionObjectPropertyDeclaration: true
+    ignoreConstantDeclaration: true
+    ignoreAnnotation: true
+    ignoreNamedArgument: true
+    ignoreEnums: true
+  MaxLineLength:
+    active: false
+  ForbiddenComment:
+    active: true
+  UnusedPrivateMember:
+    active: true
+complexity:
+  LongMethod:
+    active: true
+    threshold: 80
+  LargeClass:
+    active: true
+    threshold: 500
+  CyclomaticComplexMethod:
+    active: true
+empty-blocks:
+  EmptyCatchBlock:
+    active: true
+    allowedExceptionNameRegex: '^$'
+  EmptyFunctionBlock:
+    active: true
+formatting:
+  active: false

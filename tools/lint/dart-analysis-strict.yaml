@@ -1,0 +1,19 @@
+# Strict analyzer settings for app/. Lane `android` merges the `analyzer.language` and `linter.rules` blocks
+# into app/analysis_options.yaml (a file takes one `include:`, so this cannot be included next to flutter_lints).
+# The analyzer has no magic-number lint (it is a paid DCM rule), so literals are enforced by review
+# and rule 1 of the hard rules, not by a gate. Violations are ratcheted by `gates.mjs dart`.
+analyzer:
+  language:
+    strict-casts: true
+    strict-inference: true
+    strict-raw-types: true
+linter:
+  rules:
+    - avoid_catches_without_on_clauses
+    - empty_catches
+    - unawaited_futures
+    - discarded_futures
+    - avoid_print
+    - prefer_final_locals
+    - unused_catch_clause
+    - avoid_dynamic_calls

@@ -62,7 +62,10 @@ pub enum HostEvent {
 pub fn line_event(line: &[u8]) -> Option<HostEvent> {
     use bubbleplay_host::admin_agent::client::{VIEWER_ENDED_MARKER, VIEWER_STARTED_MARKER};
     [
-        (super::update::REGISTERED_MARKER, HostEvent::Registered),
+        (
+            bubbleplay_host::signaling::REGISTERED_MARKER,
+            HostEvent::Registered,
+        ),
         (VIEWER_STARTED_MARKER, HostEvent::ViewerStarted),
         (VIEWER_ENDED_MARKER, HostEvent::ViewerEnded),
     ]
@@ -510,7 +513,10 @@ mod tests {
     fn host_lines_map_to_events() {
         let line = |text: &str| line_event(text.as_bytes());
         assert_eq!(
-            line("2026-09-30T10:00:00Z  INFO bubbleplay_host::signaling: signaling registered as host\n"),
+            line(&format!(
+                "2026-09-30T10:00:00Z  INFO bubbleplay_host::signaling: {}\n",
+                bubbleplay_host::signaling::REGISTERED_MARKER
+            )),
             Some(HostEvent::Registered)
         );
         assert_eq!(
