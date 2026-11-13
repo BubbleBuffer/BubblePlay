@@ -133,7 +133,7 @@
   "worker/public/file-client.js": 666,
   "worker/public/input.js": 577,
   "worker/public/media.js": 841,
-  "worker/public/receiver.js": 4030,
+  "worker/public/receiver.js": 3871,
   "worker/test-e2e/harness.mjs": 515,
   "worker/test/cdp-boundary.test.mjs": 512,
   "worker/test/devicekey.test.mjs": 1014,
