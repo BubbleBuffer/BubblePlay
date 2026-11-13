@@ -92,10 +92,10 @@
     "no-magic-numbers": 2
   },
   "worker/public/receiver.js": {
-    "max-lines-per-function": 7,
+    "max-lines-per-function": 6,
     "no-empty": 1,
-    "no-magic-numbers": 138,
-    "no-unused-vars": 7
+    "no-magic-numbers": 137,
+    "no-unused-vars": 3
   },
   "worker/public/recovery.js": {
     "no-magic-numbers": 3
@@ -165,9 +165,6 @@
     "no-unused-vars": 1
   },
   "worker/test/reconnect-recovery.test.mjs": {
-    "no-unused-vars": 1
-  },
-  "worker/test/viewer-robustness.test.mjs": {
     "no-unused-vars": 1
   },
   "worker/test/viewer-socket-tickets.test.mjs": {

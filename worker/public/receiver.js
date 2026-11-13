@@ -2,28 +2,26 @@ import { describeConnectionStatus } from "/connection-status.js";
 import { RemoteClipboardWriter, sameClipboardImage, pasteHostClipboard } from "/remote-clipboard.js";
 "use strict";
 import { createLatencyGuard, decodeTimestampPatternBits, normalizeEncodedTimestamp, summarizeRtcStats, computeQosRxWindow, createQosPayload, parseHostQuality } from "/latency.js";
-import { STUN_FALLBACK, deriveCandidateRoute, parseIceTransportPolicy, validateIceServers, wantsTurn } from "/turn.js";
+import { deriveCandidateRoute, parseIceTransportPolicy, validateIceServers, wantsTurn } from "/turn.js";
 import {
   shouldRecoverAfterNetworkRouteProbe,
-  shouldReconnectAfterClose,
-  OFFER_FAILURE_LIMIT,
-  shouldRetryOnWake,
   signalingUnanswered,
   rtcPeerEndAction,
 } from "/recovery.js";
 import { createOnceReporter } from "/report.js";
 import { createSignalingSocket } from "/signaling-socket.js";
+import { createPeer } from "/peer.js";
 import { createKeyboardDraft } from "/keyboard-draft.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, RemoteCursor, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
-import { CODEC, createRtcStartupFallback, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
+import { CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
 import { cropGain } from "/sharp-viewport.js";
 import { createSharpSession } from "/sharp-session.js";
-import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_KEYFRAME_REQUEST_INTERVAL_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, jitteredBackoffMsV4, nextBackoffMsV4, V4_DECODE_BACKLOG_LIMIT_FRAMES, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
+import { V4ReceiveGate, V4_HEARTBEAT_MS, V4_KEYFRAME_REQUEST_INTERVAL_MS, V4_VERSION, ackMessageV4, detectAnnexBCodec, keyframeMessageV4, V4_DECODE_BACKLOG_LIMIT_FRAMES, parseFrameV4, shouldPresentDecodedV4, wssV4StatusLabel } from "/media-v4.js";
 import {
   TRANSPORT, createCodecSession, forgetRtcFailure, parseQualityPreset, parseTransport, rememberRtcFailure,
-  orderRtpCodecPreferences, rememberedRtcFailure, rtcFailureStorage, rtpCodecMimeTypes, selectWssDecoderPath,
+  rememberedRtcFailure, rtcFailureStorage, selectWssDecoderPath,
 } from "/transport.js";
 import { createWssWorkerClient, wssWorkerSupported } from "/wss-worker-client.js";
 import { avcCodecFromSps } from "/wss-pipeline.js";
@@ -849,6 +847,78 @@ const signaling = createSignalingSocket({
 });
 const { sendRelay, sendControl, reconnect: reconnectSignaling, recycle: recycleSignaling, wake: wakeReconnect } = signaling;
 
+function resetFirstFrameHandshake() {
+  clearFirstFrameWatchdog();
+  firstFrameHandshake.requestId = null;
+  firstFrameHandshake.phase = "idle";
+  firstFrameHandshake.admitted = false;
+  firstFrameHandshake.presented = false;
+  firstFrameHandshake.rtpGate = null;
+  firstFrameHandshake.failureReason = "";
+}
+
+// Everything the receiver holds for the peer's media: decoder, worker, video element and counters.
+function releaseMediaPipeline() {
+  try { decoder?.close(); } catch { /* already closed */ }
+  decoder = null;
+  if (encodedWorker) {
+    encodedWorker.terminate();
+    encodedWorker = null;
+    replaceTransferredCanvas();
+  }
+  activeVideo?.remove();
+  activeVideo = null;
+  nativePresentation = null;
+  previousInboundStats = null;
+  hudState.route = "…";
+  stage.classList.remove("native-video-input");
+  resetRenderPacing();
+  resetPresentationCounters();
+}
+
+const peer = createPeer({
+  state: sessionState,
+  hudState,
+  requestedTransport,
+  iceTransportPolicy,
+  useWebCodecs,
+  codecSession,
+  get mobilePointerDevice() { return mobilePointerDevice; },
+  isCurrentPeer: (generation, candidate) => isCurrentPeer(generation, candidate),
+  sendControl: message => sendControl(message),
+  updateInputReady: () => updateAuthenticatedInputReady(),
+  handleCursorState: data => handleCursorState(data),
+  handleConnectionState: (generation, candidate, connectionState) => handleRtcPeerConnectionState(generation, candidate, connectionState),
+  onTrack: (ev, generation) => onTrack(ev, generation),
+  startFirstFrameHandshake: reason => startFirstFrameHandshake(reason),
+  startupSnapshot: generation => ({
+    framesReceived,
+    nativeFramesPresented: nativePresentation?.generation === generation ? nativePresentation.framesPresented : 0,
+  }),
+  switchToWss: reason => switchToWss(reason),
+  onRtcHealthy: () => forgetRtcFailure(rtcFailureStorage()),
+  requestPointerLock: () => requestPointerLock(),
+  markBad: () => hud.classList.add("bad"),
+  markGood: () => hud.classList.remove("bad"),
+  releaseInput: send => releaseInput(send),
+  recycleSignaling: reason => recycleSignaling(reason),
+  endRtcPeerOnly: reason => endRtcPeerOnly(reason),
+  reconnectSignaling: reason => reconnectSignaling(reason),
+  requestWssMediaStart: () => requestWssMediaStart(),
+  invalidatePendingMonitorRequest: reason => invalidatePendingMonitorRequest(reason),
+  resetFirstFrameHandshake: () => resetFirstFrameHandshake(),
+  renderDesktopState: () => renderDesktopState(),
+  clearHostQuality: () => { hostQuality = null; },
+  resetFileDropPreview: () => { fileDragPreview.cancel(); nativeFileDropPreviewAvailable = false; },
+  stopWssMedia: () => stopWssMedia(),
+  detachRtcSound: () => soundController.detachSink("rtc"),
+  clearWssTimers: () => clearWssTimers(),
+  resetInputUi: () => { keyboardDraft.reset(); resetTouchCursor(); cursorAppearance.reset(); },
+  releaseMediaPipeline: () => releaseMediaPipeline(),
+  viewerLog: (level, event, detail) => viewerLog(level, event, detail),
+});
+const { start: startPeer, cleanup: cleanupPeer, restart: restartPeer } = peer;
+
 async function handleSignal(socket, generation, ev) {
   if (sessionState.ws !== socket || generation !== sessionState.signalingGeneration) return;
   // The relay never forwards plaintext endpoint frames after cutover.
@@ -1142,77 +1212,6 @@ function maybeBindRtcPeer(candidate = sessionState.pc, generation = sessionState
   if (!candidate || !isCurrentPeer(generation, candidate) || sessionState.usingWssMedia || sessionState.wssSelected ||
       candidate.connectionState !== "connected" || !candidate.localDescription?.sdp || !candidate.remoteDescription?.sdp) return;
   void sessionState.authenticatedSession?.bindPeer({ localSdp: candidate.localDescription.sdp, remoteSdp: candidate.remoteDescription.sdp });
-}
-
-function restartPeer(reason, reconnect = true) {
-  const generation = ++sessionState.peerGeneration;
-  invalidatePendingMonitorRequest(reason);
-  clearFirstFrameWatchdog();
-  firstFrameHandshake.requestId = null;
-  firstFrameHandshake.phase = "idle";
-  firstFrameHandshake.admitted = false;
-  firstFrameHandshake.presented = false;
-  firstFrameHandshake.rtpGate = null;
-  sessionState.transitionNeedsKeyframe = false;
-  sessionState.transitionGatePassedToken = null;
-  firstFrameHandshake.failureReason = "";
-  sessionState.desktopAwaitingFrame = true;
-  renderDesktopState();
-  hostQuality = null;
-  cleanupPeer();
-  sessionState.pendingRemoteIce = [];
-  sessionState.remoteDescriptionSet = false;
-  sessionState.offerSent = false;
-  sessionState.rtcOfferSignaled = false;
-  hudState.ice = reason;
-  hud.classList.add("bad");
-  if (sessionState.ws?.readyState === WebSocket.OPEN) {
-    if (sessionState.wssSelected) requestWssMediaStart();
-    else startPeer(generation);
-  }
-  else if (reconnect) reconnectSignaling(reason);
-}
-
-function cleanupPeer() {
-  for (const { event } of sessionState.pendingRtcTracks) event.track.stop();
-  sessionState.pendingRtcTracks = [];
-  fileDragPreview.cancel();
-  nativeFileDropPreviewAvailable = false;
-  sessionState.fileDropPresentedGeneration = null;
-  sessionState.fileDropPresentedViewportRevision = null;
-  sessionState.closingPeer = true;
-  releaseInput();
-  if (sessionState.usingWssMedia) stopWssMedia();
-  soundController.detachSink("rtc");
-  clearWssTimers();
-  sessionState.authenticatedSession?.resetPeer();
-  keyboardDraft.reset();
-  resetTouchCursor();
-  cursorAppearance.reset();
-  sessionState.inputReady = false;
-  sessionState.connected = false;
-  try { sessionState.dc?.close(); } catch { /* already closed */ }
-  try { sessionState.motionDc?.close(); } catch { /* already closed */ }
-  sessionState.dc = null;
-  sessionState.motionDc = null;
-  try { sessionState.pc?.close(); } catch { /* already closed */ }
-  sessionState.pc = null;
-  sessionState.closingPeer = false;
-  try { decoder?.close(); } catch { /* already closed */ }
-  decoder = null;
-  if (encodedWorker) {
-    encodedWorker.terminate();
-    encodedWorker = null;
-    replaceTransferredCanvas();
-  }
-  activeVideo?.remove();
-  activeVideo = null;
-  nativePresentation = null;
-  previousInboundStats = null;
-  hudState.route = "…";
-  stage.classList.remove("native-video-input");
-  resetRenderPacing();
-  resetPresentationCounters();
 }
 
 function clearWssTimers() {
@@ -1870,197 +1869,6 @@ function decodeWssFrame(frame) {
 
 // Builds the peer connection. A server-specific ICE URI the validator accepted but the browser
 // rejects gets one retry on the plain STUN fallback. Returns null when construction still throws.
-function openPeerConnection(peerOptions) {
-  try {
-    return new RTCPeerConnection(peerOptions);
-  } catch (firstError) {
-    viewerLog("warn", "rtc-construct-failed", { error: String(firstError?.message || firstError), stunFallback: sessionState.currentIceServers === STUN_FALLBACK });
-    if (sessionState.currentIceServers === STUN_FALLBACK) return null;
-  }
-  sessionState.currentIceServers = STUN_FALLBACK;
-  try {
-    return new RTCPeerConnection({ ...peerOptions, iceServers: STUN_FALLBACK });
-  } catch (error) {
-    viewerLog("error", "rtc-construct-failed", { error: String(error?.message || error), stunFallback: true });
-    return null;
-  }
-}
-
-// WebRTC cannot start in this browser. Auto mode moves to WSS at once; a forced WebRTC page has no
-// other transport to use, so it shows the error.
-function peerConstructionFailed() {
-  if (requestedTransport === TRANSPORT.AUTO) {
-    switchToWss("rtc-construct-failed");
-    return;
-  }
-  hudState.ice = "ice-config-error";
-  hud.classList.add("bad");
-}
-
-let offerFailures = 0;
-
-// A failed offer restarts the peer, up to OFFER_FAILURE_LIMIT in a row (reset by a sent offer). After
-// that auto mode moves to WSS; a forced WebRTC page shows the error instead of looping.
-function offerFailed(error) {
-  offerFailures++;
-  if (offerFailures < OFFER_FAILURE_LIMIT) { restartPeer(`offer:${error?.message || error}`); return; }
-  viewerLog("error", "offer-failed-giving-up", { failures: offerFailures, error: String(error?.message || error) });
-  if (requestedTransport === TRANSPORT.AUTO) switchToWss("offer-failed");
-  else { hudState.ice = "offer-failed"; hud.classList.add("bad"); }
-}
-
-async function startPeer(generation = sessionState.peerGeneration) {
-  if (requestedTransport === TRANSPORT.WSS || sessionState.usingWssMedia) return;
-  if (!sessionState.authenticatedSession?.controlReady) return;
-  if (sessionState.offerSent || generation !== sessionState.peerGeneration || sessionState.ws?.readyState !== WebSocket.OPEN) return;
-  sessionState.offerSent = true;
-  sessionState.lastIceCandidateError = null;
-
-  const peerOptions = {
-    iceServers: sessionState.currentIceServers,
-    iceTransportPolicy,
-  };
-  // This must be set during construction, but only the opt-in WebCodecs path
-  // needs it. The native path keeps browser decode/render untouched.
-  if (useWebCodecs) peerOptions.encodedInsertableStreams = true;
-  const candidate = openPeerConnection(peerOptions);
-  if (!candidate) {
-    sessionState.offerSent = false;
-    peerConstructionFailed();
-    return;
-  }
-  sessionState.pc = candidate;
-  sessionState.rtcStartupFallback?.stop();
-  sessionState.rtcOfferSignaled = false;
-  if (requestedTransport === TRANSPORT.AUTO) {
-    sessionState.rtcStartupFallback = createRtcStartupFallback({
-      isCurrent: () => isCurrentPeer(generation, candidate) && !sessionState.usingWssMedia && !sessionState.wssSelected,
-      snapshot: () => ({
-        connected: ["connected", "completed"].includes(candidate.iceConnectionState),
-        peerConnected: candidate.connectionState === "connected",
-        framesReceived,
-        nativeFramesPresented: nativePresentation?.generation === generation ? nativePresentation.framesPresented : 0,
-      }),
-      getStats: () => candidate.getStats(),
-      onFallback: () => switchToWss("no-rtp"),
-      onHealthy: () => forgetRtcFailure(rtcFailureStorage()),
-    });
-  }
-
-  // Receive-only video; the browser offers, the host answers (locked).
-  const transceiver = candidate.addTransceiver("video", { direction: "recvonly" });
-  // PC sound: receive-only Opus after the video m-line. Audio is not gated on video.
-  candidate.addTransceiver("audio", { direction: "recvonly" });
-  transceiver.receiver.playoutDelayHint = 0; // minimal jitter buffer
-  // playoutDelayHint is advisory and Chromium may still grow hundreds of
-  // milliseconds of buffer. jitterBufferTarget is the explicit millisecond
-  // target in current Chromium; zero chooses latency over concealment.
-  if ("jitterBufferTarget" in transceiver.receiver) {
-    try { transceiver.receiver.jitterBufferTarget = 0; } catch { /* older implementation */ }
-  }
-
-  // Prefer HEVC for a fresh page, with H.264 after it so an H.264-only host can
-  // still answer. The preference and capability/decode fallback are page-local;
-  // no selection is persisted between sessions.
-  try {
-    const caps = RTCRtpReceiver.getCapabilities("video");
-    const codec = orderRtpCodecPreferences(caps?.codecs, codecSession.codec);
-    const primary = rtpCodecMimeTypes(codecSession.codec);
-    const primaryAvailable = codec.some((c) => primary.includes(c.mimeType.toLowerCase()));
-    if (codec.length && primaryAvailable) {
-      transceiver.setCodecPreferences(codec);
-    } else if (codecSession.codec === "hevc" && codecSession.fallbackToH264()) {
-      sessionState.offerSent = false;
-      try { candidate.close(); } catch { /* already closed */ }
-      startPeer(generation);
-      return;
-    }
-  } catch (e) {
-    console.warn("setCodecPreferences", e);
-  }
-
-  // Reliable ordered state lane plus lossy latest-only motion lane.
-  const channel = candidate.createDataChannel("input-control", { ordered: true });
-  const motionChannel = candidate.createDataChannel("input-motion", { ordered: false, maxRetransmits: 0 });
-  sessionState.dc = channel;
-  sessionState.motionDc = motionChannel;
-  channel.binaryType = "arraybuffer";
-  motionChannel.binaryType = "arraybuffer";
-  const updateInputReady = () => updateAuthenticatedInputReady();
-  const laneClosed = () => {
-    if (!isCurrentPeer(generation, candidate) || sessionState.closingPeer) return;
-    if (sessionState.wssSelected || rtcPeerEndAction({ usingWssMedia: sessionState.usingWssMedia, laneClosed: true }) === "end-peer") return endRtcPeerOnly("input-lane-closed");
-    releaseInput(false); recycleSignaling("input-lane-closed"); restartPeer("input-lane-closed", false);
-  };
-  channel.onopen = () => { if (isCurrentPeer(generation, candidate)) { sessionState.rtcStartupFallback?.progress(); updateInputReady(); } };
-  channel.onclose = laneClosed;
-  motionChannel.onopen = () => { if (isCurrentPeer(generation, candidate)) { sessionState.rtcStartupFallback?.progress(); updateInputReady(); } };
-  motionChannel.onclose = laneClosed;
-  channel.onerror = (e) => { if (isCurrentPeer(generation, candidate)) hudState.dc = `err:${e.message || ""}`; };
-  channel.onmessage = (event) => { if (isCurrentPeer(generation, candidate) && !sessionState.usingWssMedia && sessionState.authenticatedSession?.mediaReady) handleCursorState(event.data); };
-  motionChannel.onmessage = (event) => { if (isCurrentPeer(generation, candidate) && !sessionState.usingWssMedia && sessionState.authenticatedSession?.mediaReady) handleCursorState(event.data); };
-
-  candidate.onicecandidate = (ev) => {
-    if (isCurrentPeer(generation, candidate) && ev.candidate) {
-      sendControl({ type: "ice", candidate: ev.candidate.candidate });
-    }
-  };
-  candidate.onicecandidateerror = (ev) => {
-    if (!isCurrentPeer(generation, candidate)) return;
-    // Keep this compact and omit address/port so profiling never reports a
-    // client's private or public IP address through the signaling relay.
-    sessionState.lastIceCandidateError = {
-      errorCode: ev.errorCode,
-      errorText: ev.errorText,
-      url: ev.url,
-      atMs: Date.now(),
-    };
-  };
-  candidate.oniceconnectionstatechange = () => {
-    if (!isCurrentPeer(generation, candidate)) return;
-    hudState.ice = candidate.iceConnectionState;
-    sessionState.rtcStartupFallback?.progress();
-    sessionState.connected = candidate.iceConnectionState === "connected" || candidate.iceConnectionState === "completed";
-    if (candidate.iceConnectionState === "failed" && requestedTransport === TRANSPORT.AUTO
-        && !sessionState.usingWssMedia && !sessionState.wssSelected && !["new", "connecting"].includes(candidate.connectionState)) {
-      switchToWss("ice-failed");
-      return;
-    }
-    if (sessionState.connected) {
-      hud.classList.remove("bad");
-      if (!mobilePointerDevice) requestPointerLock();
-      // Usually idempotent with the offer-time request. If slow ICE outlasted
-      // both watchdog intervals, renew the failed handshake once media can flow.
-      startFirstFrameHandshake("ice-connected");
-    }
-  };
-  candidate.ontrack = ev => {
-    if (!isCurrentPeer(generation, candidate) || sessionState.usingWssMedia || sessionState.wssSelected) { ev.track.stop(); return; }
-    if (sessionState.authenticatedSession?.mediaReady) onTrack(ev, generation);
-    else {
-      ev.track.enabled = false;
-      // There is one receive transceiver each for video and audio.
-      if (sessionState.pendingRtcTracks.length >= 2) { ev.track.stop(); return; }
-      sessionState.pendingRtcTracks.push({ event: ev, generation });
-    }
-  };
-  candidate.onconnectionstatechange = () => handleRtcPeerConnectionState(generation, candidate, candidate.connectionState);
-
-  try {
-    const offer = await candidate.createOffer();
-    if (!isCurrentPeer(generation, candidate)) return;
-    await candidate.setLocalDescription(offer);
-    if (!isCurrentPeer(generation, candidate)) return;
-    if (sendControl({ type: "offer", sdp: offer.sdp })) {
-      offerFailures = 0;
-      sessionState.rtcOfferSignaled = true;
-      startFirstFrameHandshake("offer-sent");
-    }
-  } catch (e) {
-    if (isCurrentPeer(generation, candidate)) offerFailed(e);
-  }
-}
-
 /**
  * Starts the session for one PC after dk-app.js unlocked the key. identity: { id,
  * publicRaw: Uint8Array, privateKey: non-extractable CryptoKey }. pinnedPublic is the

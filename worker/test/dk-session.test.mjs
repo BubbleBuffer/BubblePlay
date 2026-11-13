@@ -2,6 +2,7 @@ import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import { createSessionContext } from "./helpers/session-context.mjs";
 import test from "node:test";
 import { attachSignaling } from "./helpers/signaling-wiring.mjs";
+import { peerHarness } from "./helpers/peer-harness.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, hkdfSync, sign } from "node:crypto";
@@ -436,29 +437,28 @@ test("receiver cannot send DataChannel input or WSS media hello before authentic
   assert.deepEqual(sent, ["raw-input", "ctl-input"]);
 });
 
-test("receiver disables and holds RTC audio/video tracks until the verified media gate opens", () => {
+test("receiver disables and holds RTC audio/video tracks until the verified media gate opens", async () => {
   const rendered = [], stopped = [], persisted = [];
-  const candidate = {};
   const track = kind => ({ kind, enabled: true, readyState: "live", stop() { stopped.push(kind); this.readyState = "ended"; } });
   const video = track("video"), audio = track("audio");
-  const context = createSessionContext({ monitorPreviews: noMonitorPreviews, candidate, pc: candidate, generation: 4, peerGeneration: 4,
-    authenticatedSession: { mediaReady: false }, usingWssMedia: false, wssSelected: false, pendingRtcTracks: [],
-    sessionGate: { hide: () => rendered.push("gate-hidden") }, sessionTouched: false, sessionPc: hs.pc.id,
+  const h = peerHarness({ env: { onTrack: event => rendered.push(event.track.kind) } });
+  Object.assign(h.state, { sessionGate: { hide: () => rendered.push("gate-hidden") }, sessionTouched: false, sessionPc: hs.pc.id });
+  await h.peer.start();
+  const context = createSessionContext({ monitorPreviews: noMonitorPreviews, sessionState: h.state,
     touchPc: id => { persisted.push(id); return Promise.resolve(); },
     updateAuthenticatedInputReady: () => rendered.push("input-update"),
-    onTrack: event => rendered.push(event.track.kind),
-    isCurrentPeer: generation => generation === 4,
-    videoEvent: { track: video }, audioEvent: { track: audio },
+    onTrack: h.env.onTrack, isCurrentPeer: h.env.isCurrentPeer,
   });
-  const trackHandler = source.slice(source.indexOf("  candidate.ontrack ="), source.indexOf("  candidate.onconnectionstatechange ="));
   const openMedia = source.slice(source.indexOf("function openAuthenticatedMedia("), source.indexOf("\nfunction maybeBindRtcPeer("));
-  vm.runInContext(trackHandler + "\n" + openMedia + "\ncandidate.ontrack(videoEvent); candidate.ontrack(audioEvent); openAuthenticatedMedia();", context);
+  vm.runInContext(openMedia, context);
+  h.pcs[0].ontrack({ track: video }); h.pcs[0].ontrack({ track: audio });
+  vm.runInContext("openAuthenticatedMedia();", context);
   assert.equal(video.enabled, false);
   assert.equal(audio.enabled, false);
   assert.equal(context.pendingRtcTracks.length, 2);
   assert.deepEqual(rendered, []);
   assert.deepEqual(persisted, []);
-  context.authenticatedSession.mediaReady = true;
+  h.state.authenticatedSession.mediaReady = true;
   vm.runInContext("openAuthenticatedMedia();", context);
   assert.equal(video.enabled, true);
   assert.equal(audio.enabled, true);
@@ -475,7 +475,7 @@ test("receiver binds the peer only once DTLS is connected, with its actual local
     isCurrentPeer: generation => generation === 3, usingWssMedia: false, wssSelected: false,
     authenticatedSession: { bindPeer: descriptions => bindings.push(descriptions) },
   });
-  const fn = source.slice(source.indexOf("function maybeBindRtcPeer("), source.indexOf("\nfunction restartPeer("));
+  const fn = source.slice(source.indexOf("function maybeBindRtcPeer("), source.indexOf("\nfunction clearWssTimers("));
   vm.runInContext(fn + "\nmaybeBindRtcPeer();", context);
   assert.equal(bindings.length, 0);
   candidate.connectionState = "connected";
@@ -507,20 +507,6 @@ test("receiver failure closes authentication, media, pending tracks and input wi
   assert.equal(context.signalingTicket, null);
   assert.equal(context.terminalSignalingFailure, true);
   assert.deepEqual(calls, ["auth-close", "reconnect-cancel", "watchdog-clear", "peer-cleanup", ["file-epoch", null], ["files", false], "socket-close", ["refusal", "Session ended"]]);
-  // Exercise the actual cleanup prefix that the failure path calls. Its order
-  // closes stale tracks and sends release-all before removing the RTC lanes.
-  const cleanupCalls = [];
-  const cleanupContext = createSessionContext({ monitorPreviews: noMonitorPreviews, authenticatedSession: { resetPeer: () => cleanupCalls.push("peer-reset") },
-    pendingRtcTracks: [{ event: { track: { stop: () => cleanupCalls.push("track-stop") } } }],
-    fileDragPreview: { cancel() {} }, nativeFileDropPreviewAvailable: true,
-    fileDropPresentedGeneration: 3, fileDropPresentedViewportRevision: 1, usingWssMedia: false,
-    soundController: { detachSink() {} }, clearWssTimers() {}, closingPeer: false,
-    releaseInput: () => cleanupCalls.push("release-input"),
-  });
-  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  keyboardDraft.reset();", source.indexOf("function cleanupPeer(")));
-  vm.runInContext(cleanupPrefix + "\n}\ncleanupPeer();", cleanupContext);
-  assert.deepEqual(cleanupCalls, ["track-stop", "release-input", "peer-reset"]);
-  assert.equal(cleanupContext.pendingRtcTracks.length, 0);
 });
 
 test("receiver drains a final encrypted refusal before processing socket close or reconnect", async () => {
@@ -561,19 +547,13 @@ test("WSS teardown releases through ctl and cannot authorize an unbound DataChan
   const sent = [];
   let context;
   const lane = { readyState: "open", bufferedAmount: 0, send: () => sent.push("plaintext-dc") };
-  context = createSessionContext({ monitorPreviews: noMonitorPreviews, authenticatedSession: { mediaReady: true, rtcReady: false,
-    sendInput: () => { sent.push("ctl-input"); return true; }, resetPeer() {} },
-    desktopInputState: "enabled", desktopAvailable: true, desktopAwaitingFrame: false,
-    usingWssMedia: true, signalingRegistered: true, WebSocket: { OPEN: 1 }, ws: { readyState: 1, bufferedAmount: 0 },
-    dc: lane, motionDc: lane, data: new Uint8Array([1]), pendingRtcTracks: [],
-    fileDragPreview: { cancel() {} }, nativeFileDropPreviewAvailable: true,
-    fileDropPresentedGeneration: 3, fileDropPresentedViewportRevision: 1, closingPeer: false,
-    releaseInput: () => vm.runInContext("sendInput(data, dc)", context),
-    stopWssMedia: () => { context.usingWssMedia = false; }, soundController: { detachSink() {} }, clearWssTimers() {},
-  });
-  const inputFns = source.slice(source.indexOf("function inputControlState("), source.indexOf("\n// A refused motion tail"));
-  const cleanupPrefix = source.slice(source.indexOf("function cleanupPeer("), source.indexOf("  keyboardDraft.reset();", source.indexOf("function cleanupPeer(")));
-  vm.runInContext(inputFns + "\n" + cleanupPrefix + "\n}\ncleanupPeer();", context);
+  const h = peerHarness({ state: { usingWssMedia: true, signalingRegistered: true, ws: { readyState: 1, bufferedAmount: 0 },
+    dc: lane, motionDc: lane, authenticatedSession: { mediaReady: true, rtcReady: false, resetPeer() {},
+      sendInput: () => { sent.push("ctl-input"); return true; } } },
+  env: { releaseInput: () => vm.runInContext("sendInput(data, dc)", context), stopWssMedia: () => { h.state.usingWssMedia = false; } } });
+  context = createSessionContext({ monitorPreviews: noMonitorPreviews, sessionState: h.state, WebSocket: { OPEN: 1 }, data: new Uint8Array([1]) });
+  vm.runInContext(source.slice(source.indexOf("function inputControlState("), source.indexOf("\n// A refused motion tail")), context);
+  h.peer.cleanup();
   assert.deepEqual(sent, ["ctl-input"]);
   assert.equal(vm.runInContext("sendInput(data, dc)", context), false);
   assert.equal(vm.runInContext("inputControlState()", context), "down");

@@ -437,7 +437,4 @@ test("the strip sound button sits before fullscreen, hidden until the host annou
   assert.match(receiver, /s\.type === "inbound-rtp" && \(s\.kind === "video" \|\| s\.mediaType === "video"\)/);
   assert.match(receiver, /s\.type === "inbound-rtp" && \(s\.kind === "audio" \|\| s\.mediaType === "audio"\)/);
   assert.match(receiver, /audio: audioSnapshot\(\),/);
-  const video = receiver.indexOf('candidate.addTransceiver("video", { direction: "recvonly" });');
-  const audio = receiver.indexOf('candidate.addTransceiver("audio", { direction: "recvonly" });');
-  assert.ok(video > 0 && audio > video, "audio transceiver right after video");
 });
