@@ -277,3 +277,11 @@ Before further optimization, build an isolated candidate and compare it with a
 same-machine baseline. Cover: WSS, WebRTC Gaming, H264 fallback,
 relay/child recovery, ten-minute soak, then helper/display/QoS/browser cleanup
 and idle recovery. Keep production deployment separate from candidate validation.
+
+## Windows checks
+
+Jobs on GitHub-hosted runners (Host checks, Windows client checks, windows-packaging) run only on a manual
+`workflow_dispatch` of the Checks workflow: the Actions budget for this private repository is spent on hosted
+Windows minutes. Until a self-hosted Windows runner exists, changes under `host/` and `client-win/` are gated by the
+local run of `.claude/dk2/win-check.sh <worktree> host|client-win` (fmt, clippy, tests, one run at a time across lanes).
+Every other job, including `changes`, runs on build01.
