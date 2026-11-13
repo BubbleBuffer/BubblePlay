@@ -60,6 +60,9 @@ jobs:
           cache-dependency-path: worker/package-lock.json
       - run: npm --prefix worker ci --ignore-scripts
       - run: node tools/check.mjs client
+      - name: Lint gates (shrink-only baselines)
+        if: matrix.node == 24
+        run: node tools/lint/gates.mjs
       - run: node --test tools/tests/*.test.mjs
 
   windows-packaging:
@@ -142,6 +145,13 @@ jobs:
           cargo test --locked --workspace --no-fail-fast
           cargo clippy --locked --workspace --all-targets -- -D warnings
           cargo fmt --all -- --check
+      - name: Clippy ratchet (relay-rs, bp-device-key)
+        run: |
+          # Both gates run even if the first fails, so one run shows every miss.
+          status=0
+          node tools/lint/gates.mjs clippy relay-rs || status=1
+          node tools/lint/gates.mjs clippy bp-device-key || status=1
+          exit $status
       - name: bp-relay-core builds for wasm32
         working-directory: relay-rs
         run: cargo check --locked -p bp-relay-core --target wasm32-unknown-unknown
@@ -161,9 +171,24 @@ jobs:
         run: |
           cargo clippy --locked --target wasm32-unknown-unknown -- -D warnings
           cargo fmt --check
+      - name: Clippy ratchet (relay worker)
+        if: ${{ !cancelled() }}
+        run: node tools/lint/gates.mjs clippy relay-worker
       - name: bp-relay-worker builds (worker-build --release)
         working-directory: relay-rs/worker
         run: worker-build --release
+      # The bundle CI built and tested, stamped like tools/deploy-relay.mjs stamps it, so a deploy can use
+      # exactly this one: node tools/deploy-relay.mjs --config <wrangler.prod.toml> --skip-build.
+      - name: Stamp and keep the tested relay bundle
+        run: |
+          worker_build="$(sed -n 's/^worker = "=\(.*\)"/\1/p' relay-rs/worker/Cargo.toml)"
+          printf '{"commit":"%s","builtAt":"%s","workerBuild":"%s"}\n' "$GITHUB_SHA" "$(date -u +%FT%TZ)" "$worker_build" > relay-rs/worker/build/BUILD_INFO.json
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: relay-worker-bundle
+          path: relay-rs/worker/build/
+          if-no-files-found: error
+          retention-days: 30
       # wrangler 4.148.0 was published 2026-10-06: the newest release at least two weeks old on
       # 2026-10-23 (4.149.0 is 13.9 days old). The crate has no lockfile for wrangler, so the exact pin is the guarantee.
       - name: Install wrangler (pinned)
@@ -279,10 +304,58 @@ jobs:
           # host/tests/hung_foreground_input.rs drives this runner's interactive desktop.
           BUBBLEPLAY_FOREGROUND_TESTS: "1"
         run: node tools/check.mjs host
+      - name: Admin agent e2e (basic-user token)
+        # Creates a local user: hosted runners only, never a self-hosted one.
+        if: runner.environment == 'github-hosted'
+        # The hosted runner account is an elevated administrator and the dev agent refuses to run
+        # elevated, so `Host tests` skips these tests. Run them again as a standard user;
+        # BUBBLEPLAY_E2E_REQUIRE_UNELEVATED turns a skip into a failure.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $built = cargo test --locked --offline --manifest-path host/Cargo.toml --test admin_agent_e2e --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'building admin_agent_e2e failed' }
+          $exe = ($built | ForEach-Object { try { $_ | ConvertFrom-Json } catch { } } |
+            Where-Object { $_.executable -and $_.target.name -eq 'admin_agent_e2e' } | Select-Object -Last 1).executable
+          if (-not $exe) { throw 'admin_agent_e2e executable not found' }
+          # `runas /trustlevel` keeps TokenIsElevated on the hosted runner (UAC is off), so use a
+          # throwaway local standard user that exists only for this step.
+          $user = 'bpe2e'
+          $plain = [guid]::NewGuid().ToString('N') + 'aA1!'
+          # New-LocalUser, not `net user`: that one prompts for passwords over 14 characters.
+          New-LocalUser -Name $user -Password (ConvertTo-SecureString $plain -AsPlainText -Force) | Out-Null
+          try {
+            $dir = Split-Path $exe
+            icacls $dir /grant "${user}:(OI)(CI)RX" /T /C | Out-Null
+            $cred = [pscredential]::new($user, (ConvertTo-SecureString $plain -AsPlainText -Force))
+            $log = Join-Path $env:RUNNER_TEMP 'admin-agent-e2e.log'
+            icacls $env:RUNNER_TEMP /grant "${user}:(OI)(CI)M" | Out-Null
+            # The standard user has no usable profile temp dir; give it one it can write.
+            $scratch = Join-Path $env:RUNNER_TEMP 'bpe2e-tmp'
+            New-Item -ItemType Directory -Force $scratch | Out-Null
+            icacls $scratch /grant "${user}:(OI)(CI)F" | Out-Null
+            $proc = Start-Process -FilePath $exe -ArgumentList '--test-threads=1' -Credential $cred -LoadUserProfile `
+              -Environment @{ BUBBLEPLAY_E2E_REQUIRE_UNELEVATED = '1'; TEMP = $scratch; TMP = $scratch } `
+              -RedirectStandardOutput $log -RedirectStandardError "$log.err" -PassThru -WindowStyle Hidden
+            if (-not $proc.WaitForExit(300000)) { $proc.Kill(); throw 'admin_agent_e2e did not finish in 5 minutes' }
+            Get-Content $log, "$log.err" -ErrorAction SilentlyContinue
+            if ($proc.ExitCode -ne 0) { throw "admin_agent_e2e failed with exit code $($proc.ExitCode)" }
+          } finally {
+            Remove-LocalUser -Name $user
+          }
+      - name: Remove the e2e user
+        if: always() && runner.environment == 'github-hosted'
+        shell: pwsh
+        run: |
+          net user bpe2e 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) { net user bpe2e /delete }
+          exit 0
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --offline --manifest-path host/Cargo.toml --all-targets -- -D warnings
       - name: Rustfmt
         run: cargo fmt --manifest-path host/Cargo.toml --all -- --check
+      - name: Clippy ratchet
+        run: node tools/lint/gates.mjs clippy host -- --offline
 
   client-win:
     name: Windows client checks (windows-latest)
@@ -311,6 +384,8 @@ jobs:
         run: cargo test --locked --offline --manifest-path client-win/Cargo.toml
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --offline --manifest-path client-win/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy ratchet
+        run: node tools/lint/gates.mjs clippy client-win -- --offline
       - name: Rustfmt
         # The frozen mock UI (src/ui, src/mock.rs, src/model.rs, tests/ui_layout.rs) predates
         # this check and is skipped: main.rs marks those modules #[rustfmt::skip] and the

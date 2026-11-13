@@ -1,0 +1,24 @@
+{
+  "comment": "Names shared by the Rust host/tray and the PowerShell install scripts. Rust reads this file in unit tests (host/src/tray/platform.rs and host/tests/install_names_contract.rs); tools/tests/install-names.test.mjs checks the scripts. Change a value here and in every consumer, or the checks fail.",
+  "values": {
+    "taskFolder": { "value": "\\BubblePlay\\", "ps": [{ "file": "host/scripts/setup-tray.ps1", "variable": "TaskPath" }] },
+    "agentTask": { "value": "AdminAgent", "ps": [{ "file": "host/scripts/setup-tray.ps1", "variable": "AgentTaskName" }] },
+    "secureDesktopTask": { "value": "SecureDesktop", "ps": [{ "file": "host/scripts/setup-tray.ps1", "variable": "HelperTaskName" }] },
+    "adminModeOffTask": { "value": "AdminModeOff", "ps": [{ "file": "host/scripts/setup-tray.ps1", "variable": "AdminModeOffTaskName" }] },
+    "hklmKey": { "value": "SOFTWARE\\BubblePlay", "ps": [{ "file": "host/scripts/setup-tray.ps1", "variable": "AdminModeRegistryPath" }] },
+    "runValue": { "value": "BubblePlayTray", "ps": [{ "file": "host/scripts/setup-tray.ps1", "variable": "RunValue" }] },
+    "agentExe": { "value": "bubbleplay_admin_agent.exe", "ps": [
+      { "file": "host/scripts/setup-tray.ps1", "variable": "AgentExeName" },
+      { "file": "host/scripts/update-tray.ps1", "variable": "AgentExeName" }] },
+    "helperExe": { "value": "bubbleplay_secure_helper.exe", "ps": [
+      { "file": "host/scripts/setup-tray.ps1", "variable": "HelperExeName" },
+      { "file": "host/scripts/update-tray.ps1", "variable": "HelperExeName" }] },
+    "hostExe": { "value": "bubbleplay-host.exe", "ps": [
+      { "file": "host/scripts/setup-tray.ps1" }, { "file": "host/scripts/update-tray.ps1" }] },
+    "trayExe": { "value": "bubbleplay_tray.exe", "ps": [
+      { "file": "host/scripts/setup-tray.ps1" }, { "file": "host/scripts/update-tray.ps1" }] },
+    "updateStateFile": { "value": "update-state.json", "ps": [{ "file": "host/scripts/update-tray.ps1" }] },
+    "hostConfigFile": { "value": "host.json", "ps": [
+      { "file": "host/scripts/setup-tray.ps1" }, { "file": "host/scripts/update-tray.ps1" }] }
+  }
+}

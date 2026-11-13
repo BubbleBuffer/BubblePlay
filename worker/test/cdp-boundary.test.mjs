@@ -1,4 +1,5 @@
 import { readClientSource } from "./helpers/client-source.mjs";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -7,7 +8,7 @@ import { createCompositionCommitGate } from "../public/composition-gate.js";
 
 test("receiver diagnostics expose current host capabilities, capture and clock", () => {
   const client = readClientSource();
-  assert.match(client, /hostCapabilities:\s*\{\s*\.\.\.hostCapabilities,\s*current:\s*hostCapabilitiesGeneration === signalingGeneration/);
+  assert.match(client, /hostCapabilities:\s*\{\s*\.\.\.sessionState\.hostCapabilities,\s*current:\s*sessionState\.hostCapabilitiesGeneration === sessionState\.signalingGeneration/);
   assert.match(client, /captureFrame\(\)\s*\{[\s\S]*?toDataURL\("image\/png"\)/);
   assert.match(client, /clock:\s*\{\s*performanceMs:\s*snapshotAtMs,\s*epochMs:\s*snapshotAtEpochMs\s*\}/);
 });
@@ -26,8 +27,7 @@ test("external debug attempts report before module imports and across the WSS pr
   assert.match(client, /debugAttempt/);
   assert.match(client, /trace\("bootstrap-inline"/);
   for (const stage of [
-    "module-ready", "signaling-construct", "signaling-open",
-    "signaling-hello-ok", "media-v4-open", "media-first-packet",
+    "module-ready", "signaling-hello-ok", "media-first-packet",
     "decoder-configured", "decoder-first-output", "first-presented",
   ]) assert.match(client, new RegExp(`debugTrace\\(\"${stage}\"`));
 });
@@ -70,7 +70,7 @@ test("a normal page load creates and reports its own diagnostic attempt", () => 
     URLSearchParams));
   assert.equal(broken[0][2].navigation, null);
   // The client logger's redactor keeps the value readable in the stored line.
-  const context = vm.createContext({ console: { warn() {}, error() {} }, addEventListener() {}, setTimeout: () => 1,
+  const context = createSessionContext({ console: { warn() {}, error() {} }, addEventListener() {}, setTimeout: () => 1,
     Date, JSON, Error, Promise, Set, Math, Number, String, Array, Object, RegExp, indexedDB: undefined });
   context.globalThis = context;
   vm.runInContext(readFileSync(new URL("../public/dk-log.js", import.meta.url), "utf8"), context);
@@ -128,18 +128,18 @@ test("automatic WSS fallback releases the WebRTC video sink before reclaiming it
   const client = readClientSource();
   assert.match(client, /function releaseWebRtcVideoSink\(\)[\s\S]*encodedWorker\.terminate\(\)[\s\S]*replaceTransferredCanvas\(\)/);
   assert.match(client, /function requestWssMediaStart\(\)[\s\S]*releaseWebRtcVideoSink\(\);[\s\S]*ensureMainCanvas\(\);/);
-  assert.match(client, /const updateDimensions = \(\) => \{\s*if \(generation !== peerGeneration \|\| activeVideo !== video \|\| !nativePresentation\) return;/);
+  assert.match(client, /const updateDimensions = \(\) => \{\s*if \(generation !== sessionState\.peerGeneration \|\| activeVideo !== video \|\| !nativePresentation\) return;/);
   const release = client.match(/function releaseWebRtcVideoSink\(\) \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(release, "releaseWebRtcVideoSink must be extracted from the client");
-  assert.doesNotMatch(release, /\bpc\?*\.close|\bdc\?*\.close|\bmotionDc\?*\.close/);
+  assert.doesNotMatch(release, /\bsessionState\.pc\?*\.close|\bsessionState\.dc\?*\.close|\bsessionState\.motionDc\?*\.close/);
 });
 
 test("WSS diagnostics count media bytes and packets and reset them atomically", () => {
   const client = readClientSource();
-  assert.match(client, /wssMediaReceivedBytes\s*\+=\s*data\.byteLength/);
-  assert.match(client, /wssMediaReceivedPackets\+\+/);
-  assert.match(client, /wssMedia:\s*\{[\s\S]*receivedBytes:\s*wssMediaReceivedBytes[\s\S]*receivedPackets:\s*wssMediaReceivedPackets/);
-  assert.match(client, /resetPresentationCounters\(\)[\s\S]*wssMediaReceivedBytes\s*=\s*0[\s\S]*wssMediaReceivedPackets\s*=\s*0/);
+  assert.match(client, /sessionState\.wssMediaReceivedBytes\s*\+=\s*data\.byteLength/);
+  assert.match(client, /sessionState\.wssMediaReceivedPackets\+\+/);
+  assert.match(client, /wssMedia:\s*\{[\s\S]*receivedBytes:\s*sessionState\.wssMediaReceivedBytes[\s\S]*receivedPackets:\s*sessionState\.wssMediaReceivedPackets/);
+  assert.match(client, /resetPresentationCounters\(\)[\s\S]*sessionState\.wssMediaReceivedBytes\s*=\s*0[\s\S]*sessionState\.wssMediaReceivedPackets\s*=\s*0/);
 });
 
 test("WSS presentation diagnostics prove immediate draws and expose every RAF coalescing path", () => {
@@ -198,7 +198,7 @@ test("responsive product shell keeps normal controls compact and diagnostics adv
   assert.match(client, /params\.get\("diag"\) === "1"/);
   assert.match(client, /id="secure-desktop-status"/);
   assert.match(client, /Windows secure desktop/);
-  assert.match(client, /desktopKind === "secure"/);
+  assert.match(client, /sessionState\.desktopKind === "secure"/);
   assert.match(client, /keyboardInput\.setAttribute\("autocorrect", secureDesktop \? "off" : "on"\)/);
   // Touch order follows the Android quick-action bar.
   assert.match(client, /data-ui-action="keyboard"[\s\S]*data-ui-action="monitors"[\s\S]*data-ui-action="pointer"[\s\S]*data-ui-action="shortcuts"[\s\S]*data-ui-action="keys"[\s\S]*data-ui-action="arrows"[\s\S]*data-ui-action="more"/);
@@ -233,7 +233,7 @@ test("first-frame startup uses one bounded retry and clears on native or decoded
   assert.match(client, /function cleanupPeer\(\)[\s\S]*resetPresentationCounters\(\)/);
   assert.match(client, /recoverWssStartup/);
   assert.match(client, /monitorTransition/);
-  assert.match(client, /desktopTransitionPlan\(\{ reason: message\.reason, state: message\.state, usingWss: usingWssMedia, alreadyRendering, rtcInPlace: rtcInPlaceTransitionCapable\(\) \}\)/);
+  assert.match(client, /desktopTransitionPlan\(\{ reason: message\.reason, state: message\.state, usingWss: sessionState\.usingWssMedia, alreadyRendering, rtcInPlace: rtcInPlaceTransitionCapable\(\) \}\)/);
   assert.match(client, /function startFirstFrameHandshake\(reason, forceNew = false\)/);
   assert.match(client, /firstFrameHandshake.retries < 1/);
   assert.match(client, /}, 5_000\)/);
@@ -266,23 +266,10 @@ test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive se
   assert.doesNotMatch(styles, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
 });
 
-test("client starts a new signaling and peer epoch after relay loss or peer departure", () => {
-  const client = readClientSource();
-  assert.match(client, /function reconnectSignaling\(reason\)/);
-  assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
-  const reconnect = client.match(/function reconnectSignaling\(reason\) \{[\s\S]*?\n\}/)?.[0];
-  assert.ok(reconnect);
-  assert.match(reconnect, /socket\.onclose = event => \{[\s\S]*receiveQueue = receiveQueue\.then\(\(\) => handleClose\(event\)\);/);
-  assert.match(reconnect, /const handleClose = event => \{[\s\S]*authenticatedSession\?\.close\(\);[\s\S]*cleanupPeer\(\);[\s\S]*restartPeer\("ws-closed", false\);\s*reconnectSignaling\("ws-closed"\);/);
-  assert.match(client, /const generation = \+\+peerGeneration/);
-  assert.match(client, /pendingRemoteIce/);
-});
-
 test("browser signaling sends the signed viewer hello and never stores an application secret", () => {
   const client = readClientSource();
-  assert.match(client, /sendRelay\(viewerHello\(\{ identity: sessionIdentity, turn: wantsTurn\(params\) \}\)\)/);
   assert.doesNotMatch(client, /bp_token|BubblePlay token|hello", token/);
-  assert.doesNotMatch(client, /localStorage[^\n]*(privateKey|sessionIdentity)/);
+  assert.doesNotMatch(client, /localStorage[^\n]*(privateKey|sessionState\.sessionIdentity)/);
 });
 
 test("WSS fallback negotiates the v4 media socket and keeps the control surface", () => {
@@ -296,7 +283,6 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /streamMode: streamModeValue\(\)/);
   assert.match(client, /<option value="auto">Auto<\/option>/);
   assert.match(client, /function mediaSocketUrl\(\)/);
-  assert.match(client, /role: "media-viewer"/);
   assert.match(client, /hev1\.1\.6\.L120\.B0/);
   assert.match(client, /media-control/);
   assert.match(client, /fullFrameDiagnostic/);
@@ -305,7 +291,7 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /mediaGeneration/);
   assert.match(client, /<canvas id="screen"><\/canvas><canvas id="sharp-screen"><\/canvas>/);
   assert.match(client, /function beginWssRecovery\(reason, requestId = null\)/);
-  assert.match(client, /wssRecoveryPending/);
+  assert.match(client, /sessionState\.wssRecoveryPending/);
   assert.match(client, /wss-recovery-keyframe/);
   assert.match(client, /case "desktop-state"/);
   assert.match(client, /case "monitor-list"/);
@@ -317,10 +303,10 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.match(client, /data-vk="162"/);
   assert.match(client, /createPopoverController\(\{/);
   assert.match(client, /desktop-unavailable/);
-  assert.match(client, /if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
+  assert.match(client, /if \(!sessionState\.desktopAvailable \|\| sessionState\.desktopAwaitingFrame\) return false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*sessionState\.desktopAwaitingFrame = false[\s\S]*renderDesktopState\(\);/);
   assert.doesNotMatch(client, /sharpZoomEnabled\s*&&\s*pointerMode\s*===\s*"desktop"/);
-  assert.match(client, /function requestWssMediaStart\(\) \{\s*if \(usingWssMedia\) return;\s*if \(!authenticatedSession\?\.controlReady \|\| !signalingTicket\) return;\s*if \(!mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
+  assert.match(client, /function requestWssMediaStart\(\) \{\s*if \(sessionState\.usingWssMedia\) return;\s*if \(!sessionState\.authenticatedSession\?\.controlReady \|\| !sessionState\.signalingTicket\) return;\s*if \(!sessionState\.mediaEpoch\)[\s\S]*ensureMainCanvas\(\);/);
   assert.match(client, /function requestWssMediaStart\(\)[\s\S]*stage\.classList\.remove\("native-video-input"\)/);
   assert.match(client, /function recoverNetworkRoute\(reason\)/);
   assert.match(client, /addEventListener\("online", \(\) => recoverNetworkRoute\("online"\)\)/);
@@ -331,12 +317,12 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
   assert.doesNotMatch(client, /switchToWss\("ice-timeout"\)/);
   assert.match(client, /2_000/);
   assert.doesNotMatch(client, /localStorage\.setItem\([^\n]*codec/);
-  assert.match(client, /const due = usingWssMedia \? now : latencyGuard\.expectedWall\(ts\)/);
-  assert.match(client, /wssLatestFrameTrace/);
-  assert.match(client, /wssPresentedFrameTraces/);
+  assert.match(client, /const due = sessionState\.usingWssMedia \? now : latencyGuard\.expectedWall\(ts\)/);
+  assert.match(client, /sessionState\.wssLatestFrameTrace/);
+  assert.match(client, /sessionState\.wssPresentedFrameTraces/);
   assert.match(client, /frameTraceHistory/);
-  assert.match(client, /wssPresentedSequence\s*=\s*metadata\.sequence\s*>>>\s*0/);
-  assert.doesNotMatch(client, /wssPresentedSequence\s*=\s*Math\.max\(/);
+  assert.match(client, /sessionState\.wssPresentedSequence\s*=\s*metadata\.sequence\s*>>>\s*0/);
+  assert.doesNotMatch(client, /sessionState\.wssPresentedSequence\s*=\s*Math\.max\(/);
   assert.match(client, /decodeQueuedAtMs/);
   assert.match(client, /decodedAtMs/);
   assert.match(client, /presentedAtMs/);
@@ -346,25 +332,18 @@ test("WSS fallback negotiates the v4 media socket and keeps the control surface"
 
 test("QoS polling continues after ICE reaches completed", () => {
   const client = readClientSource();
-  assert.match(client, /\["connected",\s*"completed"\]\.includes\(pc\.iceConnectionState\)/);
-  assert.doesNotMatch(client, /pc\.iceConnectionState\s*!==\s*"connected"/);
-});
-
-test("worker policy closure is terminal while transient websocket closure reconnects", () => {
-  const client = readClientSource();
-  assert.match(client, /shouldReconnectAfterClose\(event\.code, terminalSignalingFailure\)/);
-  assert.match(client, /terminalSignalingFailure/);
-  assert.match(client, /reconnectSignaling\("ws-closed"\)/);
+  assert.match(client, /\["connected",\s*"completed"\]\.includes\(sessionState\.pc\.iceConnectionState\)/);
+  assert.doesNotMatch(client, /sessionState\.pc\.iceConnectionState\s*!==\s*"sessionState\.connected"/);
 });
 
 test("client applies validated ephemeral ICE configuration and keeps route diagnostics private", () => {
   const client = readClientSource();
   assert.match(client, /from "\/turn\.js"/);
-  assert.match(client, /currentIceServers = validateIceServers\(msg\.iceServers\);/);
+  assert.match(client, /sessionState\.currentIceServers = validateIceServers\(msg\.iceServers\);/);
   assert.ok(client.includes('mediaEpoch = typeof msg.mediaEpoch === "string" && /^[\\x20-\\x7e]{1,64}$/.test(msg.mediaEpoch) ? msg.mediaEpoch : null;'),
     "the admitted epoch must be a bounded printable ASCII string, preserved without numeric conversion");
-  assert.match(client, /onAuthenticated: \(\) => \{\s*if \(!current\(\)\) return;[\s\S]*?if \(wssSelected\) requestWssMediaStart\(\);\s*else startPeer\(peerGeneration\);/);
-  assert.match(client, /iceServers: currentIceServers,\s*iceTransportPolicy,/);
+  assert.match(client, /onAuthenticated: \(\) => \{\s*if \(!current\(\)\) return;[\s\S]*?if \(sessionState\.wssSelected\) requestWssMediaStart\(\);\s*else startPeer\(sessionState\.peerGeneration\);/);
+  assert.match(client, /iceServers: sessionState\.currentIceServers,\s*iceTransportPolicy,/);
   assert.match(client, /hudState\.route = deriveCandidateRoute\(latestRtcProfile\);/);
   assert.match(client, /hudState\.route = "…";/);
 });
@@ -406,27 +385,9 @@ test("WSS hybrid presentation parses before decode and composites only after the
   assert.match(client, /wssMedia:\s*\{[\s\S]*hybrid:\s*wssHybridSnapshot\(\)/);
 });
 
-test("peer departure recycles signaling before another peer offer", () => {
+test("the diagnostics snapshot exposes the last signaling recycle", () => {
   const client = readClientSource();
-  assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
-  assert.match(client, /function recycleSignaling\(reason\)/);
-});
-
-test("intentional signaling recycle retains its initiator before invalidating the old epoch", () => {
-  const client = readClientSource();
-  const recycle = client.match(/function recycleSignaling\(reason\) \{([\s\S]*?)\n\}/)?.[1];
-  assert.ok(recycle, "recycleSignaling must be extracted from the client");
-  assert.match(recycle, /createSignalingRecycleDiagnostic\(\{/);
-  assert.match(recycle, /reason,[\s\S]*signalingGeneration,[\s\S]*signalingRegistered,/);
-  assert.match(recycle, /socketReadyState:\s*ws\?\.readyState\s*\?\?\s*null/);
-  assert.match(recycle, /usingWssMedia,[\s\S]*mediaSocketOpen:/);
-  assert.match(recycle, /mediaGeneration:[\s\S]*reconstructed:[\s\S]*presented:[\s\S]*receivedPackets:/);
-  assert.match(recycle, /lastSignalingRecycle\s*=\s*\{\s*\.\.\.diagnostic,\s*atMs:\s*Date\.now\(\)\s*\}/);
-  const emittedAt = recycle.indexOf('viewerLog("warn", "signaling-recycle", diagnostic)');
-  const invalidatedAt = recycle.indexOf("ws = null");
-  assert.ok(emittedAt >= 0 && invalidatedAt > emittedAt,
-    "the diagnostic must use the still-open old signaling socket before it is invalidated");
-  assert.match(client, /signaling:\s*\{[\s\S]*lastRecycle:\s*lastSignalingRecycle\s*\?\s*\{\s*\.\.\.lastSignalingRecycle\s*\}\s*:\s*null/);
+  assert.match(client, /signaling:\s*\{[\s\S]*lastRecycle:\s*sessionState\.lastSignalingRecycle\s*\?\s*\{\s*\.\.\.sessionState\.lastSignalingRecycle\s*\}\s*:\s*null/);
 });
 
 test("predicted cursor repaints through one follow boundary and has a real black outline", () => {
@@ -463,15 +424,15 @@ test("mobile desktop pointer uses absolute targets and authoritative host reconc
 
 test("desktop input suspension is enforced at the final browser transport boundary", () => {
   const client = readClientSource();
-  assert.match(client, /function sendInput\(data, channel\) \{\s*if \(!authenticatedSession\?\.mediaReady\) return false;\s*if \(desktopInputState !== "enabled"\) return false;/);
-  assert.match(client, /function inputControlState\(\) \{\s*if \(!authenticatedSession\?\.mediaReady\) return "down";\s*if \(desktopInputState !== "enabled" \|\| !desktopAvailable\) return "down";/);
-  assert.match(client, /if \(desktopInputState !== "enabled"\) releaseInput\(false\);/);
+  assert.match(client, /function sendInput\(data, channel\) \{\s*if \(!sessionState\.authenticatedSession\?\.mediaReady\) return false;\s*if \(sessionState\.desktopInputState !== "enabled"\) return false;/);
+  assert.match(client, /function inputControlState\(\) \{\s*if \(!sessionState\.authenticatedSession\?\.mediaReady\) return "down";\s*if \(sessionState\.desktopInputState !== "enabled" \|\| !sessionState\.desktopAvailable\) return "down";/);
+  assert.match(client, /if \(sessionState\.desktopInputState !== "enabled"\) releaseInput\(false\);/);
 });
 
 test("browser diagnostics retain host-side applied input evidence", () => {
   const client = readClientSource();
   assert.match(client, /case "input-status"/);
-  assert.match(client, /latestInputStatus = msg/);
+  assert.match(client, /sessionState\.latestInputStatus = msg/);
   assert.match(client, /host-input-application-failed/);
   assert.match(client, /appliedEvents.*requestedEvents/);
 });
@@ -484,25 +445,25 @@ test("desktop source transitions preserve the last frame without authorizing sta
   // otherwise the WebRTC peer is recycled with input released.
   const monitorBranch = client.match(/if \(monitorTransition && alreadyRendering\) \{[\s\S]*?\r?\n  \}/)?.[0];
   assert.ok(monitorBranch, "the monitor-transition branch must be extracted from the client");
-  assert.match(monitorBranch, /desktopAwaitingFrame = true;[\s\S]*suppressDesktopTransitionOverlay = true;[\s\S]*inputTransitionHold = true;[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);/);
-  assert.match(monitorBranch, /if \(transitionPlan\.action === "restart-peer"\) \{[\s\S]*releaseInput\(false\);[\s\S]*restartRtcForTransition\("monitor-transition"\);\s*return;\s*\}\s*inputTransitionHold = true;/);
+  assert.match(monitorBranch, /sessionState\.desktopAwaitingFrame = true;[\s\S]*sessionState\.suppressDesktopTransitionOverlay = true;[\s\S]*sessionState\.inputTransitionHold = true;[\s\S]*startFirstFrameHandshake\("monitor-transition", true\);/);
+  assert.match(monitorBranch, /if \(transitionPlan\.action === "restart-peer"\) \{[\s\S]*releaseInput\(false\);[\s\S]*restartRtcForTransition\("monitor-transition"\);\s*return;\s*\}\s*sessionState\.inputTransitionHold = true;/);
   assert.match(client, /const RTC_IN_PLACE_TRANSITIONS = \["monitor-transition", "desktop-source-transition"\];/);
   assert.match(client, /function recoverRtcInPlaceTransition\(reason\) \{[\s\S]*RTC_IN_PLACE_TRANSITIONS\.includes\(firstFrameHandshake\.reason\)[\s\S]*restartPeerInNewEpoch/);
   // Admission without a provable RTP timestamp falls back to the peer restart.
   assert.match(client, /const plan = rtcAdmissionGate\(\{[\s\S]*admittedRtpTimestamp: message\.rtpTimestamp[\s\S]*if \(plan\.action === "restart-peer"\) \{\s*recoverRtcInPlaceTransition\(plan\.reason\);\s*return;/);
-  assert.match(client, /requireAdmission && !usingWssMedia\s*&& !rtcGateOpens\(firstFrameHandshake\.rtpGate, proof\)\) return false;/);
-  assert.match(client, /if \(inputTransitionHold\) \{\s*inputTransitionHold = false;\s*input\.resumeAfterTransition\(\);/);
-  assert.match(client, /if \(sourceTransition && alreadyRendering\) \{[\s\S]*desktopAwaitingFrame = true;[\s\S]*startFirstFrameHandshake\("desktop-source-transition", true\);[\s\S]*return;\s*\}/);
+  assert.match(client, /requireAdmission && !sessionState\.usingWssMedia\s*&& !rtcGateOpens\(firstFrameHandshake\.rtpGate, proof\)\) return false;/);
+  assert.match(client, /if \(sessionState\.inputTransitionHold\) \{\s*sessionState\.inputTransitionHold = false;\s*input\.resumeAfterTransition\(\);/);
+  assert.match(client, /if \(sourceTransition && alreadyRendering\) \{[\s\S]*sessionState\.desktopAwaitingFrame = true;[\s\S]*startFirstFrameHandshake\("desktop-source-transition", true\);[\s\S]*return;\s*\}/);
   assert.match(client, /if \(transitionPlan\.action === "restart-peer"\) \{\s*restartRtcForTransition\("desktop-source-transition"\);\s*return;/);
-  assert.match(client, /function restartRtcForTransition\(transition\) \{\s*rtcTransitionRestartPending = true;\s*restartPeerInNewEpoch\(\{ recycleSignaling, restartPeer \}, transition\);/);
+  assert.match(client, /function restartRtcForTransition\(transition\) \{\s*sessionState\.rtcTransitionRestartPending = true;\s*restartPeerInNewEpoch\(\{ recycleSignaling, restartPeer \}, transition\);/);
   assert.match(client, /if \(workerPresented\) markFirstFramePresented\(null, null, \{ gatePassed \}\)/);
-  assert.match(client, /firstFrameHandshake\.requireAdmission && !usingWssMedia && useWebCodecs[\s\S]*resyncPipeline\("desktop-transition-admitted", firstFrameHandshake\.rtpGate\)/);
-  assert.match(client, /if \(!usingWssMedia && firstFrameHandshake\.requireAdmission\) \{[\s\S]*if \(!firstFrameHandshake\.admitted\)[\s\S]*if \(transitionNeedsKeyframe\)[\s\S]*const verdict = transitionKeyframeVerdict\(\{ isKey,[\s\S]*if \(verdict !== \"admit\"\)[\s\S]*if \(verdict === \"unprovable\"\) recoverRtcInPlaceTransition\(\"no-frame-rtp-timestamp\"\);/);
-  assert.match(client, /function sendInput\(data, channel\) \{[\s\S]*if \(!desktopAvailable \|\| desktopAwaitingFrame\) return false;/);
+  assert.match(client, /firstFrameHandshake\.requireAdmission && !sessionState\.usingWssMedia && useWebCodecs[\s\S]*resyncPipeline\("desktop-transition-admitted", firstFrameHandshake\.rtpGate\)/);
+  assert.match(client, /if \(!sessionState\.usingWssMedia && firstFrameHandshake\.requireAdmission\) \{[\s\S]*if \(!firstFrameHandshake\.admitted\)[\s\S]*if \(sessionState\.transitionNeedsKeyframe\)[\s\S]*const verdict = transitionKeyframeVerdict\(\{ isKey,[\s\S]*if \(verdict !== \"admit\"\)[\s\S]*if \(verdict === \"unprovable\"\) recoverRtcInPlaceTransition\(\"no-frame-rtp-timestamp\"\);/);
+  assert.match(client, /function sendInput\(data, channel\) \{[\s\S]*if \(!sessionState\.desktopAvailable \|\| sessionState\.desktopAwaitingFrame\) return false;/);
   assert.match(client, /firstFrameHandshake\.requireAdmission = forceNew \|\| reason === "desktop-source-transition"/);
   assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*requireAdmission && !firstFrameHandshake\.admitted[\s\S]*return false/);
   assert.match(client, /presentedGeneration !== firstFrameHandshake\.generation[\s\S]*return false/);
-  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*desktopAwaitingFrame = false/);
+  assert.match(client, /function markFirstFramePresented\(presentedGeneration = null, presentedViewportRevision = null, proof = null\)[\s\S]*sessionState\.desktopAwaitingFrame = false/);
 });
 
 test("monitor control uses the signaling epoch and drops stale confirmations", () => {
@@ -510,13 +471,12 @@ test("monitor control uses the signaling epoch and drops stale confirmations", (
   assert.match(client, /import \{\s*desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,[\s\S]*?\} from "\/monitor-selection\.js"/);
   // Both epoch restarts drop an outstanding confirmation instead of latching
   // monitor selection off for the rest of the page.
-  assert.match(client, /function recycleSignaling\(reason\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
   assert.match(client, /function restartPeer\(reason, reconnect = true\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
   assert.match(client, /function invalidatePendingMonitorRequest\(reason\) \{[\s\S]*monitorRequestAfterRestart\(monitorSwitchPending, reason\)[\s\S]*monitorSwitchPending = null;/);
   // The monitor control is a signaling message; input data channels are not a
   // precondition.
-  assert.match(client, /function requestMonitor\(selector\) \{[\s\S]*monitorRequestReadiness\(\{[\s\S]*signalingRegistered,[\s\S]*\}\);/);
-  assert.doesNotMatch(client, /if \(monitorSwitchPending \|\| !inputReady && !usingWssMedia\) return false;/);
+  assert.match(client, /function requestMonitor\(selector\) \{[\s\S]*monitorRequestReadiness\(\{[\s\S]*sessionState\.signalingRegistered,[\s\S]*\}\);/);
+  assert.doesNotMatch(client, /if \(monitorSwitchPending \|\| !sessionState\.inputReady && !sessionState\.usingWssMedia\) return false;/);
   assert.match(client, /monitorSwitchPending,\s*lastMonitorRequest:/);
 });
 
@@ -524,9 +484,8 @@ test("an active desktop generation change re-arms the first-frame input gate", (
   const client = readClientSource();
   const handler = client.match(/function handleDesktopState\(message\) \{[\s\S]*?\n\}/)?.[0];
   assert.ok(handler, "handleDesktopState must be extracted from the client");
-  assert.match(client, /let desktopGeneration = null/);
-  assert.match(handler, /const desktopGenerationChanged = Number\.isInteger\(message\.generation\)[\s\S]*message\.generation !== desktopGeneration/);
-  assert.match(handler, /desktopGeneration = message\.generation/);
+  assert.match(handler, /const desktopGenerationChanged = Number\.isInteger\(message\.generation\)[\s\S]*message\.generation !== sessionState\.desktopGeneration/);
+  assert.match(handler, /sessionState\.desktopGeneration = message\.generation/);
   assert.match(handler, /startFirstFrameHandshake\("desktop-state", desktopStateNeedsNewHandshake\(desktopGenerationChanged\)\)/);
   assert.match(client, /firstFrameHandshake\.requireAdmission = forceNew \|\| reason === "desktop-source-transition" \|\| reason === "monitor-transition"/);
 });

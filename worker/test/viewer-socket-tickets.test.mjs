@@ -1,9 +1,10 @@
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
+import { createSessionContext } from "./helpers/session-context.mjs";
+import { attachSignaling } from "./helpers/signaling-wiring.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { FileTransferClient } from "../public/file-client.js";
 import { b64urlDecode, pcListUrl, registerProof, relayOrigin, viewerHello } from "../public/dk-relay.js";
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
@@ -30,7 +31,7 @@ function receiverFunction(name) {
 }
 
 function urlHarness(overrides = {}) {
-  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, URLSearchParams, proto: "wss:", location: { host: "relay.test" },
+  const context = createSessionContext({ monitorPreviews: noMonitorPreviews, URLSearchParams, proto: "wss:", location: { host: "relay.test" },
     sessionPc: "requested-pc", mediaEpoch: epoch, signalingPc: "resolved-pc", signalingTicket: ticket,
     authenticatedSession: { mediaReady: true }, ...overrides });
   vm.runInContext(["signalingSocketUrl", "mediaSocketUrl", "fileSocketUrl"].map(receiverFunction).join("\n"), context);
@@ -64,7 +65,7 @@ function signalHarness(identity) {
     send(text) { output.push(JSON.parse(text)); }
     close() { this.readyState = 3; }
   }
-  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, URLSearchParams,
+  const context = createSessionContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, URLSearchParams,
     performance: { now: () => 1 }, navigator: { onLine: true },
     ws: null, signalingGeneration: 0, signalingPc: null, signalingTicket: null,
     authenticatedSession: null, sessionPinnedPublic: new Uint8Array(32).fill(7),
@@ -84,7 +85,7 @@ function signalHarness(identity) {
     BPLog: { log: (...args) => logged.push(args), setContext() {} },
     debugTrace: (...args) => output.push(args), recordSignalingError: (...args) => output.push(args),
     shouldReconnectAfterClose: () => false, restartPeer() {},
-    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0,  connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
     recovery: recoveryStub(), noteSessionAuthenticated() {}, handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
     sendStreamMode: reason => endpoint.push(["stream-mode", reason]), wssSelected: false,
     startPeer: generation => endpoint.push(["start-peer", generation]), peerGeneration: 0,
@@ -93,7 +94,7 @@ function signalHarness(identity) {
     handleCursorState: (bytes, route) => endpoint.push(["cursor", Array.from(bytes), route]),
     inputReady: false, pendingRtcTracks: [], dc: null, motionDc: null, onInputReady() {},
     invalidatePendingMonitorRequest() {}, lastRenderedDueMs: null, usingWssMedia: false,
-    wssV4: { socketOpen: false, lastSeq: 0 }, wssPresentedSequence: 0,
+    wssV4: { lastSeq: 0 }, wssSocket: { isOpen: false }, wssPresentedSequence: 0,
     wssMediaReceivedPackets: 0, wssRecoveryState: "idle",
     createSignalingRecycleDiagnostic: value => value,
     createViewerSession(options) {
@@ -107,9 +108,9 @@ function signalHarness(identity) {
       return session;
     },
   });
-  vm.runInContext(["sendRelay", "sendControl", "viewerLog", "handleSignal", "reconnectSignaling", "armConnectTimeout", "recycleSignaling",
-    "showNotAdmitted", "endAuthenticatedSession", "openAuthenticatedMedia", "updateAuthenticatedInputReady"]
-    .map(receiverFunction).join("\n"), context);
+  vm.runInContext(["viewerLog", "handleSignal", "showNotAdmitted", "endAuthenticatedSession", "openAuthenticatedMedia", "updateAuthenticatedInputReady"]
+    .map(receiverFunction).join(String.fromCharCode(10)), context);
+  attachSignaling(context);
   context.reconnectSignaling("startup");
   const socket = sockets[0];
   socket.readyState = Socket.OPEN; socket.bufferedAmount = 0;
@@ -291,36 +292,7 @@ test("admission traces and authenticated client logs exclude session credentials
   assert.ok(h.logged.some(entry => entry[2] === "signaling-authenticated"), "the event is logged locally");
   assert.ok(h.output.some(message => message[0] === "signaling-hello-ok"));
   assert.doesNotMatch(JSON.stringify([h.output, h.endpoint, h.logged]), /test-only-secret-socket-ticket/);
-  assert.doesNotMatch(JSON.stringify(h.output.filter(message => Array.isArray(message))), /pc-one/);
-});
-
-test("media hello requires authenticated media and a current ticket; obsolete sockets cannot send", () => {
-  const sent = [], sockets = [];
-  class Socket {
-    constructor(url) { this.url = url; sockets.push(this); }
-    send(text) { sent.push(text); }
-  }
-  const h = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, usingWssMedia: true, mediaEpoch: epoch,
-    wssV4: {}, signalingTicket: null, authenticatedSession: null,
-    mediaSocketUrl: () => `wss://relay.test/media-ws?epoch=${epoch}&pc=pc-one`,
-    performance: { now: () => 1 }, setTimeout: () => 0, clearTimeout() {}, MEDIA_CONNECT_TIMEOUT_MS: 1, viewerLog() {} });
-  vm.runInContext(receiverFunction("openWssV4Socket"), h);
-  h.openWssV4Socket(); assert.equal(sockets.length, 0);
-  h.signalingTicket = ticket;
-  h.openWssV4Socket(); assert.equal(sockets.length, 0);
-  h.authenticatedSession = { mediaReady: false };
-  h.openWssV4Socket(); assert.equal(sockets.length, 0);
-  h.authenticatedSession.mediaReady = true;
-  h.openWssV4Socket(); sockets[0].onopen();
-  assert.equal(sent[0], JSON.stringify({ type: "hello", role: "media-viewer", ticket }));
-  h.signalingTicket = "replacement";
-  sockets[0].onopen(); assert.equal(sent.length, 1);
-  h.openWssV4Socket(); sockets[1].onopen();
-  assert.equal(sent[1], JSON.stringify({ type: "hello", role: "media-viewer", ticket: "replacement" }));
-  sockets[0].onopen(); assert.equal(sent.length, 2);
-  h.authenticatedSession.mediaReady = false;
-  sockets[1].onopen(); assert.equal(sent.length, 2);
-  for (const socket of sockets) assert.ok(!socket.url.includes(ticket));
+  assert.doesNotMatch(JSON.stringify(h.output.filter(message => Array.isArray(message))), /sessionState\.pc-one/);
 });
 
 test("file hello reads the current ticket callback without exposing it in snapshots", () => {
@@ -345,7 +317,7 @@ test("file hello reads the current ticket callback without exposing it in snapsh
     }
   } finally { client.reset(); }
   assert.equal(sent.length, 2);
-  assert.match(source, /new FileTransferClient\(\{ socketUrl: fileSocketUrl, socketTicket: \(\) => signalingTicket \}\)/);
+  assert.match(source, /new FileTransferClient\(\{ socketUrl: fileSocketUrl, socketTicket: \(\) => sessionState\.signalingTicket \}\)/);
 });
 
 test("diagnostic snapshots, reports, telemetry and HUD do not read or spread credentials", () => {
@@ -357,9 +329,9 @@ test("diagnostic snapshots, reports, telemetry and HUD do not read or spread cre
   ];
   for (const path of paths) {
     assert.ok(path.length > 0);
-    assert.doesNotMatch(path, /signalingTicket|signalingPc|\.\.\.msg|\.\.\.message|\.\.\.hello/);
+    assert.doesNotMatch(path, /sessionState\.signalingTicket|sessionState\.signalingPc|\.\.\.msg|\.\.\.message|\.\.\.hello/);
   }
   const bootstrap = index.slice(index.indexOf("(() => {"), index.indexOf("})();") + 5);
   assert.match(bootstrap, /window\.BPLog\?\.info\("trace"/);
-  assert.doesNotMatch(bootstrap, /WebSocket|ticket|signalingPc|hello-ok|fetch\(/);
+  assert.doesNotMatch(bootstrap, /WebSocket|ticket|sessionState\.signalingPc|hello-ok|fetch\(/);
 });

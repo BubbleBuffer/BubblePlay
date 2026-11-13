@@ -97,6 +97,33 @@ fn wait_for<T>(timeout: Duration, mut check: impl FnMut() -> Option<T>) -> Optio
     }
 }
 
+/// The dev agent refuses to run elevated, so these tests cannot run in an elevated shell. The CI step that
+/// runs them with a basic-user token sets this variable, which turns a skip into a failure.
+const REQUIRE_UNELEVATED_ENV: &str = "BUBBLEPLAY_E2E_REQUIRE_UNELEVATED";
+/// Upper bound for the background connect of an `AdminAgentLink` to reach a final state.
+const LINK_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn skip_when_elevated() -> bool {
+    if !trust::is_process_elevated() {
+        return false;
+    }
+    assert!(
+        std::env::var_os(REQUIRE_UNELEVATED_ENV).is_none(),
+        "{REQUIRE_UNELEVATED_ENV} is set but this process is elevated"
+    );
+    eprintln!("skipped: the dev agent refuses to run elevated (run tests unelevated)");
+    true
+}
+
+/// The link connects on a background thread: inject until it has connected or fallen back.
+fn inject_until_settled(link: &mut AdminAgentLink, records: &[Record]) -> Option<(u32, i32)> {
+    wait_for(LINK_SETTLE_TIMEOUT, || {
+        let receipt = link.inject(records);
+        (receipt.is_some() || !matches!(link.state(), LinkState::Idle)).then_some(receipt)
+    })
+    .expect("the admin agent link did not settle")
+}
+
 fn wait_exit(child: &mut Child, timeout: Duration) -> Option<i32> {
     wait_for(timeout, || {
         child.try_wait().unwrap().map(|s| s.code().unwrap_or(-1))
@@ -134,8 +161,7 @@ fn open_raw(pipe: &str) -> std::fs::File {
 #[test]
 #[ignore = "injects real mouse input; run only in the authorized test VM"]
 fn dev_agent_receives_host_input_over_the_pipe() {
-    if trust::is_process_elevated() {
-        eprintln!("skipped: the dev agent refuses to run elevated (run tests unelevated)");
+    if skip_when_elevated() {
         return;
     }
     let dir = scratch("main");
@@ -165,7 +191,7 @@ fn dev_agent_receives_host_input_over_the_pipe() {
         data: 0,
         flags: MOUSEEVENTF_MOVE,
     };
-    assert_eq!(strict.inject(&[one]), None);
+    assert_eq!(inject_until_settled(&mut strict, &[one]), None);
     assert!(
         matches!(strict.state(), LinkState::Fallback(LinkError::Untrusted(_))),
         "{:?}",
@@ -230,8 +256,7 @@ fn dev_agent_receives_host_input_over_the_pipe() {
 
 #[test]
 fn incompatible_agent_makes_the_host_fall_back() {
-    if trust::is_process_elevated() {
-        eprintln!("skipped: the dev agent refuses to run elevated (run tests unelevated)");
+    if skip_when_elevated() {
         return;
     }
     let dir = scratch("newer");
@@ -259,7 +284,7 @@ fn incompatible_agent_makes_the_host_fall_back() {
         flags: MOUSEEVENTF_MOVE,
     };
     // None: the caller (InputSink) injects at user level instead.
-    assert_eq!(link.inject(&[one]), None);
+    assert_eq!(inject_until_settled(&mut link, &[one]), None);
     assert!(
         matches!(
             link.state(),
@@ -295,8 +320,7 @@ fn agent_refuses_to_run_unelevated_without_dev() {
 
 #[test]
 fn agent_refuses_a_pipe_name_someone_else_created() {
-    if trust::is_process_elevated() {
-        eprintln!("skipped: the dev agent refuses to run elevated (run tests unelevated)");
+    if skip_when_elevated() {
         return;
     }
     let dir = scratch("squat");

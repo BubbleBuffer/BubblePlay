@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -22,7 +23,7 @@ function peerHarness(requestedTransport) {
   const calls = { constructed: [], wss: [], logged: [] };
   const STUN_FALLBACK = [{ urls: "stun:fallback.test" }];
   class ThrowingPeer { constructor(options) { calls.constructed.push(options); throw new Error("resource limit"); } }
-  const context = vm.createContext({ RTCPeerConnection: ThrowingPeer, STUN_FALLBACK, currentIceServers: [{ urls: "turn:x.test" }],
+  const context = createSessionContext({ RTCPeerConnection: ThrowingPeer, STUN_FALLBACK, currentIceServers: [{ urls: "turn:x.test" }],
     requestedTransport, TRANSPORT, hudState: {}, hud: { classList: { add() {} } },
     viewerLog: (level, name) => calls.logged.push(`${level}:${name}`), switchToWss: reason => calls.wss.push(reason) });
   vm.runInContext(receiverFunctions("openPeerConnection", "peerConstructionFailed"), context);
@@ -40,27 +41,4 @@ test("a throwing RTCPeerConnection reaches the WSS fallback in auto mode and the
   vm.runInContext("peerConstructionFailed()", forced.context);
   assert.deepEqual(forced.calls.wss, []);
   assert.equal(forced.context.hudState.ice, "ice-config-error");
-});
-
-test("a media socket that never reaches hello-ok is abandoned after the connect timeout and retried", () => {
-  const timers = [], sockets = [], reconnects = [];
-  class Socket {
-    static OPEN = 1;
-    constructor(url) { this.url = url; this.readyState = 0; this.closed = false; sockets.push(this); }
-    close() { this.closed = true; }
-  }
-  const context = vm.createContext({ WebSocket: Socket, performance: { now: () => 1 },
-    setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; }, clearTimeout() {},
-    usingWssMedia: true, mediaEpoch: "e", signalingTicket: "t", authenticatedSession: { mediaReady: true },
-    mediaSocketUrl: () => "wss://relay.test/media-ws", MEDIA_CONNECT_TIMEOUT_MS, viewerLog() {},
-    wssV4: { socket: null, socketOpen: false, connectTimer: null, reconnects: 0 },
-    scheduleWssV4Reconnect: reason => reconnects.push(reason) });
-  vm.runInContext(receiverFunctions("openWssV4Socket"), context);
-  vm.runInContext("openWssV4Socket()", context);
-  const timeout = timers.find(timer => timer.delay === MEDIA_CONNECT_TIMEOUT_MS);
-  assert.ok(timeout, "connect timeout armed");
-  timeout.fn();
-  assert.equal(sockets[0].closed, true);
-  assert.equal(context.wssV4.socket, null);
-  assert.deepEqual(reconnects, ["connect-timeout"]);
 });

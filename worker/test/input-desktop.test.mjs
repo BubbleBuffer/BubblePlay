@@ -155,7 +155,7 @@ test("receiver wires physical keys, keyboard lock, wheel accumulation and clipbo
   const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8");
   const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
   assert.match(client, /controlState: inputControlState/);
-  assert.match(client, /function inputControlState\(\) \{\s*if \(!authenticatedSession\?\.mediaReady\) return "down";\s*if \(desktopInputState !== "enabled" \|\| !desktopAvailable\) return "down";\s*if \(desktopAwaitingFrame\) return inputTransitionHold && .*\? "gated" : "down";/);
+  assert.match(client, /function inputControlState\(\) \{\s*if \(!sessionState\.authenticatedSession\?\.mediaReady\) return "down";\s*if \(sessionState\.desktopInputState !== "enabled" \|\| !sessionState\.desktopAvailable\) return "down";\s*if \(sessionState\.desktopAwaitingFrame\) return sessionState\.inputTransitionHold && .*\? "gated" : "down";/);
   assert.match(client, /function releaseInput\(send = true\)/);
   assert.match(client, /input\.physicalKey\(e\.code, false\)/);
   assert.match(client, /input\.physicalKey\(e\.code, true\)/);
@@ -169,7 +169,7 @@ test("receiver wires physical keys, keyboard lock, wheel accumulation and clipbo
   assert.match(client, /document\.addEventListener\("fullscreenchange", updateKeyboardLock\)/);
   assert.match(client, /case "clipboard":\s*receiveRemoteClipboard\(msg\);/);
   assert.match(client, /case "host-capabilities":\s*applyInputCapabilities\(null\);/, "stale capabilities reset when a host (re)announces");
-  assert.match(client, /clipboardSyncEnabled\(\) \{ return hostInputCapabilities\.clipboard && desktopKind !== "secure"/);
+  assert.match(client, /clipboardSyncEnabled\(\) \{ return hostInputCapabilities\.clipboard && sessionState\.desktopKind !== "secure"/);
   assert.match(client, /remoteClipboardWriter\.receive\(content, document\.hasFocus\(\)\)/);
   assert.match(html, /<button id="remote-clipboard" type="button" hidden[^>]*>Copy remote clipboard<\/button>/);
 });

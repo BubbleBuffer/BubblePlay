@@ -819,5 +819,5 @@ test("the receiver consults native presentation before the automatic WSS fallbac
   assert.match(receiver,
     /createRtcStartupFallback\(\{[\s\S]*?nativeFramesPresented: nativePresentation\?\.generation === generation/);
   assert.match(receiver,
-    /rtcStartupFallback\?\.stop\(\);[\s\S]{0,400}?markFirstFramePresented\(null, null, \{ rtpTimestamp \}\);/);
+    /sessionState\.rtcStartupFallback\?\.stop\(\);[\s\S]{0,400}?markFirstFramePresented\(null, null, \{ rtpTimestamp \}\);/);
 });

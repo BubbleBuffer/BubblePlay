@@ -28,6 +28,9 @@ use base64::Engine as _;
 use serde_json::json;
 
 pub const SIGNALING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Log line once the signaling Worker accepted the host registration. The tray reads it from the host
+/// output to end update probation, so both sides use this constant.
+pub const REGISTERED_MARKER: &str = "signaling registered as host";
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(45);
 const WORKER_VERSION_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 /// Failed probes back off by doubling up to this interval.
@@ -1367,7 +1370,7 @@ impl Signaling {
         // Publish the authoritative list immediately after every registration.
         ws.send(Message::text(device_protocol.admit_message().to_string()))?;
         set_nonblocking(&mut ws)?;
-        info!("signaling registered as host");
+        info!("{REGISTERED_MARKER}");
         Ok(Self {
             ws,
             route,

@@ -1,0 +1,19 @@
+{
+  "app": {
+    "// ignore:": 5,
+    "empty catch": 26
+  },
+  "client-win": {
+    "#[allow(": 21
+  },
+  "host": {
+    "#[allow(": 43,
+    "empty catch": 7
+  },
+  "relay-rs": {
+    "#[allow(": 8
+  },
+  "worker": {
+    "empty catch": 1
+  }
+}

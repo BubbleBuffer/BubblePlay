@@ -1,3 +1,4 @@
+import { sessionSandbox } from "./helpers/session-context.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -83,7 +84,7 @@ function receiverHarness({ autoCopy = false, clipboard = {}, compare = async () 
   const keydownBlock = receiver.slice(keydownStart, receiver.indexOf('document.addEventListener("keyup",', keydownStart));
   const settingStart = receiver.indexOf('const clipboardAutoCopySwitch =');
   const settingBlock = receiver.slice(settingStart, receiver.indexOf('const scrollSpeedSelect =', settingStart));
-  runInNewContext(`${clipboardBlock}\n${keydownBlock}\n${settingBlock}\nthis.writer = remoteClipboardWriter; this.receive = receiveRemoteClipboard; applyInputCapabilities({ protocol: 1, clipboard: true });`, context);
+  runInNewContext(`${clipboardBlock}\n${keydownBlock}\n${settingBlock}\nthis.writer = remoteClipboardWriter; this.receive = receiveRemoteClipboard; applyInputCapabilities({ protocol: 1, clipboard: true });`, sessionSandbox(context));
   const key = (key = "v", modifier = "ctrlKey") => {
     let prevented = false;
     documentEvents.get("keydown")({ key, code: `Key${key.toUpperCase()}`, [modifier]: true, preventDefault() { prevented = true; } });

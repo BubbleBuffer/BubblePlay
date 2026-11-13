@@ -87,9 +87,19 @@ node tools/check.mjs          # all deterministic checks, offline Rust resolutio
 node tools/check.mjs client   # Node tests and all JavaScript/inline-script syntax
 node tools/check.mjs host     # Rust tests and checks across all targets
 node tools/check.mjs syntax   # syntax only
+node tools/check.mjs lint     # lint gates: file length, suppressions, ESLint (shrink-only baselines in tools/lint/)
 ```
 
 The checker uses the current Node executable directly. Missing dependencies fail the offline check rather than triggering installation.
+
+## Relay deployment
+
+`node tools/deploy-relay.mjs --config <wrangler.prod.toml>` builds the relay Worker bundle with the pinned
+`worker-build`, stamps `relay-rs/worker/build/BUILD_INFO.json` with the commit, refuses a dirty tree or a bundle
+older than HEAD, and runs a `wrangler deploy --dry-run`. `--deploy` publishes with the commit as the
+`BUILD_COMMIT` var and the deployment message. `--skip-build` uses the bundle already in `relay-rs/worker/build`,
+for example the `relay-worker-bundle` artifact of the CI run for the same commit. `--plan` prints the steps only.
+The production config is an input and stays untracked.
 
 ## Desktop tray deployment
 
