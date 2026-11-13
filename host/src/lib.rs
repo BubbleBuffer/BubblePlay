@@ -81,3 +81,6 @@ pub(crate) mod test_tracing {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
+
+#[cfg(test)]
+mod input_contract_tests;

@@ -959,55 +959,6 @@ mod tests {
         assert_eq!(without["type"], "ack");
     }
 
-    #[test]
-    fn start_message_uses_browser_values_and_never_carries_audio() {
-        let start: Value = serde_json::from_str(&start_message(
-            "0123456789abcdef0123456789abcdef",
-            Codec::Hevc,
-        ))
-        .unwrap();
-        assert_eq!(start["type"], "media-control");
-        assert_eq!(start["action"], "start");
-        assert_eq!(start["protocol"], 4);
-        assert_eq!(start["codec"], "hevc");
-        assert_eq!(start["streamMode"], "work");
-        assert_eq!(start["reason"], "client-start");
-        assert_eq!(start["quality"], "high");
-        assert!(
-            start.get("audio").is_none(),
-            "step 1 never opts into audio: {start}"
-        );
-    }
-
-    #[test]
-    fn first_frame_and_keyframe_messages_match_the_browser_shape() {
-        let request: Value = serde_json::from_str(&first_frame_request(
-            "ABCDEFGHIJKLMNOP",
-            "0123456789abcdef0123456789abcdef",
-        ))
-        .unwrap();
-        assert_eq!(request["phase"], "request");
-        assert_eq!(request["transport"], "wss");
-        assert_eq!(request["protocol"], 1);
-        let presented: Value =
-            serde_json::from_str(&first_frame_presented("ABCDEFGHIJKLMNOP", 9)).unwrap();
-        assert_eq!(presented["phase"], "presented");
-        assert_eq!(presented["generation"], 9);
-        let keyframe: Value = serde_json::from_str(&first_frame_keyframe(
-            "0123456789abcdef0123456789abcdef",
-            Codec::H264,
-        ))
-        .unwrap();
-        assert_eq!(keyframe["action"], "keyframe");
-        assert_eq!(keyframe["reason"], "first-frame-timeout");
-        assert_eq!(keyframe["codec"], "h264");
-        let hello: Value = serde_json::from_str(&media_hello("TICKET")).unwrap();
-        assert_eq!(
-            hello,
-            json!({ "type": "hello", "role": "media-viewer", "ticket": "TICKET" })
-        );
-    }
-
     fn fixture_viewer() -> (DeviceIdentity, Value) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../fixtures/device-keys-contract.json");

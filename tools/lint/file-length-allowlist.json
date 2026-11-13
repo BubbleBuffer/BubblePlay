@@ -20,7 +20,7 @@
   "client-win/src/net/input.rs": 943,
   "client-win/src/net/integration_contract_tests.rs": 802,
   "client-win/src/net/phase2.rs": 1406,
-  "client-win/src/net/protocol.rs": 1228,
+  "client-win/src/net/protocol.rs": 1179,
   "client-win/src/net/session.rs": 2636,
   "client-win/src/net/session_tests.rs": 1659,
   "client-win/src/net/webrtc/channels.rs": 608,

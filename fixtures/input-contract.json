@@ -764,5 +764,26 @@
       0,
       65
     ]
-  ]
+  ],
+  "pointerKeyTextPackets": {
+    "note": "Browser to host packets of types 0, 1, 4, 6 to 11, as bytes (hex, little-endian) and decoded fields. Encoders (browser, Kotlin, client-win) must produce hex from decoded; decoders (client-win, host) must produce decoded from hex. seq is a u16 and wraps; dx, dy, wheelX and wheelY are i16; x and y are u16. Types 2, 3 and 5 are legacy, decoded by the host only. Types 12 and 13 are in packets above.",
+    "textMaxBytes": 512,
+    "textChunkBytes": 500,
+    "vectors": [
+      { "name": "key-down", "hex": "004100", "decoded": { "kind": "key", "vk": 65, "up": false } },
+      { "name": "key-up-high-vk", "hex": "01a501", "decoded": { "kind": "key", "vk": 421, "up": true } },
+      { "name": "buttons", "hex": "0415", "decoded": { "kind": "buttons", "mask": 21 } },
+      { "name": "release-all", "hex": "06", "decoded": { "kind": "releaseAll" } },
+      { "name": "motion", "hex": "0701000500fbff00007800", "decoded": { "kind": "motion", "seq": 1, "dx": 5, "dy": -5, "wheelX": 0, "wheelY": 120 } },
+      { "name": "motion-extremes-seq-wrap", "hex": "07ffff0080ff7fffff0100", "decoded": { "kind": "motion", "seq": 65535, "dx": -32768, "dy": 32767, "wheelX": -1, "wheelY": 1 } },
+      { "name": "motion-zero", "hex": "0700000000000000000000", "decoded": { "kind": "motion", "seq": 0, "dx": 0, "dy": 0, "wheelX": 0, "wheelY": 0 } },
+      { "name": "absolute", "hex": "08020034127856", "decoded": { "kind": "absolute", "seq": 2, "x": 4660, "y": 22136 } },
+      { "name": "absolute-max", "hex": "08ffffffff0000", "decoded": { "kind": "absolute", "seq": 65535, "x": 65535, "y": 0 } },
+      { "name": "buttons-at", "hex": "0903006400c80003", "decoded": { "kind": "buttonsAt", "seq": 3, "x": 100, "y": 200, "mask": 3 } },
+      { "name": "cursor-sync", "hex": "0a0201", "decoded": { "kind": "cursorSync", "seq": 258 } },
+      { "name": "cursor-sync-wrap", "hex": "0affff", "decoded": { "kind": "cursorSync", "seq": 65535 } },
+      { "name": "text", "hex": "0b68c3a9", "decoded": { "kind": "text", "text": "hé" } }
+    ],
+    "malformedHex": ["", "63", "0041", "00410000", "04", "041500", "0600", "0701000500", "08010001", "090100", "0a01", "0a010203", "0b"]
+  }
 }
