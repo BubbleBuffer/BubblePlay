@@ -183,7 +183,10 @@ jobs:
         run: |
           worker_build="$(sed -n 's/^worker = "=\(.*\)"/\1/p' relay-rs/worker/Cargo.toml)"
           printf '{"commit":"%s","builtAt":"%s","workerBuild":"%s"}\n' "$GITHUB_SHA" "$(date -u +%FT%TZ)" "$worker_build" > relay-rs/worker/build/BUILD_INFO.json
-      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+      # Only master builds are deployed, so pull requests do not spend artifact storage (a full quota failed
+      # a green relay job on a host-only PR).
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: relay-worker-bundle
           path: relay-rs/worker/build/
