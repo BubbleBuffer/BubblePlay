@@ -1,11 +1,12 @@
 import test from "node:test";
+import { attachSignaling } from "./helpers/signaling-wiring.mjs";
 import { createSessionContext } from "./helpers/session-context.mjs";
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import { OFFER_FAILURE_LIMIT } from "../public/recovery.js";
-import { V4_BACKOFF_JITTER_FRACTION, V4_BACKOFF_MAX_MS, V4_BACKOFF_MIN_MS, jitteredBackoffMsV4, nextBackoffMsV4 } from "../public/media-v4.js";
+import { V4_BACKOFF_JITTER_FRACTION, V4_BACKOFF_MAX_MS, V4_BACKOFF_MIN_MS } from "../public/media-v4.js";
 import { TRANSPORT } from "../public/transport.js";
 
 // Behaviour of receiver.js paths that are not modules yet, run in a vm sandbox as the other receiver tests do.
@@ -31,12 +32,12 @@ function signalingHarness(random) {
     inputStatusReason: null, latestInputStatus: null, terminalSignalingFailure: false, reconnectTimer: null, ws: null,
     signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null, hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, recordSignalingError() {},
-    shouldReconnectAfterClose: () => true, restartPeer() {}, cleanupPeer() {}, handleSignal() {}, clearTimeout() {},
-    armConnectTimeout() {}, connectTimer: null, pendingConnect: null, signalingBackoffMs: 0,
-    nextBackoffMsV4, jitteredBackoffMsV4: ms => jitteredBackoffMsV4(ms, random),
+    restartPeer() {}, cleanupPeer() {}, handleSignal() {}, clearTimeout() {},
+    connectTimer: null, pendingConnect: null, signalingBackoffMs: 0,
     setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; } });
-  vm.runInContext(receiverFunctions("reconnectSignaling", "noteSessionAuthenticated"), context);
-  vm.runInContext('reconnectSignaling("startup");', context);
+  vm.runInContext(receiverFunctions("noteSessionAuthenticated"), context);
+  attachSignaling(context, { random });
+  context.reconnectSignaling("startup");
   const lose = async () => {
     const dead = sockets.at(-1);
     dead.readyState = 3;

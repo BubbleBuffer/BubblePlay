@@ -12,6 +12,7 @@ import {
   rtcPeerEndAction,
 } from "/recovery.js";
 import { createOnceReporter } from "/report.js";
+import { createSignalingSocket } from "/signaling-socket.js";
 import { createKeyboardDraft } from "/keyboard-draft.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
@@ -774,19 +775,6 @@ function isCurrentPeer(generation, candidate = sessionState.pc) {
   return generation === sessionState.peerGeneration && candidate === sessionState.pc;
 }
 
-// Relay-level messages only: hello, register-proof and the keepalive ping.
-function sendRelay(message) {
-  if (sessionState.ws?.readyState !== WebSocket.OPEN) return false;
-  sessionState.ws.send(JSON.stringify(message));
-  return true;
-}
-
-// Every endpoint JSON message on /ws is encrypted; relay messages use sendRelay instead.
-function sendControl(message) {
-  if (!sessionState.signalingRegistered || sessionState.ws?.readyState !== WebSocket.OPEN) return false;
-  return sessionState.authenticatedSession?.sendControl(message) || false;
-}
-
 function recordHostEvidence(type) {
   sessionState.signalingHostEvidence = { seen: true, type, atMs: Date.now() };
 }
@@ -819,132 +807,27 @@ function handleSessionFailure(refusal, reason) {
   endAuthenticatedSession(refusal);
 }
 
-function reconnectSignaling(reason) {
-  if (sessionState.terminalSignalingFailure) return;
-  if (sessionState.reconnectTimer || sessionState.ws?.readyState === WebSocket.OPEN || sessionState.ws?.readyState === WebSocket.CONNECTING) return;
-  hudState.ws = `reconnecting (${reason})`;
-  const connect = () => {
-    sessionState.reconnectTimer = null;
-    sessionState.pendingConnect = null;
-    sessionState.latestInputStatus = null;
-    sessionState.inputStatusReason = null;
-    sessionState.authenticatedSession?.close();
-    sessionState.authenticatedSession = null;
-    const generation = ++sessionState.signalingGeneration;
-    recovery.noteConnectionOpened();
-    const socketUrl = signalingSocketUrl();
-    debugTrace("signaling-construct", {
-      path: new URL(socketUrl).pathname,
-      generation,
-      reason,
-    });
-    const socket = new WebSocket(socketUrl);
-    socket.binaryType = "arraybuffer";
-    sessionState.ws = socket;
-    armConnectTimeout(socket, generation);
-    let receiveQueue = Promise.resolve();
-    socket.onopen = () => {
-      if (sessionState.ws !== socket || generation !== sessionState.signalingGeneration) return;
-      clearTimeout(sessionState.connectTimer);
-      hudState.ws = "open";
-      debugTrace("signaling-open", { generation });
-      sendRelay(viewerHello({ identity: sessionState.sessionIdentity, turn: wantsTurn(params) }));
-    };
-    const handleClose = event => {
-      if (sessionState.ws !== socket || generation !== sessionState.signalingGeneration) return;
-      clearTimeout(sessionState.connectTimer);
-      const admitted = sessionState.signalingRegistered;
-      recovery.noteLoss();
-      hudState.ws = "closed";
-      sessionState.latestInputStatus = null;
-      sessionState.inputStatusReason = null;
-      sessionState.signalingRegistered = false;
-      sessionState.signalingPc = null;
-      sessionState.signalingTicket = null;
-      sessionState.authenticatedSession?.close();
-      sessionState.authenticatedSession = null;
-      cleanupPeer();
-      recordSignalingError("socket-close", `WebSocket closed (${event.code})`, { code: event.code, reason: event.reason || "" });
-      debugTrace("signaling-close", { generation, code: event.code, reason: event.reason || "" });
-      viewerLog(event.code === 1008 ? "warn" : "info", "signaling-close", { generation, closeCode: event.code, reason: event.reason || "", admitted });
-      hud.classList.add("bad");
-      if (event.code === 1008) {
-        // Policy close: refused before hello-ok, or dropped from the PC's list. Never reconnect.
-        sessionState.terminalSignalingFailure = true;
-        releaseInput();
-        if (!admitted) showNotAdmitted(event.reason);
-        return;
-      }
-      if (!shouldReconnectAfterClose(event.code, sessionState.terminalSignalingFailure)) {
-        sessionState.terminalSignalingFailure = true;
-        return;
-      }
-      restartPeer("ws-closed", false);
-      reconnectSignaling("ws-closed");
-    };
-    socket.onerror = () => { if (sessionState.ws === socket) { hudState.ws = "error"; recordSignalingError("socket-error", "WebSocket signaling error"); debugTrace("signaling-error", { generation }); } };
-    // WebCrypto yields between messages. Preserve wire order across hello-ok,
-    // auth-host and ctl rather than letting WebSocket callbacks race each other.
-    socket.onmessage = ev => {
-      if (sessionState.ws === socket) sessionState.signalingInboundMs = performance.now();
-      receiveQueue = receiveQueue.then(() => handleSignal(socket, generation, ev)).catch(error => {
-        if (sessionState.ws === socket && generation === sessionState.signalingGeneration) viewerLog("error", "signaling-message-failed", { error: String(error?.message || error), stack: String(error?.stack || "") });
-        if (sessionState.ws === socket && generation === sessionState.signalingGeneration) endAuthenticatedSession({ title: "Session ended", body: "A control message failed its integrity check, so the session was closed." });
-      });
-    };
-    socket.onclose = event => {
-      // A final encrypted refusal precedes close on the wire, but decryption
-      // may still be running. Let that refusal decide whether to reconnect.
-      receiveQueue = receiveQueue.then(() => handleClose(event));
-    };
-  };
-  if (reason === "startup") connect();
-  else {
-    sessionState.signalingBackoffMs = nextBackoffMsV4(sessionState.signalingBackoffMs);
-    sessionState.pendingConnect = connect;
-    sessionState.reconnectTimer = setTimeout(connect, jitteredBackoffMsV4(sessionState.signalingBackoffMs));
-  }
-}
-
-// A reconnect of an established session abandons a socket that has not opened in time (5, 7.5, then
-// 10 s) and tries a new one. Handlers are detached first so a late event of the old socket is ignored.
-function armConnectTimeout(socket, generation) {
-  clearTimeout(sessionState.connectTimer);
-  const waitedMs = recovery.connectTimeoutMs();
-  if (waitedMs === null) return;
-  sessionState.connectTimer = setTimeout(() => {
-    if (sessionState.ws !== socket || generation !== sessionState.signalingGeneration || socket.readyState !== WebSocket.CONNECTING) return;
-    viewerLog("info", "signaling-connect-abandoned", { connectAttempt: recovery.attempts, waitedMs });
-    socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
-    sessionState.ws = null;
-    sessionState.signalingGeneration++;
-    try { socket.close(); } catch { /* already closed */ }
-    reconnectSignaling("connect-timeout");
-  }, waitedMs);
-}
-
-// The page was frozen or came back online: a pending reconnect retries now instead of waiting for a timer.
-function wakeReconnect(event) {
-  if (!shouldRetryOnWake({ timerPending: sessionState.reconnectTimer !== null && sessionState.pendingConnect !== null,
-    terminal: sessionState.terminalSignalingFailure, connecting: sessionState.ws?.readyState === WebSocket.CONNECTING })) return;
-  const connect = sessionState.pendingConnect;
-  clearTimeout(sessionState.reconnectTimer); sessionState.reconnectTimer = null; sessionState.pendingConnect = null;
-  viewerLog("info", "reconnect-wake", { event });
-  connect();
-}
-
 function signalingSocketUrl() {
   return `${proto}//${location.host}/ws?pc=${encodeURIComponent(sessionState.sessionPc)}`;
 }
 
-function recycleSignaling(reason) {
-  if (sessionState.terminalSignalingFailure) return;
-  recovery.noteLoss();
-  sessionState.latestInputStatus = null;
-  sessionState.inputStatusReason = null;
-  invalidatePendingMonitorRequest(reason);
-  const renderedAgeMs = lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs;
-  const diagnostic = createSignalingRecycleDiagnostic({
+const signaling = createSignalingSocket({
+  state: sessionState,
+  get recovery() { return recovery; },
+  hudState,
+  url: () => signalingSocketUrl(),
+  hello: () => viewerHello({ identity: sessionState.sessionIdentity, turn: wantsTurn(params) }),
+  handleSignal: (socket, generation, ev) => handleSignal(socket, generation, ev),
+  cleanupPeer: () => cleanupPeer(),
+  restartPeer: (reason, reconnect) => restartPeer(reason, reconnect),
+  markBad: () => hud.classList.add("bad"),
+  onPolicyClose: ({ admitted, reason }) => { releaseInput(); if (!admitted) showNotAdmitted(reason); },
+  onMessageFailed: error => {
+    viewerLog("error", "signaling-message-failed", { error: String(error?.message || error), stack: String(error?.stack || "") });
+    endAuthenticatedSession({ title: "Session ended", body: "A control message failed its integrity check, so the session was closed." });
+  },
+  invalidateMonitor: reason => invalidatePendingMonitorRequest(reason),
+  recycleDiagnostic: reason => createSignalingRecycleDiagnostic({
     reason,
     signalingGeneration: sessionState.signalingGeneration,
     signalingRegistered: sessionState.signalingRegistered,
@@ -956,25 +839,15 @@ function recycleSignaling(reason) {
     presented: sessionState.wssPresentedSequence,
     receivedPackets: sessionState.wssMediaReceivedPackets,
     recoveryState: sessionState.wssRecoveryState,
-    renderedAgeMs,
+    renderedAgeMs: lastRenderedDueMs === null ? null : performance.now() - lastRenderedDueMs,
     online: navigator.onLine,
-  });
-  sessionState.lastSignalingRecycle = { ...diagnostic, atMs: Date.now() };
-  debugTrace("signaling-recycle", diagnostic);
-  viewerLog("warn", "signaling-recycle", diagnostic);
-  // Invalidate first so the intentional close cannot restart a peer with
-  // credentials from the old signaling epoch.
-  const socket = sessionState.ws;
-  sessionState.ws = null;
-  sessionState.signalingRegistered = false;
-  sessionState.signalingPc = null;
-  sessionState.signalingTicket = null;
-  sessionState.authenticatedSession?.close();
-  sessionState.authenticatedSession = null;
-  sessionState.signalingGeneration++;
-  try { socket?.close(1000, reason); } catch { /* already closed */ }
-  reconnectSignaling(reason);
-}
+  }),
+  log: (level, event, detail) => viewerLog(level, event, detail),
+  trace: (stage, detail) => debugTrace(stage, detail),
+  recordError: (kind, message, detail) => recordSignalingError(kind, message, detail),
+  now: () => performance.now(),
+});
+const { sendRelay, sendControl, reconnect: reconnectSignaling, recycle: recycleSignaling, wake: wakeReconnect } = signaling;
 
 async function handleSignal(socket, generation, ev) {
   if (sessionState.ws !== socket || generation !== sessionState.signalingGeneration) return;

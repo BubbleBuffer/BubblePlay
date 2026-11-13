@@ -27,8 +27,7 @@ test("external debug attempts report before module imports and across the WSS pr
   assert.match(client, /debugAttempt/);
   assert.match(client, /trace\("bootstrap-inline"/);
   for (const stage of [
-    "module-ready", "signaling-construct", "signaling-open",
-    "signaling-hello-ok", "media-first-packet",
+    "module-ready", "signaling-hello-ok", "media-first-packet",
     "decoder-configured", "decoder-first-output", "first-presented",
   ]) assert.match(client, new RegExp(`debugTrace\\(\"${stage}\"`));
 });
@@ -267,21 +266,8 @@ test("BubbleBuffer edge instrument replaces purple glass and exposes adaptive se
   assert.doesNotMatch(styles, /#7c3aed|#9b6cff|backdrop-filter|linear-gradient|radial-gradient/i);
 });
 
-test("client starts a new signaling and peer epoch after relay loss or peer departure", () => {
-  const client = readClientSource();
-  assert.match(client, /function reconnectSignaling\(reason\)/);
-  assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
-  const reconnect = client.match(/function reconnectSignaling\(reason\) \{[\s\S]*?\n\}/)?.[0];
-  assert.ok(reconnect);
-  assert.match(reconnect, /socket\.onclose = event => \{[\s\S]*receiveQueue = receiveQueue\.then\(\(\) => handleClose\(event\)\);/);
-  assert.match(reconnect, /const handleClose = event => \{[\s\S]*sessionState\.authenticatedSession\?\.close\(\);[\s\S]*cleanupPeer\(\);[\s\S]*restartPeer\("ws-closed", false\);\s*reconnectSignaling\("ws-closed"\);/);
-  assert.match(client, /const generation = \+\+sessionState\.peerGeneration/);
-  assert.match(client, /sessionState\.pendingRemoteIce/);
-});
-
 test("browser signaling sends the signed viewer hello and never stores an application secret", () => {
   const client = readClientSource();
-  assert.match(client, /sendRelay\(viewerHello\(\{ identity: sessionState\.sessionIdentity, turn: wantsTurn\(params\) \}\)\)/);
   assert.doesNotMatch(client, /bp_token|BubblePlay token|hello", token/);
   assert.doesNotMatch(client, /localStorage[^\n]*(privateKey|sessionState\.sessionIdentity)/);
 });
@@ -350,13 +336,6 @@ test("QoS polling continues after ICE reaches completed", () => {
   assert.doesNotMatch(client, /sessionState\.pc\.iceConnectionState\s*!==\s*"sessionState\.connected"/);
 });
 
-test("worker policy closure is terminal while transient websocket closure reconnects", () => {
-  const client = readClientSource();
-  assert.match(client, /shouldReconnectAfterClose\(event\.code, sessionState\.terminalSignalingFailure\)/);
-  assert.match(client, /sessionState\.terminalSignalingFailure/);
-  assert.match(client, /reconnectSignaling\("ws-closed"\)/);
-});
-
 test("client applies validated ephemeral ICE configuration and keeps route diagnostics private", () => {
   const client = readClientSource();
   assert.match(client, /from "\/turn\.js"/);
@@ -406,26 +385,8 @@ test("WSS hybrid presentation parses before decode and composites only after the
   assert.match(client, /wssMedia:\s*\{[\s\S]*hybrid:\s*wssHybridSnapshot\(\)/);
 });
 
-test("peer departure recycles signaling before another peer offer", () => {
+test("the diagnostics snapshot exposes the last signaling recycle", () => {
   const client = readClientSource();
-  assert.match(client, /case "peer-left":\s*recycleSignaling\("peer-left"\);\s*restartPeer\("peer-left", false\);/);
-  assert.match(client, /function recycleSignaling\(reason\)/);
-});
-
-test("intentional signaling recycle retains its initiator before invalidating the old epoch", () => {
-  const client = readClientSource();
-  const recycle = client.match(/function recycleSignaling\(reason\) \{([\s\S]*?)\n\}/)?.[1];
-  assert.ok(recycle, "recycleSignaling must be extracted from the client");
-  assert.match(recycle, /createSignalingRecycleDiagnostic\(\{/);
-  assert.match(recycle, /reason,[\s\S]*sessionState\.signalingGeneration,[\s\S]*sessionState\.signalingRegistered,/);
-  assert.match(recycle, /socketReadyState:\s*sessionState\.ws\?\.readyState\s*\?\?\s*null/);
-  assert.match(recycle, /sessionState\.usingWssMedia,[\s\S]*mediaSocketOpen:/);
-  assert.match(recycle, /mediaGeneration:[\s\S]*reconstructed:[\s\S]*presented:[\s\S]*receivedPackets:/);
-  assert.match(recycle, /sessionState\.lastSignalingRecycle\s*=\s*\{\s*\.\.\.diagnostic,\s*atMs:\s*Date\.now\(\)\s*\}/);
-  const emittedAt = recycle.indexOf('viewerLog("warn", "signaling-recycle", diagnostic)');
-  const invalidatedAt = recycle.indexOf("ws = null");
-  assert.ok(emittedAt >= 0 && invalidatedAt > emittedAt,
-    "the diagnostic must use the still-open old signaling socket before it is invalidated");
   assert.match(client, /signaling:\s*\{[\s\S]*lastRecycle:\s*sessionState\.lastSignalingRecycle\s*\?\s*\{\s*\.\.\.sessionState\.lastSignalingRecycle\s*\}\s*:\s*null/);
 });
 
@@ -510,7 +471,6 @@ test("monitor control uses the signaling epoch and drops stale confirmations", (
   assert.match(client, /import \{\s*desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,[\s\S]*?\} from "\/monitor-selection\.js"/);
   // Both epoch restarts drop an outstanding confirmation instead of latching
   // monitor selection off for the rest of the page.
-  assert.match(client, /function recycleSignaling\(reason\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
   assert.match(client, /function restartPeer\(reason, reconnect = true\) \{[\s\S]*invalidatePendingMonitorRequest\(reason\);/);
   assert.match(client, /function invalidatePendingMonitorRequest\(reason\) \{[\s\S]*monitorRequestAfterRestart\(monitorSwitchPending, reason\)[\s\S]*monitorSwitchPending = null;/);
   // The monitor control is a signaling message; input data channels are not a

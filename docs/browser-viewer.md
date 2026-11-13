@@ -95,4 +95,5 @@ Settings has two groups that matter here.
 - `hud-text.js`: the text of the diagnostics HUD overlay (pure formatter).
 - `recovery-tracker.js`: the state of a recovery after a lost signaling connection (loss time, retry budget, attempts, suspended time) and its log line; the decisions are the pure functions in `recovery.js`.
 - `wss-media-socket.js`: the `/media-ws` socket: ticketed hello, connect timeout, heartbeat, reconnect on the media backoff. Packets and host presence go to the receiver through callbacks.
+- `signaling-socket.js`: the `/ws` socket: relay and encrypted-control sends, reconnect on the media backoff, connect timeout, wake retry and the recycle. Messages, peer clean-up and the policy-close screen go to the receiver through callbacks.
 - `session-state.js`: `createSessionState()`, the one object holding the session, peer, input and WSS state that signaling, the peer, WSS decode and the first-frame handshake share. `receiver.js` reads and writes it as `sessionState.<field>`.

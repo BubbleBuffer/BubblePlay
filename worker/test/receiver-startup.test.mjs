@@ -1,10 +1,10 @@
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import { createSessionContext } from "./helpers/session-context.mjs";
 import test from "node:test";
+import { attachSignaling } from "./helpers/signaling-wiring.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { createRtcStartupFallback, shouldFallbackToWssOnMissingRtp } from "../public/media.js";
 import { rememberedRtcFailure, rememberRtcFailure, rtcFailureStorage, RTC_FAILURE_STORAGE_KEY } from "../public/transport.js";
 import { rtcPeerEndAction } from "../public/recovery.js";
@@ -59,11 +59,11 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
     signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null,
     hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, recordSignalingError() {},
-    shouldReconnectAfterClose: () => true, restartPeer() {}, cleanupPeer() {}, handleSignal() {},
-    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
+    restartPeer() {}, cleanupPeer() {}, handleSignal() {},
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
   });
-  const fn = source.slice(source.indexOf("function reconnectSignaling("), source.indexOf("\nfunction signalingSocketUrl("));
-  vm.runInContext(fn + '\nreconnectSignaling("startup");', context);
+  attachSignaling(context);
+  context.reconnectSignaling("startup");
   assert.equal(sockets.length, 1);
   assert.equal(timers.length, 0);
   assert.equal(context.inputStatusReason, null);

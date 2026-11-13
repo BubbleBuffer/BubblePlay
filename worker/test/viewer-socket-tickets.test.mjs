@@ -1,10 +1,10 @@
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import { createSessionContext } from "./helpers/session-context.mjs";
+import { attachSignaling } from "./helpers/signaling-wiring.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { FileTransferClient } from "../public/file-client.js";
 import { b64urlDecode, pcListUrl, registerProof, relayOrigin, viewerHello } from "../public/dk-relay.js";
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
@@ -85,7 +85,7 @@ function signalHarness(identity) {
     BPLog: { log: (...args) => logged.push(args), setContext() {} },
     debugTrace: (...args) => output.push(args), recordSignalingError: (...args) => output.push(args),
     shouldReconnectAfterClose: () => false, restartPeer() {},
-    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0,  connectTimer: null, pendingConnect: null, setTimeout: () => 1, validateIceServers: () => [], renderAbout() {}, noteFileEpoch() {},
     recovery: recoveryStub(), noteSessionAuthenticated() {}, handleSessionFailure: (refusal) => context.endAuthenticatedSession(refusal),
     sendStreamMode: reason => endpoint.push(["stream-mode", reason]), wssSelected: false,
     startPeer: generation => endpoint.push(["start-peer", generation]), peerGeneration: 0,
@@ -108,9 +108,9 @@ function signalHarness(identity) {
       return session;
     },
   });
-  vm.runInContext(["sendRelay", "sendControl", "viewerLog", "handleSignal", "reconnectSignaling", "armConnectTimeout", "recycleSignaling",
-    "showNotAdmitted", "endAuthenticatedSession", "openAuthenticatedMedia", "updateAuthenticatedInputReady"]
-    .map(receiverFunction).join("\n"), context);
+  vm.runInContext(["viewerLog", "handleSignal", "showNotAdmitted", "endAuthenticatedSession", "openAuthenticatedMedia", "updateAuthenticatedInputReady"]
+    .map(receiverFunction).join(String.fromCharCode(10)), context);
+  attachSignaling(context);
   context.reconnectSignaling("startup");
   const socket = sockets[0];
   socket.readyState = Socket.OPEN; socket.bufferedAmount = 0;

@@ -1,11 +1,11 @@
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import { createSessionContext } from "./helpers/session-context.mjs";
 import test from "node:test";
+import { attachSignaling } from "./helpers/signaling-wiring.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createHash, createPrivateKey, hkdfSync, sign } from "node:crypto";
 import vm from "node:vm";
-import { nextBackoffMsV4 } from "../public/media-v4.js";
 import { createViewerSession, browserDeviceName, sessionRefusal } from "../public/dk-session.js";
 import { createCtlChannel } from "../public/dk-crypto.js";
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
@@ -536,13 +536,12 @@ test("receiver drains a final encrypted refusal before processing socket close o
     ws: null, signalingGeneration: 0, signalingRegistered: true, signalingPc: hs.pc.id, signalingTicket: "ticket",
     latestInputStatus: null, inputStatusReason: null, hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, cleanupPeer: () => calls.push("cleanup"),
-    recordSignalingError() {}, shouldReconnectAfterClose: (_code, terminal) => !terminal,
-    restartPeer: () => calls.push("restart"),
-    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, nextBackoffMsV4, jitteredBackoffMsV4: ms => ms,  connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
+    recordSignalingError() {},     restartPeer: () => calls.push("restart"),
+    clearTimeout() {}, connectTimeoutMs: () => null, signalingBackoffMs: 0, connectTimer: null, pendingConnect: null, setTimeout: (fn, delay) => { timers.push({ fn, delay }); return timers.length; },
     handleSignal: async () => { calls.push("decrypt-start"); await decrypting; context.terminalSignalingFailure = true; calls.push("refusal"); },
   });
-  const fn = source.slice(source.indexOf("function reconnectSignaling("), source.indexOf("\nfunction signalingSocketUrl("));
-  vm.runInContext(fn + '\nreconnectSignaling("startup");', context);
+  attachSignaling(context);
+  context.reconnectSignaling("startup");
   const socket = sockets[0];
   socket.readyState = 1;
   socket.onmessage({ data: '{"type":"ctl"}' });
