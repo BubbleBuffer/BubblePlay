@@ -1,4 +1,5 @@
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -30,7 +31,7 @@ function receiverFunction(name) {
 }
 
 function urlHarness(overrides = {}) {
-  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, URLSearchParams, proto: "wss:", location: { host: "relay.test" },
+  const context = createSessionContext({ monitorPreviews: noMonitorPreviews, URLSearchParams, proto: "wss:", location: { host: "relay.test" },
     sessionPc: "requested-pc", mediaEpoch: epoch, signalingPc: "resolved-pc", signalingTicket: ticket,
     authenticatedSession: { mediaReady: true }, ...overrides });
   vm.runInContext(["signalingSocketUrl", "mediaSocketUrl", "fileSocketUrl"].map(receiverFunction).join("\n"), context);
@@ -64,7 +65,7 @@ function signalHarness(identity) {
     send(text) { output.push(JSON.parse(text)); }
     close() { this.readyState = 3; }
   }
-  const context = vm.createContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, URLSearchParams,
+  const context = createSessionContext({ monitorPreviews: noMonitorPreviews, WebSocket: Socket, URL, URLSearchParams,
     performance: { now: () => 1 }, navigator: { onLine: true },
     ws: null, signalingGeneration: 0, signalingPc: null, signalingTicket: null,
     authenticatedSession: null, sessionPinnedPublic: new Uint8Array(32).fill(7),
@@ -291,7 +292,7 @@ test("admission traces and authenticated client logs exclude session credentials
   assert.ok(h.logged.some(entry => entry[2] === "signaling-authenticated"), "the event is logged locally");
   assert.ok(h.output.some(message => message[0] === "signaling-hello-ok"));
   assert.doesNotMatch(JSON.stringify([h.output, h.endpoint, h.logged]), /test-only-secret-socket-ticket/);
-  assert.doesNotMatch(JSON.stringify(h.output.filter(message => Array.isArray(message))), /pc-one/);
+  assert.doesNotMatch(JSON.stringify(h.output.filter(message => Array.isArray(message))), /sessionState\.pc-one/);
 });
 
 test("file hello reads the current ticket callback without exposing it in snapshots", () => {
@@ -316,7 +317,7 @@ test("file hello reads the current ticket callback without exposing it in snapsh
     }
   } finally { client.reset(); }
   assert.equal(sent.length, 2);
-  assert.match(source, /new FileTransferClient\(\{ socketUrl: fileSocketUrl, socketTicket: \(\) => signalingTicket \}\)/);
+  assert.match(source, /new FileTransferClient\(\{ socketUrl: fileSocketUrl, socketTicket: \(\) => sessionState\.signalingTicket \}\)/);
 });
 
 test("diagnostic snapshots, reports, telemetry and HUD do not read or spread credentials", () => {
@@ -328,9 +329,9 @@ test("diagnostic snapshots, reports, telemetry and HUD do not read or spread cre
   ];
   for (const path of paths) {
     assert.ok(path.length > 0);
-    assert.doesNotMatch(path, /signalingTicket|signalingPc|\.\.\.msg|\.\.\.message|\.\.\.hello/);
+    assert.doesNotMatch(path, /sessionState\.signalingTicket|sessionState\.signalingPc|\.\.\.msg|\.\.\.message|\.\.\.hello/);
   }
   const bootstrap = index.slice(index.indexOf("(() => {"), index.indexOf("})();") + 5);
   assert.match(bootstrap, /window\.BPLog\?\.info\("trace"/);
-  assert.doesNotMatch(bootstrap, /WebSocket|ticket|signalingPc|hello-ok|fetch\(/);
+  assert.doesNotMatch(bootstrap, /WebSocket|ticket|sessionState\.signalingPc|hello-ok|fetch\(/);
 });

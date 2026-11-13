@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -85,7 +86,7 @@ test("receiver sets both preferences HEVC first and preserves its capability fal
   ]) {
     const codecSession = createCodecSession({ transport: "webrtc", decoderPath: codec === "h264" ? "webcodecs" : "native" });
     let preferences = null, closed = false, restarted = false;
-    const context = vm.createContext({ codecSession, orderRtpCodecPreferences, rtpCodecMimeTypes,
+    const context = createSessionContext({ codecSession, orderRtpCodecPreferences, rtpCodecMimeTypes,
       RTCRtpReceiver: { getCapabilities: () => ({ codecs: caps }) },
       transceiver: { setCodecPreferences: value => { preferences = value; } },
       candidate: { close: () => { closed = true; } },

@@ -82,7 +82,7 @@ test("follow active window: the client sends the saved choice and shows the host
   const { readFileSync } = await import("node:fs");
   const client = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   // Exact wire shape from docs/architecture/follow-active-window.md.
-  assert.match(client, /sendControl\(\{ type: "media-control", action: "follow", follow: settings\.followWindow, protocol: WSS_PROTOCOL, epoch: mediaEpoch, reason: "user-follow" \}\)/);
+  assert.match(client, /sendControl\(\{ type: "media-control", action: "follow", follow: settings\.followWindow, protocol: WSS_PROTOCOL, epoch: sessionState\.mediaEpoch, reason: "user-follow" \}\)/);
   // Capability gate: integer version >= 1; resent once per host-capabilities while on.
   assert.match(client, /hostFollowCapable = Number\.isInteger\(message\.followWindow\) && message\.followWindow >= 1;/);
   assert.match(client, /if \(settings\.followWindow\) sendFollowWindow\(\);/);

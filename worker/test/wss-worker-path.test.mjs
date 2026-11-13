@@ -107,14 +107,14 @@ test("messages after the handshake reach the receiver and a worker error is fata
 
 test("receiver.js picks the path with the selector and keeps the main-thread fallback", () => {
   const client = read("receiver.js");
-  assert.match(client, /selectWssDecoderPath\(\{\s*requested: params\.get\("decoderPath"\),\s*supported: wssWorkerSupported\(\),\s*disabled: wssWorkerDisabled,/);
+  assert.match(client, /selectWssDecoderPath\(\{\s*requested: params\.get\("decoderPath"\),\s*supported: wssWorkerSupported\(\),\s*disabled: sessionState\.wssWorkerDisabled,/);
   assert.match(client, /if \(selectedWssDecoderPath\(\) === "worker"\) beginWssWorker\(\); else ensureMainCanvas\(\);/);
   // Worker failure and a missing worker both end on the main-thread path.
-  assert.match(client, /function failWssWorker\(reason\)[\s\S]*wssWorkerDisabled = true;[\s\S]*stopWssMedia\(\);[\s\S]*setTimeout\(requestWssMediaStart, 0\)/);
+  assert.match(client, /function failWssWorker\(reason\)[\s\S]*sessionState\.wssWorkerDisabled = true;[\s\S]*stopWssMedia\(\);[\s\S]*setTimeout\(requestWssMediaStart, 0\)/);
   assert.match(client, /"wss-worker-unavailable"[\s\S]*teardownWssWorker\(\);\s*ensureMainCanvas\(\);/);
   // The canvases come back whenever WSS stops, and the host start waits for the handshake.
-  assert.match(client, /function stopWssMedia\(\) \{\s*usingWssMedia = false;\s*teardownWssWorker\(\);/);
-  assert.match(client, /Promise\.all\(\[selectWssCodec\(\), wssAudioDecodable, wssWorkerInit\]\)/);
+  assert.match(client, /function stopWssMedia\(\) \{\s*sessionState\.usingWssMedia = false;\s*teardownWssWorker\(\);/);
+  assert.match(client, /Promise\.all\(\[selectWssCodec\(\), wssAudioDecodable, sessionState\.wssWorkerInit\]\)/);
   assert.match(client, /function teardownWssWorker\(\)[\s\S]*replaceTransferredCanvas\(\);\s*replaceTransferredSharpCanvas\(\);/);
 });
 
@@ -122,12 +122,12 @@ test("ACKs stay on receipt and report the worker decodedSeq; recovery and watchd
   const client = read("receiver.js");
   assert.match(client, /ACK on receipt[\s\S]*wssSocket\.send\(ackMessageV4\(\{[^}]*decodedSeq: wssV4\.decodedSeq[\s\S]*?decodeWssFrame\(\{/);
   assert.match(client, /function onWssWorkerFrameOut\(m\)[\s\S]*wssV4\.decodedSeq = m\.decodedSequence/);
-  assert.match(client, /function decodeWssFrame\(frame\) \{\s*if \(wssWorker\) \{\s*if \(wssWorker\.ready\) postWssFrameToWorker\(frame\);\s*return;/);
-  assert.match(client, /function onWssWorkerMessage\(m\)[\s\S]*if \(m\.epoch !== wssDecoderEpoch\) return;/);
+  assert.match(client, /function decodeWssFrame\(frame\) \{\s*if \(sessionState\.wssWorker\) \{\s*if \(sessionState\.wssWorker\.ready\) postWssFrameToWorker\(frame\);\s*return;/);
+  assert.match(client, /function onWssWorkerMessage\(m\)[\s\S]*if \(m\.epoch !== sessionState\.wssDecoderEpoch\) return;/);
   assert.match(client, /case "failure":[\s\S]*noteWssFailure\(m\.reason\)/);
   assert.match(client, /case "drop":[\s\S]*beginWssRecovery\(m\.recover\)/);
   assert.match(client, /case "key-fed": armWssKeyframeWatchdog\(\)/);
-  assert.match(client, /wssWorker\?\.post\(\{ type: "resync", epoch: wssDecoderEpoch, reason \}\)/);
+  assert.match(client, /sessionState\.wssWorker\?\.post\(\{ type: "resync", epoch: sessionState\.wssDecoderEpoch, reason \}\)/);
 });
 
 test("the worker keeps the main-thread policies: low latency, immediate draw, desynchronized canvas", () => {
@@ -147,7 +147,7 @@ test("the main thread no longer reads or sizes the canvas on the worker path", (
   const client = read("receiver.js");
   assert.match(client, /function screenDims\(\)/);
   assert.match(client, /videoContentRect\(activeVideo \|\| screenMedia\(\)\)/);
-  assert.match(client, /captureFrame\(\) \{\s*if \(wssWorker\) return captureFromWorker\(\);/);
+  assert.match(client, /captureFrame\(\) \{\s*if \(sessionState\.wssWorker\) return captureFromWorker\(\);/);
   // Nothing in the worker-mode bookkeeping touches canvas size or context.
   const handler = client.slice(client.indexOf("function onWssWorkerFrameOut"), client.indexOf("function onTrack("));
   assert.doesNotMatch(handler, /screen\.(?:width|height)\s*=|getContext|drawImage|toDataURL/);

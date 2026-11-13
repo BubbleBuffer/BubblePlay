@@ -1,3 +1,4 @@
+import { sessionSandbox } from "./helpers/session-context.mjs";
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -57,7 +58,7 @@ test("rejected presentation cannot replace native drop's accepted generation or 
       fileDropPresentedGeneration:7,fileDropPresentedViewportRevision:3,usingWssMedia:true,wssStartupRecoveries:1,
       hasPresentedFrame:false,desktopAwaitingFrame:true,inputTransitionHold:false,suppressDesktopTransitionOverlay:true,
       monitorPreviews:{onFirstFrame(){}},recovery:recoveryStub(),document:{body:{classList:{add(){}}}},debugTrace(){},clearFirstFrameWatchdog(){},renderDesktopState(){},showContextHint(){}};
-    context.result=runInNewContext(`${source}\nmarkFirstFramePresented(${generation},${revision})`,context);
+    context.result=runInNewContext(`${source}\nmarkFirstFramePresented(${generation},${revision})`,sessionSandbox(context));
     return context;
   };
   for(const rejected of [present({admitted:false},9,4),present({},8,4)]){

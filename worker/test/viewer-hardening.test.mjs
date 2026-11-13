@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -26,7 +27,7 @@ function signalingHarness(random) {
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
     close() { this.readyState = 3; }
   }
-  const context = vm.createContext({ WebSocket: Socket, URL, recovery: recoveryStub(),
+  const context = createSessionContext({ WebSocket: Socket, URL, recovery: recoveryStub(),
     inputStatusReason: null, latestInputStatus: null, terminalSignalingFailure: false, reconnectTimer: null, ws: null,
     signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null, hudState: {}, hud: { classList: { add() {} } },
     signalingSocketUrl: () => "wss://test.invalid/ws", debugTrace() {}, viewerLog() {}, recordSignalingError() {},
@@ -60,7 +61,7 @@ test("signaling reconnects back off to the cap with jitter and restart from the 
 
 function peerHarness(requestedTransport) {
   const calls = { restarts: [], wss: [], logged: [] };
-  const context = vm.createContext({ requestedTransport, TRANSPORT, OFFER_FAILURE_LIMIT, offerFailures: 0, hudState: {}, hud: { classList: { add() {} } },
+  const context = createSessionContext({ requestedTransport, TRANSPORT, OFFER_FAILURE_LIMIT, offerFailures: 0, hudState: {}, hud: { classList: { add() {} } },
     viewerLog: (level, name) => calls.logged.push(name), restartPeer: reason => calls.restarts.push(reason), switchToWss: reason => calls.wss.push(reason) });
   vm.runInContext(receiverFunctions("offerFailed"), context);
   return { context, calls };

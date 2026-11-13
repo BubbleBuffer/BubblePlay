@@ -1,4 +1,5 @@
 import { recoveryStub } from "./helpers/recovery-stub.mjs";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -52,7 +53,7 @@ test("startup constructs signaling immediately; socket reconnect retains its 250
     static OPEN = 1; static CONNECTING = 0;
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
   }
-  const context = vm.createContext({ WebSocket: Socket, URL, recovery: recoveryStub(),
+  const context = createSessionContext({ WebSocket: Socket, URL, recovery: recoveryStub(),
     inputStatusReason: "admin-required", latestInputStatus: { failedPackets: 2 },
     terminalSignalingFailure: false, reconnectTimer: null, ws: null,
     signalingGeneration: 0, signalingRegistered: false, authenticatedSession: null,
@@ -84,7 +85,7 @@ test("first-frame is requested directly after successful offer signaling", async
   const start = source.indexOf("    const offer = await candidate.createOffer();");
   const end = source.indexOf("  } catch (e)", start);
   const block = source.slice(start, end);
-  const context = vm.createContext({ generation: 3,
+  const context = createSessionContext({ generation: 3,
     candidate: { createOffer: async () => ({ sdp: "offer-sdp" }), setLocalDescription: async () => events.push("local-description") },
     isCurrentPeer: () => true, rtcOfferSignaled: false,
     sendControl: message => { events.push(message.type); return true; },
@@ -106,7 +107,7 @@ test("slow ICE renews an exhausted offer-time handshake; normal ICE retains its 
   const sent = [];
   const state = { requestId: null, phase: "idle", presented: false, timer: null };
   const candidate = { iceConnectionState: "connected" };
-  const context = vm.createContext({ firstFrameHandshake: state,
+  const context = createSessionContext({ firstFrameHandshake: state,
     WebSocket: { OPEN: 1 }, ws: { readyState: 1 }, rtcOfferSignaled: false,
     usingWssMedia: false, mediaEpoch: "epoch", useWebCodecs: false, transitionNeedsKeyframe: false,
     desktopAvailable: true, desktopAwaitingFrame: false,
@@ -258,7 +259,7 @@ test("terminal RTC failure falls back in auto mode; explicit RTC and transient d
     ["auto", "failed", true, "end-peer"],
   ]) {
     const events = [];
-    const context = vm.createContext({ isCurrentPeer: () => true,
+    const context = createSessionContext({ isCurrentPeer: () => true,
       rtcStartupFallback: { progress() {} }, usingWssMedia: usingWss, requestedTransport: transport,
       TRANSPORT: { AUTO: "auto" }, wssSelected: false, rtcPeerEndAction,
       endRtcPeerOnly: () => events.push("end-peer"),
@@ -279,7 +280,7 @@ test("ICE failure can rescue auto only once peer connection is no longer connect
   const handler = source.slice(source.indexOf("  candidate.oniceconnectionstatechange ="), source.indexOf("  candidate.ontrack ="));
   const events = [];
   const candidate = { iceConnectionState: "failed", connectionState: "connecting" };
-  const context = vm.createContext({ candidate, generation: 0, isCurrentPeer: () => true,
+  const context = createSessionContext({ candidate, generation: 0, isCurrentPeer: () => true,
     rtcStartupFallback: { progress() {} }, hudState: {}, connected: false,
     requestedTransport: "auto", TRANSPORT: { AUTO: "auto" }, usingWssMedia: false, wssSelected: false,
     switchToWss: reason => events.push(reason),

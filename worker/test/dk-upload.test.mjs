@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -13,7 +14,7 @@ const tick = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve
 
 // ---- the real logger in its own context (memory only) ---------------------------------------
 function makeLog(clock) {
-  const context = vm.createContext({ console: { warn() {}, error() {} }, addEventListener() {}, setTimeout: () => 1,
+  const context = createSessionContext({ console: { warn() {}, error() {} }, addEventListener() {}, setTimeout: () => 1,
     Date, JSON, Error, Promise, Set, Math, Number, String, Array, Object, RegExp, indexedDB: undefined });
   context.globalThis = context;
   vm.runInContext(SOURCE, context);

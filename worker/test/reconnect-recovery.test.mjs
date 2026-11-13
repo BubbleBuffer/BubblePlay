@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -49,7 +50,7 @@ function receiverHarness() {
   const suspend = createSuspendTracker();
   const log = (level, event, detail) => output.logs.push({ level, event, detail });
   const recovery = createRecoveryTracker({ now: () => now, log, suspend });
-  const context = vm.createContext({
+  const context = createSessionContext({
     recovery, viewerLog: log,
     recycleSignaling: reason => output.recycled.push(reason),
     endAuthenticatedSession: refusal => output.ended.push(refusal),
@@ -149,7 +150,7 @@ function signalingHarness({ recovering }) {
   }
   const recovery = createRecoveryTracker({ now: () => clock, log: () => {} });
   if (recovering) { recovery.noteAuthenticated(); recovery.noteLoss(); }
-  const context = vm.createContext({
+  const context = createSessionContext({
     ws: null, signalingGeneration: 0, reconnectTimer: null, pendingConnect: null, connectTimer: null,
     terminalSignalingFailure: false, recovery,
     hudState: {}, latestInputStatus: null, inputStatusReason: null, authenticatedSession: null,
