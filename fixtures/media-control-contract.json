@@ -1,0 +1,67 @@
+{
+  "note": "Viewer-to-host signaling messages that open and confirm a WSS media session. Each message is the exact JSON object a viewer sends; builtBy lists the viewers whose builder is checked against it. A viewer builds the message with the fixture's own values, so the test fails when a field, a value or the key set drifts.",
+  "unpinned": {
+    "browser": "worker/public/receiver.js builds first-frame, keyframe, monitor and follow messages inline in sendControl calls; its start message is assembled in the codec session. Naming these literals in a test needs a source slice or a refactor of a file owned by the viewer lane.",
+    "kotlin": "android Session.kt builds the same messages inline; no builder function to call from a test."
+  },
+  "clientMessages": [
+    {
+      "name": "start",
+      "builtBy": ["client-win"],
+      "hostParses": { "variant": "media-control", "action": "start" },
+      "json": {
+        "type": "media-control",
+        "action": "start",
+        "protocol": 4,
+        "epoch": "0123456789abcdef0123456789abcdef",
+        "codec": "hevc",
+        "streamMode": "work",
+        "reason": "client-start",
+        "quality": "high"
+      }
+    },
+    {
+      "name": "first-frame-request",
+      "builtBy": ["client-win"],
+      "hostParses": { "variant": "first-frame", "phase": "request" },
+      "json": {
+        "type": "first-frame",
+        "protocol": 1,
+        "phase": "request",
+        "requestId": "ABCDEFGHIJKLMNOP",
+        "transport": "wss",
+        "epoch": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "name": "first-frame-presented",
+      "builtBy": ["client-win"],
+      "hostParses": { "variant": "first-frame", "phase": "presented" },
+      "json": {
+        "type": "first-frame",
+        "protocol": 1,
+        "phase": "presented",
+        "requestId": "ABCDEFGHIJKLMNOP",
+        "generation": 9
+      }
+    },
+    {
+      "name": "first-frame-timeout-keyframe",
+      "builtBy": ["client-win"],
+      "hostParses": { "variant": "media-control", "action": "keyframe" },
+      "json": {
+        "type": "media-control",
+        "action": "keyframe",
+        "protocol": 4,
+        "epoch": "0123456789abcdef0123456789abcdef",
+        "reason": "first-frame-timeout",
+        "codec": "h264"
+      }
+    },
+    {
+      "name": "media-hello",
+      "builtBy": ["client-win"],
+      "json": { "type": "hello", "role": "media-viewer", "ticket": "TICKET" }
+    }
+  ]
+}

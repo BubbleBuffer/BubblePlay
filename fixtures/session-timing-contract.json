@@ -1,0 +1,124 @@
+{
+  "spec": "docs/architecture/session-timing.md",
+  "note": "Timers and retry schedules of the signaling and media links, as each implementation has them on 2026-11-12. Nothing here is a decided value: where implementations disagree, each keeps its own number under its own key (see disagreements). A test in every implementation reads its section and fails when the code drifts from it. A key listed in that section's unpinned object has no reader yet; the reason names what blocks it.",
+  "schedules": {
+    "backoffDoubling": [250, 500, 1000, 2000, 4000, 5000, 5000],
+    "recycledAuthHost": [3000, 4500, 6750, 8000, 8000],
+    "connectTimeout": [5000, 7500, 10000, 10000]
+  },
+  "browser": {
+    "files": "worker/public/recovery.js, media-v4.js, dk-session.js, receiver.js",
+    "values": {
+      "heartbeatMs": 15000,
+      "signalingAnswerLimitMs": 30000,
+      "mediaAnswerLimitMs": 25000,
+      "suspendGapMs": 90000,
+      "signalingReconnect": { "fixedMs": 250, "jitterPct": 0, "resetOn": "none: fixed delay, no growth" },
+      "mediaBackoff": { "minMs": 250, "maxMs": 5000, "factor": 2, "jitterPct": 0, "resetOn": "hello-ok", "schedule": "backoffDoubling" },
+      "keyframeThrottleMs": 250,
+      "authHostTimeoutMs": 10000,
+      "recycledAuthHost": { "firstMs": 3000, "factor": 1.5, "maxMs": 8000, "schedule": "recycledAuthHost" },
+      "recoveryBudgetMs": 30000,
+      "connectTimeout": { "firstMs": 5000, "factor": 1.5, "maxMs": 10000, "schedule": "connectTimeout", "when": "only while recovering an established session" },
+      "firstFrameWatchdogMs": 5000
+    },
+    "unpinned": {
+      "signalingReconnect": "literal 250 in receiver.js (setTimeout(connect, 250)); naming it breaks the vm-sliced receiver tests, which stub every identifier the sliced function uses",
+      "keyframeThrottleMs": "literal 250 in receiver.js; media-v4.js exports V4_KEYFRAME_REQUEST_INTERVAL_MS but receiver.js does not use it",
+      "firstFrameWatchdogMs": "literal 5_000 in receiver.js"
+    }
+  },
+  "kotlin": {
+    "files": "android/app/src/main/java/de/bubblebuffer/bubbleplay/{protocol/V4.kt,net/InputLink.kt,net/ReconnectLoop.kt,net/SessionWire.kt,net/BackgroundGrace.kt,net/Session.kt,auth/Handshake.kt,ui/StreamActivity.kt}",
+    "values": {
+      "heartbeatMs": 15000,
+      "signalingAnswerLimitMs": 6000,
+      "inputProbeAfterMs": 4000,
+      "mediaAnswerLimitMs": 25000,
+      "signalingBackoff": { "minMs": 250, "maxMs": 5000, "factor": 2, "jitterPct": 0, "resetOn": "socket up, and on return to the foreground", "schedule": "backoffDoubling" },
+      "mediaBackoff": { "minMs": 250, "maxMs": 5000, "factor": 2, "jitterPct": 0, "resetOn": "socket up, and on return to the foreground", "schedule": "backoffDoubling" },
+      "keyframeThrottleMs": 250,
+      "authHostTimeoutMs": 10000,
+      "recycledAuthHost": { "firstMs": 3000, "factor": 1.5, "maxMs": 8000, "schedule": "recycledAuthHost" },
+      "recoveryBudgetMs": 30000,
+      "connectTimeoutMs": 10000,
+      "firstFrameWatchdogMs": 5000,
+      "backgroundGraceMs": 300000,
+      "streamActivityBackgroundDisconnectMs": 30000
+    },
+    "unpinned": {
+      "mediaAnswerLimitMs": "literal 25_000 in Session.kt (SignalLiveness(V4.HEARTBEAT_MS, pongTimeoutMs = 25_000))",
+      "connectTimeoutMs": "literal 10 seconds in the OkHttpClient builder in Session.kt",
+      "firstFrameWatchdogMs": "literal 5_000 in Session.kt armFirstFrameWatchdog",
+      "streamActivityBackgroundDisconnectMs": "private const in StreamActivity.kt (UI class)"
+    }
+  },
+  "clientWin": {
+    "files": "client-win/src/net/{session.rs,gate.rs,phase2.rs}",
+    "values": {
+      "handshakeStepMs": 10000,
+      "heartbeatMs": 15000,
+      "deadSilenceMs": 40000,
+      "backoff": { "minMs": 250, "maxMs": 5000, "factor": 2, "jitterPct": 0, "resetOn": "full handshake established (both sockets)", "schedule": "backoffDoubling" },
+      "keyframeThrottleMs": 250,
+      "authHostTimeoutMs": 10000,
+      "recycledAuthHost": { "firstMs": 3000, "factor": 1.5, "maxMs": 8000, "schedule": "recycledAuthHost" },
+      "recoveryBudgetMs": 30000,
+      "firstFrameWatchdogMs": 5000
+    },
+    "unpinned": {
+      "recycledAuthHost": "factor 1.5 is a literal inside the private Session::auth_wait; first, max and the schedule are only reachable through the session loop"
+    }
+  },
+  "host": {
+    "files": "host/src/{wss_v4.rs,signaling.rs,dk_host.rs,transport.rs,main.rs}",
+    "values": {
+      "signalingHeartbeatMs": 15000,
+      "mediaHeartbeatMs": 15000,
+      "signalingKeepaliveAckLimitMs": 45000,
+      "mediaInboundSilenceMs": 40000,
+      "signalingHandshakeMs": 10000,
+      "earlyHelloWindowMs": 3000,
+      "mediaBackoff": { "minMs": 250, "maxMs": 5000, "factor": 2, "jitterPct": 0, "resetOn": "link established", "schedule": "backoffDoubling" },
+      "mediaRefusalLimit": 5,
+      "ackStallMs": 3000,
+      "audioStallMs": 1000,
+      "writeStallMs": 10000,
+      "rtcDisconnectGraceMs": 5000,
+      "serveBackoff": { "minMs": 1000, "maxMs": 30000, "factor": 2, "jitterPct": 0, "resetOn": "run registered with the relay longer than healthyRunMs", "healthyRunMs": 60000 },
+      "keyframeRequestCooldownMs": 2000,
+      "rememberedMonitorMaxAttempts": 3
+    },
+    "unpinned": {
+      "signalingHeartbeatMs": "SIGNALING_HEARTBEAT_INTERVAL is private to the bin crate (main.rs)",
+      "serveBackoff": "private fns and literals in main.rs (bin crate)",
+      "keyframeRequestCooldownMs": "private const in main.rs (bin crate)",
+      "rememberedMonitorMaxAttempts": "private const in main.rs (bin crate)"
+    }
+  },
+  "relay": {
+    "files": "relay-rs/core/src/relay/types.rs, relay-rs/server/src/runtime.rs",
+    "values": {
+      "helloMs": 5000,
+      "challengeMs": 10000,
+      "idleMs": 90000,
+      "sendTimeoutMs": 10000,
+      "answersEveryPing": true
+    },
+    "unpinned": {
+      "sendTimeoutMs": "SEND_TIMEOUT lives in the server crate, which has no test target reading fixtures",
+      "answersEveryPing": "behaviour, not a number; covered by relay forward tests"
+    }
+  },
+  "disagreements": [
+    { "topic": "signaling dead detection", "keys": ["browser.signalingAnswerLimitMs", "kotlin.signalingAnswerLimitMs", "clientWin.deadSilenceMs", "host.signalingKeepaliveAckLimitMs", "relay.idleMs"], "decision": "open" },
+    { "topic": "media dead detection", "keys": ["browser.mediaAnswerLimitMs", "kotlin.mediaAnswerLimitMs", "clientWin.deadSilenceMs", "host.mediaInboundSilenceMs", "relay.idleMs"], "decision": "open" },
+    { "topic": "dead rule kind (oldest unanswered ping vs any inbound silence)", "keys": ["browser.signalingAnswerLimitMs", "kotlin.signalingAnswerLimitMs", "clientWin.deadSilenceMs", "host.mediaInboundSilenceMs"], "decision": "open" },
+    { "topic": "signaling reconnect backoff", "keys": ["browser.signalingReconnect", "kotlin.signalingBackoff", "clientWin.backoff", "host.serveBackoff"], "decision": "open" },
+    { "topic": "backoff reset rule", "keys": ["browser.mediaBackoff.resetOn", "kotlin.signalingBackoff.resetOn", "clientWin.backoff.resetOn", "host.serveBackoff.resetOn"], "decision": "open" },
+    { "topic": "jitter", "keys": ["browser.mediaBackoff.jitterPct", "kotlin.signalingBackoff.jitterPct", "clientWin.backoff.jitterPct", "host.mediaBackoff.jitterPct", "host.serveBackoff.jitterPct"], "decision": "open" },
+    { "topic": "socket open timeout on reconnect", "keys": ["browser.connectTimeout", "kotlin.connectTimeoutMs", "clientWin.handshakeStepMs", "host.signalingHandshakeMs", "relay.helloMs"], "decision": "open" },
+    { "topic": "keyframe request spacing", "keys": ["browser.keyframeThrottleMs", "kotlin.keyframeThrottleMs", "clientWin.keyframeThrottleMs", "host.keyframeRequestCooldownMs"], "decision": "open" },
+    { "topic": "background grace", "keys": ["kotlin.backgroundGraceMs", "kotlin.streamActivityBackgroundDisconnectMs", "host.rtcDisconnectGraceMs"], "decision": "open" }
+  ]
+}

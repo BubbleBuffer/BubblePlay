@@ -1,0 +1,143 @@
+{
+  "note": "Every fixtures/*.json needs an entry. consumers lists the implementations that speak that protocol part; each must have a test file that names the fixture. gaps are known missing consumers with the reason; a gap that gains a consumer must be removed.",
+  "roots": {
+    "worker": [
+      "worker/test"
+    ],
+    "android": [
+      "android/app/src/test"
+    ],
+    "client-win": [
+      "client-win/src",
+      "client-win/tests"
+    ],
+    "host": [
+      "host/src",
+      "host/tests"
+    ],
+    "relay": [
+      "relay-rs/core/tests",
+      "relay-rs/core/src",
+      "relay-rs/tests"
+    ]
+  },
+  "fixtures": {
+    "audio-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host",
+        "relay"
+      ]
+    },
+    "client-log-upload-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host"
+      ]
+    },
+    "close-codes-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "relay"
+      ]
+    },
+    "cursor-types.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host"
+      ]
+    },
+    "device-keys-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host"
+      ]
+    },
+    "file-transfer-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "host",
+        "relay"
+      ]
+    },
+    "follow-window-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "host"
+      ],
+      "gaps": {
+        "worker": "follow handling is inline in receiver.js (sendFollowWindow, host-capabilities): no importable seam; needs a viewer-lane extraction first"
+      }
+    },
+    "input-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host"
+      ]
+    },
+    "install-names-contract.json": {
+      "consumers": [
+        "host"
+      ]
+    },
+    "media-control-contract.json": {
+      "consumers": [
+        "client-win",
+        "host"
+      ],
+      "notes": "browser and Kotlin build these messages inline; see the fixture's unpinned"
+    },
+    "monitor-previews-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host"
+      ]
+    },
+    "secure-desktop-contract.json": {
+      "consumers": [
+        "worker",
+        "host"
+      ]
+    },
+    "session-timing-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host",
+        "relay"
+      ]
+    },
+    "wss-contract.json": {
+      "consumers": [
+        "client-win",
+        "host",
+        "relay"
+      ]
+    },
+    "wss-v4-contract.json": {
+      "consumers": [
+        "worker",
+        "android",
+        "client-win",
+        "host",
+        "relay"
+      ]
+    }
+  }
+}
