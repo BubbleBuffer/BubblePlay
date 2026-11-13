@@ -205,9 +205,6 @@
   "host/src/audio/wasapi.rs": {
     "clippy::let_underscore_must_use": 2
   },
-  "host/src/audio/mod.rs": {
-    "clippy::let_underscore_must_use": 1
-  },
   "host/src/benchmark.rs": {
     "clippy::let_underscore_must_use": 3
   },
@@ -219,8 +216,8 @@
   },
   "host/src/capture_wait.rs": {
     "clippy::unwrap_used": 16,
-    "clippy::too_many_lines": 2,
-    "clippy::let_underscore_must_use": 17,
+    "clippy::too_many_lines": 1,
+    "clippy::let_underscore_must_use": 8,
     "clippy::expect_used": 2
   },
   "host/src/client_logs.rs": {
@@ -527,7 +524,8 @@
   },
   "host/tests/admin_agent_e2e.rs": {
     "clippy::let_underscore_must_use": 8,
-    "clippy::unwrap_used": 7
+    "clippy::unwrap_used": 7,
+    "clippy::expect_used": 1
   },
   "relay-rs/core/src/gate.rs": {
     "clippy::expect_used": 1
@@ -597,5 +595,39 @@
   },
   "relay-rs/core/tests/relay_m2.rs": {
     "clippy::expect_used": 5
+  },
+  "host/src/capture_wait/tests.rs": {
+    "clippy::too_many_lines": 1,
+    "clippy::let_underscore_must_use": 8
+  },
+  "host/tests/install_names_contract.rs": {
+    "clippy::expect_used": 1
+  },
+  "crates/bp-device-key/src/proof.rs": {
+    "clippy::expect_used": 1
+  },
+  "crates/bp-device-key/src/phase2/ctl.rs": {
+    "clippy::expect_used": 2
+  },
+  "crates/bp-device-key/src/phase2/pairing.rs": {
+    "clippy::expect_used": 3
+  },
+  "crates/bp-device-key/tests/contract.rs": {
+    "clippy::expect_used": 6
+  },
+  "crates/bp-device-key/tests/phase2_contract.rs": {
+    "clippy::expect_used": 11
+  },
+  "relay-rs/worker/src/front.rs": {
+    "clippy::too_many_lines": 1
+  },
+  "relay-rs/worker/src/ntfy.rs": {
+    "clippy::let_underscore_must_use": 1
+  },
+  "relay-rs/worker/src/pc.rs": {
+    "clippy::let_underscore_must_use": 7
+  },
+  "relay-rs/worker/src/rng.rs": {
+    "clippy::expect_used": 1
   }
 }

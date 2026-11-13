@@ -62,7 +62,7 @@ class RelayServer : TestRule {
               "assets_dir": ${json(assets.absolutePath)},
               "state_dir": ${json(state.absolutePath)},
               "token": "$TOKEN",
-              "admin_token": "e2e-admin-token"
+              "admin_token": "e2e-admin-token-0123456789-0123456789-abcdef"
             }
             """.trimIndent(),
         )
@@ -105,7 +105,7 @@ class RelayServer : TestRule {
     }
 
     companion object {
-        const val TOKEN = "e2e-first-registration-token"
+        const val TOKEN = "e2e-first-registration-token-0123456789-abcdef"
         const val ENV_BIN = "BP_RELAY_SERVER_BIN"
         const val ENV_REQUIRED = "BP_E2E_REQUIRED"
 
