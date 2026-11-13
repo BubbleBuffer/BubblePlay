@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -14,7 +15,7 @@ const SDP = ["v=0", "o=- 1 2 IN IP4 127.0.0.1", "s=-", "t=0 0", "a=group:BUNDLE 
 
 function load(extra = {}) {
   const sandbox = { console, isCurrentPeer: () => true, calls: [], ...extra };
-  vm.createContext(sandbox);
+  createSessionContext(sandbox);
   vm.runInContext(source.slice(start, end), sandbox);
   return sandbox;
 }

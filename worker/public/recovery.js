@@ -1,7 +1,10 @@
+// The relay closes a viewer it refuses, or drops from the PC's list, with this code.
+export const CLOSE_POLICY = 1008;
+
 // Signaling policy failures are page-local and must not retry into a newer
 // client of the same one-client room. Network failures remain recoverable.
 export function shouldReconnectAfterClose(closeCode, terminalFailure) {
-  return !terminalFailure && closeCode !== 1008;
+  return !terminalFailure && closeCode !== CLOSE_POLICY;
 }
 
 // The relay answers every signaling ping at once. A ping left unanswered this

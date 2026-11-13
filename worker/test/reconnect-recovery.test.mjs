@@ -1,4 +1,6 @@
 import test from "node:test";
+import { createSessionContext } from "./helpers/session-context.mjs";
+import { attachSignaling } from "./helpers/signaling-wiring.mjs";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
@@ -49,7 +51,7 @@ function receiverHarness() {
   const suspend = createSuspendTracker();
   const log = (level, event, detail) => output.logs.push({ level, event, detail });
   const recovery = createRecoveryTracker({ now: () => now, log, suspend });
-  const context = vm.createContext({
+  const context = createSessionContext({
     recovery, viewerLog: log,
     recycleSignaling: reason => output.recycled.push(reason),
     endAuthenticatedSession: refusal => output.ended.push(refusal),
@@ -145,18 +147,19 @@ function signalingHarness({ recovering }) {
   class FakeSocket {
     static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
     constructor(url) { this.url = url; this.readyState = 0; this.closed = false; sockets.push(this); }
+    send(text) { sent.push(JSON.parse(text)); }
     close() { this.closed = true; this.readyState = 3; }
   }
   const recovery = createRecoveryTracker({ now: () => clock, log: () => {} });
   if (recovering) { recovery.noteAuthenticated(); recovery.noteLoss(); }
-  const context = vm.createContext({
+  const context = createSessionContext({
     ws: null, signalingGeneration: 0, reconnectTimer: null, pendingConnect: null, connectTimer: null,
     terminalSignalingFailure: false, recovery,
     hudState: {}, latestInputStatus: null, inputStatusReason: null, authenticatedSession: null,
     signalingRegistered: false, signalingPc: null, signalingTicket: null, sessionIdentity: {}, params: {},
     hud: { classList: { add() {} } },
     WebSocket: FakeSocket, URL, Promise, Math, Number, Array,
-    shouldRetryOnWake, shouldReconnectAfterClose, signalingBackoffMs: 0, nextBackoffMsV4: () => 250, jitteredBackoffMsV4: ms => ms, // reconnect delay is not under test here
+    signalingBackoffMs: 0,
     setTimeout: (fn, delay) => { const id = nextId++; timers.push({ id, at: clock + delay, fn }); return id; },
     clearTimeout: id => { timers = timers.filter(t => t.id !== id); },
     signalingSocketUrl: () => "wss://relay.test/ws?pc=pc",
@@ -165,7 +168,7 @@ function signalingHarness({ recovering }) {
     handleSignal: async () => {}, cleanupPeer() {}, recordSignalingError() {},
     releaseInput() {}, showNotAdmitted() {}, restartPeer() {}, performance: { now: () => clock },
   });
-  vm.runInContext(["reconnectSignaling", "armConnectTimeout", "wakeReconnect"].map(fn).join("\n"), context);
+  attachSignaling(context);
   const tick = ms => {
     const end = clock + ms;
     for (;;) {
@@ -194,7 +197,7 @@ test("a socket that does not open is abandoned and replaced, waiting longer each
   assert.equal(first.onopen, null);
   assert.equal(first.onclose, null);
   assert.deepEqual(h.logs.map(l => [l.event, l.detail]), [["signaling-connect-abandoned", { connectAttempt: 1, waitedMs: 5000 }]]);
-  h.tick(250);
+  h.tick(500);
   assert.equal(h.sockets.length, 2);
   assert.equal(h.context.ws, h.sockets[1]);
   // A late open event of the abandoned socket does nothing.
@@ -202,10 +205,10 @@ test("a socket that does not open is abandoned and replaced, waiting longer each
   assert.deepEqual(h.sent, []);
   assert.equal(h.context.ws, h.sockets[1]);
   h.tick(7500);
-  h.tick(250);
+  h.tick(1000);
   assert.equal(h.sockets.length, 3);
   h.tick(10_000);
-  h.tick(250);
+  h.tick(2000);
   h.tick(10_000);
   assert.deepEqual(h.logs.map(l => l.detail.waitedMs), [5000, 7500, 10000, 10000]);
 });
