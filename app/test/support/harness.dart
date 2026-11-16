@@ -48,11 +48,13 @@ class TestApp {
   List<Object?> get actions => [for (final text in channel.actions) jsonDecode(text)];
 }
 
-/// Pumps the whole app at [screen] size, showing [state] (a snapshot, as from [contractState]).
+/// Pumps the whole app at [screen] size (or [size] when given), showing [state] (a snapshot, as
+/// from [contractState]).
 Future<TestApp> pumpApp(
   WidgetTester tester,
   Object? state, {
   Screen screen = Screen.desktop,
+  Size? size,
   Brightness brightness = Brightness.dark,
   bool windows = true,
   ValueNotifier<Brightness?>? theme,
@@ -62,7 +64,7 @@ Future<TestApp> pumpApp(
   String? section,
   FeedbackServices? feedback,
 }) async {
-  tester.view.physicalSize = Size(screen.width, screen.height);
+  tester.view.physicalSize = size ?? Size(screen.width, screen.height);
   tester.view.devicePixelRatio = 1;
   addTearDown(tester.view.reset);
   final channel = FakeChannel(state);
