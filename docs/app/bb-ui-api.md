@@ -1,54 +1,62 @@
-# bb_ui 0.7.0 API cheat sheet
+# bb_ui API cheat sheet
+
+The app is on bb_ui 0.8. The root setup and tokens below are 0.8. The component sections from
+`buttons.dart` on were written against 0.7.0: in 0.8 every size there is a token (`ControlSize`,
+`IconSize`, `Space`, a `context.type` role) instead of a number, `mobile` parameters are gone,
+and [the migration guide](https://github.com/BubbleBuffer/bb-ui/blob/dcc9c848e51ea0dd58ab277cf1ca5735e17c3e80/docs/migration-0.8.md)
+lists each rename. When a signature here disagrees with the source, the source wins.
 
 Source: `packages/bb_ui/lib` of the bb-ui git dependency (pinned in `app/pubspec.lock`) (barrel `bb_ui.dart`).
-Tokens: `...\packages\bb_tokens\lib\tokens.dart` (re-exported by bb_ui). Repo root has no CHANGELOG; docs are `README.md`, `packages/bb_ui/README.md`, `docs/verification.md`.
-Signatures copied from source. Every widget class accepts `key` (omitted from the lines below).
+Tokens: `packages/bb_tokens/lib/tokens.dart` (re-exported by bb_ui). Every widget class accepts `key` (omitted from the lines below).
 
 ## Root setup
 
-- No Material anywhere: grep of `packages/` and `apps/` finds no `package:flutter/material`. Imports are `widgets`, `services`, `gestures`, `rendering`.
-- Root is a `WidgetsApp`, not `MaterialApp`. Its `builder` wraps the Navigator in `AppTheme`, as `apps/gallery/lib/gallery.dart:32-50` does:
+- No Material anywhere. Imports are `widgets`, `services`, `gestures`, `rendering`.
+- Root is a `WidgetsApp`, not `MaterialApp`. Its `builder` wraps the Navigator in `SizeClassScope` and `AppTheme` (see `app/lib/src/app.dart`):
 
 ```dart
-import 'package:bb_ui/bb_ui.dart';
-
-WidgetsApp(
-  title: 'App',
-  color: AppColors.light.desk,
-  debugShowCheckedModeBanner: false,
-  pageRouteBuilder: <T>(settings, builder) => PageRouteBuilder<T>(
-    settings: settings,
-    pageBuilder: (context, animation, secondary) => builder(context),
-  ),
-  builder: (context, child) => LayoutBuilder(
-    builder: (context, constraints) => AppTheme(
-      colors: dark ? AppColors.darkTheme : AppColors.light, // switch here
-      formFactor: FormFactor.forWidth(constraints.maxWidth), // breakpoint 768
-      child: child!,
+builder: (context, child) => MediaQuery.withClampedTextScaling(
+  maxScaleFactor: maxTextScale, // app_tokens.dart
+  child: LayoutBuilder(
+    builder: (context, constraints) => SizeClassScope(
+      sizeClass: SizeClass.forWidth(constraints.maxWidth),
+      child: AppTheme(
+        colors: dark ? AppColors.darkTheme : AppColors.light,
+        density: env.isWindows ? Density.pointer : Density.touch,
+        child: child!,
+      ),
     ),
   ),
-  home: HomeScreen(),
-);
+),
 ```
 
-- `AppTheme({required AppColors colors, required FormFactor formFactor, required Widget child})` is an `InheritedWidget` (`bb_tokens/lib/tokens.dart:403`). Read it with `AppTheme.of(context)`. There is no `BbTheme`.
-- Context accessors (`ThemeX`): `context.colors`, `context.type` (TypeScale), `context.formFactor`, `context.mobile`.
-- Light/dark: neither package follows the system brightness (grep for `platformBrightness` finds nothing). The host passes `AppColors.light` or `AppColors.darkTheme` (`tokens.dart:195-197`) and rebuilds. `AppColors.dark` is a bool field.
-- `FormFactor { desktop, mobile }`, `FormFactor.forWidth(double)`, `FormFactor.breakpoint = 768`.
-- Fonts: the host registers the three families. Top-level mutable Strings: `sansFamily = 'Atkinson Hyperlegible Next'`, `monoFamily = 'Fragment Mono'`, `displayFamily = 'Bricolage Grotesque'`, plus `monoFallback = ['monospace']`. Assets and licences are in `apps/gallery/pubspec.yaml`: `AtkinsonHyperlegibleNext[wght].ttf` and `-Italic`, `FragmentMono-Regular.ttf` and `-Italic`, `BricolageGrotesque[opsz,wdth,wght].ttf`.
-- Icons: `lucide_icons_flutter 3.1.25` is a bb_ui dependency. The app does not register it by hand. The golden config loads it for tests only (inference: at runtime Flutter bundles dependency fonts itself).
-- `scrollBehavior`: `AppScrollBehavior` (routes.dart:46) is exported but used nowhere in the repo. Pass `scrollBehavior: const AppScrollBehavior()` to `WidgetsApp` yourself if you want its overscroll and scrollbar behaviour.
+- Two separate questions replace 0.7's `FormFactor` / `context.mobile`:
+  - `Density` (pointer or touch) sets control heights, icon sizes, row padding and the type ramp. The app picks it from the platform (`AppEnv.isWindows`), so goldens get pointer on the desktop pictures and touch on the phone ones. Read it as `context.touch` or, better, `context.metrics.*`.
+  - `SizeClass` (compact below 600, medium below 1000, expanded) sets layout: sheet or panel, full-screen flow or centred pane, list alone or list beside details. Read it as `context.sizeClass`, `context.adaptive(...)`, or lay a component out by its own width with `AdaptiveLayout`.
+- Context accessors (`ThemeX`): `context.colors`, `context.type` (TypeScale), `context.density`, `context.metrics`, `context.touch`, `context.sizeClass`, `context.adaptive(...)`.
+- Light/dark: the host passes `AppColors.light` or `AppColors.darkTheme` and rebuilds. `AppColors.dark` is a bool field.
+- Fonts: the host registers the three families: `sansFamily = 'Atkinson Hyperlegible Next'`, `monoFamily = 'Fragment Mono'`, `displayFamily = 'Bricolage Grotesque'`.
+- Icons: `lucide_icons_flutter` is a bb_ui dependency. The golden config loads it for tests only.
 - Fully transparent colour: use `kTransparent` (`Colors.transparent` is Material).
 
 ## Tokens (bb_tokens, via bb_ui `tokens.dart`)
 
-- `AppColors` (`tokens.dart:95`), built only through `AppColors.light` / `AppColors.darkTheme`. Roles: `palette` (ProfileColors), `dark`; `bgPrimary bgSecondary bgTertiary bgElevated bgHover bgPressed bgSelectedBlock textSelection`; `textPrimary textSecondary textTertiary textDisabled`; `iconPrimary iconSecondary iconTertiary`; `border borderSubtle borderStrong borderTranslucent divider`; `accent accentHover accentText onAccent focus`; `inlineCodeBg inlineCodeText overlay desk`; `thread threadStrong`; `okBg infoBg attnBg dangerBg pawBg`; `rail rail2 railInk railMuted railLine`; shadows `seam seamHover stack` (List<BoxShadow>), with getters `shadowMenu`, `shadowSmall`.
-- Raw colour literals belong only in the token source (`scripts/check-raw-colours.sh`). `ProfileColors` lives in the generated `src/colors.g.dart`; do not hand-edit it.
-- Spacing: `KitSpacing.standard` (`KitSpacing({hair=2, xs=4, sm=8, md=12, lg=16, xl=24})`). Also `KitLayout.standard` (sizeMedium 600, sizeExpanded 1000, fitComposer 460, contextSplit 680, paneMinWidth 200, paneMinHeight 120, edgeTab 28, controlHeight 32, rowHeight 28).
-- `Layout` constants: `contentWidth 720`, `textWidth 708`, `topbarHeight 44`, `sidebarWidth 240`, `sidebarRowHeight 30`, `gutter 18`, `minTapTarget 44`, `listRowHeight 44`, `indent 24`.
-- `Radii`: `sm 4, md 6, lg 10, sheet 12` (doubles); `ctl`, `field`, `panel` (BorderRadius); `pill` (999).
-- `Motion`: `fast 150ms, standard 220ms, sheet 250ms, wiggle 200ms`; curves `easing`, `ease`, `settle`. `Motion.of(context)` returns `MotionDurations`, which is zero when reduce-motion is on.
-- Type: `TypeScale.desktop` / `TypeScale.mobile` with `pageTitle, h1, h2, h3, body, ui, uiSmall, code`, each a `TypeSpec(size, line, weight)`. Helpers: `ts(TypeSpec s, Color color, {int? weight, bool mono = false})`, `tsRaw(double size, double line, int weight, Color color)`, `tsDisplay(TypeSpec s, Color color, {int? weight})`, `fw(int)`.
+Widgets never write a number for spacing, size, type, stroke, opacity, colour or duration. The
+`bb_lints` analyzer plugin (enabled in `app/analysis_options.yaml`) enforces it; run
+`dart analyze --fatal-infos` in `app/` (without path arguments: neither `flutter analyze` nor
+`dart analyze lib test` reports plugin diagnostics). Values particular to BubblePlay (pane widths,
+the settings panel, the video backdrop) live in `app/lib/src/app_tokens.dart`, the one place the
+lint accepts raw values.
+
+- `AppColors`: roles `bgPrimary bgSecondary bgTertiary bgElevated bgHover bgPressed bgSelectedBlock textSelection`; `textPrimary textSecondary textTertiary textDisabled`; `iconPrimary iconSecondary iconTertiary`; `border borderSubtle borderStrong borderTranslucent divider`; `accent accentHover accentText onAccent focus`; `inlineCodeBg inlineCodeText overlay desk`; `okBg infoBg attnBg dangerBg`; shadows `seam seamHover stack`, with getters `shadowMenu`, `shadowSmall`.
+- `Space`: `hair 2, xxs 4, xs 6, sm 8, md 12, lg 16, xl 24, xxl 32, xxxl 48`. Gaps between siblings: `Gap(Space.x)` or the parent's `spacing:`.
+- `ControlSize` (heights): `xs 24, sm 28, md 32, lg 36, xl 44, xxl 48`. `IconSize`: `xs 14, sm 16, md 18, lg 20, xl 24, xxl 28`.
+- `Stroke`, `Alpha`, `Widths` (`popover 220` ... `form 420`, `sheet 480`, `content 720`), `Heights`, `Sizes` (`tile 40`, `qr 200`, ...).
+- `Layout`: `topbarHeight 44`, `gutter 16`, `sheetHeight .85`, ...
+- `Radii`: `sm 4, md 6, lg 10, sheet 12`; `ctl`, `field`, `panel`, `pill`.
+- `Motion`: `fast 150ms, standard 220ms, sheet 250ms, wiggle 200ms`, plus `hoverDelay`, `linger`, `confirm`, `toast`, `warm`, `spin`. `Motion.of(context)` is zero when reduce-motion is on.
+- Type: roles of `context.type` (`pageTitle display h1 h2 h3 title body item ui uiSmall caption micro code codeSmall`). Helpers: `ts(TypeSpec, Color, {Weight? weight, bool mono})`, `tsDisplay(TypeSpec, Color, {Weight weight})`, `tsNumeral(NumeralSize, Color)`.
+- Give text-bearing boxes a minimum height (`ConstrainedBox(constraints: BoxConstraints(minHeight: ...))`), not a fixed one: bb_ui's controls grow with the system text size. `app/test/screens/adaptive_matrix_test.dart` renders the main screens at eight widths, both densities and three text sizes and fails on any overflow.
 
 ## buttons.dart
 
