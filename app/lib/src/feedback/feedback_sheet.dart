@@ -2,11 +2,13 @@
 // screen (removable) and Send / Cancel. A bottom sheet on a phone, a panel on desktop. Escape
 // closes it. It pops with true once [onSend] has stored the report; Cancel stores nothing.
 
+import 'dart:math' as math;
 
 import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import '../app_tokens.dart';
 import 'report.dart';
 
 class FeedbackSheet extends StatefulWidget {
@@ -75,7 +77,10 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
   Widget build(BuildContext context) {
     final c = context.colors;
     final ty = context.type;
-    final mobile = context.mobile;
+    // A bottom sheet in a narrow window (see FeedbackController); no keyboard pops up unasked
+    // under a finger.
+    final compact = context.sizeClass.isCompact;
+    final touch = context.touch;
     final title = Semantics(
       header: true,
       child: Text('Report a problem', style: ts(ty.h3, c.textPrimary)),
@@ -97,19 +102,19 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
             ),
           ],
         ),
-        const SizedBox(height: 12),
+        const Gap(Space.md),
         ExcludeSemantics(
           child: Text('What happened?', style: ts(ty.ui, c.textSecondary)),
         ),
-        const SizedBox(height: 6),
+        const Gap(Space.xs),
         Semantics(
           label: 'What happened?',
           textField: true,
           multiline: true,
           child: ConstrainedBox(
-            constraints: const BoxConstraints(minHeight: 96),
+            constraints: const BoxConstraints(minHeight: AppSizes.feedbackField),
             child: FieldFrame(
-              padding: const EdgeInsets.all(10),
+              padding: const EdgeInsets.all(Space.md),
               child: EditableText(
                 key: const ValueKey('feedback-text'),
                 controller: _text,
@@ -118,8 +123,8 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
                 cursorColor: c.textPrimary,
                 backgroundCursorColor: c.textTertiary,
                 selectionColor: c.textSelection,
-                cursorWidth: 1.5,
-                autofocus: !mobile,
+                cursorWidth: Stroke.regular,
+                autofocus: !touch,
                 keyboardType: TextInputType.multiline,
                 textInputAction: TextInputAction.newline,
                 selectionControls: noteSelectionControls,
@@ -130,11 +135,11 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
           ),
         ),
         if (_screenshot case final shot?) ...[
-          const SizedBox(height: 12),
+          const Gap(Space.md),
           Align(
             alignment: Alignment.centerLeft,
             child: Container(
-              padding: const EdgeInsets.all(1),
+              padding: const EdgeInsets.all(Space.hair),
               decoration: BoxDecoration(
                 border: Border.all(color: c.border),
                 borderRadius: Radii.ctl,
@@ -142,7 +147,9 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
               child: ClipRRect(
                 borderRadius: Radii.ctl,
                 child: ConstrainedBox(
-                  constraints: BoxConstraints(maxHeight: mobile ? 140 : 120),
+                  constraints: BoxConstraints(
+                    maxHeight: compact ? AppSizes.screenshotSheet : AppSizes.screenshotPanel,
+                  ),
                   child: Image.memory(
                     shot,
                     key: const ValueKey('feedback-screenshot'),
@@ -162,13 +169,13 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
             ),
           ),
         ],
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         Text(
           'Includes the recent log lines and errors from this device.',
           style: ts(ty.uiSmall, c.textTertiary),
         ),
         if (_failed) ...[
-          const SizedBox(height: 12),
+          const Gap(Space.md),
           const NoticeBanner(
             kind: NoticeKind.danger,
             message: 'The report could not be saved on this device.',
@@ -185,7 +192,7 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
             onTap: _cancel,
           ),
         ),
-        const SizedBox(width: 8),
+        const Gap(Space.sm),
         Expanded(
           child: PrimaryButton(
             key: const ValueKey('feedback-send'),
@@ -196,35 +203,42 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
       ],
     );
     final Widget content;
-    if (mobile) {
+    if (compact) {
       final media = MediaQuery.of(context);
-      final room = media.size.height * 0.85 - 134 - media.padding.bottom;
+      final room = media.size.height * Layout.sheetHeight -
+          AppSizes.feedbackSheetChrome -
+          media.padding.bottom;
       content = SheetSurface(
         children: [
-          Padding(padding: const EdgeInsets.symmetric(horizontal: 16), child: title),
-          const SizedBox(height: 12),
+          Padding(padding: const EdgeInsets.symmetric(horizontal: Layout.gutter), child: title),
+          const Gap(Space.md),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
+            padding: const EdgeInsets.symmetric(horizontal: Layout.gutter),
             child: ConstrainedBox(
-              constraints: BoxConstraints(maxHeight: room < 120 ? 120 : room),
+              constraints: BoxConstraints(
+                maxHeight: math.max(room, AppSizes.feedbackBodyMin),
+              ),
               child: SingleChildScrollView(child: body),
             ),
           ),
-          const SizedBox(height: 16),
-          Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 8), child: buttons),
+          const Gap(Space.lg),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(Layout.gutter, 0, Layout.gutter, Space.sm),
+            child: buttons,
+          ),
         ],
       );
     } else {
       content = Padding(
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.all(Space.xl),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             title,
-            const SizedBox(height: 12),
+            const Gap(Space.md),
             Flexible(child: SingleChildScrollView(child: body)),
-            const SizedBox(height: 16),
+            const Gap(Space.lg),
             buttons,
           ],
         ),

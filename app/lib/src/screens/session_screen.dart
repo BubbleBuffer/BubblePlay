@@ -5,6 +5,7 @@ import 'package:flutter/services.dart' show KeyDownEvent, KeyUpEvent, LogicalKey
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
+import '../app_tokens.dart';
 import '../model/model.dart';
 import 'monitor_preview_overlay.dart';
 import 'stream_video.dart';
@@ -102,21 +103,21 @@ class _SessionScreenState extends State<SessionScreen> {
           if (index >= 0) _act(SetMonitor(index));
         },
       ),
-      desktopHeight: 420,
+      desktopHeight: AppSizes.displayPicker,
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final width = MediaQuery.sizeOf(context).width;
-    final compact = context.mobile;
+    // A narrow window: the stats panel takes the full width, the strip scrolls.
+    final compact = context.sizeClass.isCompact;
 
     return Focus(
       focusNode: _keys,
       autofocus: true,
       onKeyEvent: _onKey,
       child: ColoredBox(
-        color: const Color(0xFF000000),
+        color: videoBackdrop,
         child: Stack(
           children: [
             Positioned.fill(
@@ -153,26 +154,26 @@ class _SessionScreenState extends State<SessionScreen> {
                       ),
                     ),
                     if (_open) ...[
-                      const SizedBox(height: 6),
+                      const Gap(Space.xs),
                       Center(child: _strip(context)),
                     ],
                     for (final notice in _notices(context))
                       Padding(
-                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                        padding: const EdgeInsets.fromLTRB(Space.md, Space.sm, Space.md, 0),
                         child: Center(
                           child: ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 620),
+                            constraints: const BoxConstraints(maxWidth: AppSizes.sessionNotice),
                             child: notice,
                           ),
                         ),
                       ),
                     if (_stats)
                       Padding(
-                        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                        padding: const EdgeInsets.fromLTRB(Space.md, Space.sm, Space.md, 0),
                         child: Center(
                           child: MetricsPanel(
                             title: 'Stream',
-                            width: compact ? width - 24 : 270,
+                            width: compact ? double.infinity : Widths.panel,
                             metrics: _metrics(),
                             trend: _session.stats.frameMs,
                             trendCaption: 'Frame time',
@@ -244,7 +245,7 @@ class _SessionScreenState extends State<SessionScreen> {
         ),
       ],
     );
-    if (context.mobile) {
+    if (context.sizeClass.isCompact) {
       return SizedBox(
         width: double.infinity,
         child: SingleChildScrollView(

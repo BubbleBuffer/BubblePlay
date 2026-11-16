@@ -47,7 +47,7 @@ class PcDetail extends StatelessWidget {
   Widget build(BuildContext context) {
     final controller = AppScope.of(context).controller;
     return Padding(
-      padding: const EdgeInsets.all(24),
+      padding: const EdgeInsets.all(Space.xl),
       child: DetailPanel(
         eyebrow: 'Selected',
         title: pc.name,
@@ -57,7 +57,7 @@ class PcDetail extends StatelessWidget {
           KeyValueRow('Allowed', pc.allowed),
           KeyValueRow('Last session', _lastSession(pc)),
           if (pc.problem != null) ...[
-            const SizedBox(height: 12),
+            const Gap(Space.md),
             _ProblemNotice(pc.problem!),
           ],
         ],
@@ -68,14 +68,20 @@ class PcDetail extends StatelessWidget {
             expand: true,
             onTap: () => controller.act(Connect(pcId: pc.id)),
           ),
-          Row(
+          // Forget goes under Rename when large text leaves no room beside it. Each button keeps
+          // its own width rather than the run's.
+          Wrap(
+            alignment: WrapAlignment.spaceBetween,
             children: [
-              TextBtn('Rename', icon: Ico.pencil, onTap: () => renamePc(context, pc)),
-              const Spacer(),
-              TextBtn(
-                'Forget ${pc.name}',
-                icon: Ico.trash,
-                onTap: () => forgetPc(context, pc),
+              IntrinsicWidth(
+                child: TextBtn('Rename', icon: Ico.pencil, onTap: () => renamePc(context, pc)),
+              ),
+              IntrinsicWidth(
+                child: TextBtn(
+                  'Forget ${pc.name}',
+                  icon: Ico.trash,
+                  onTap: () => forgetPc(context, pc),
+                ),
               ),
             ],
           ),
@@ -169,7 +175,7 @@ Future<void> renamePc(BuildContext context, RemotePc pc) async {
   final name = await showModalPanel<String>(
     context,
     (dialog) => _RenameBox(initial: pc.name),
-    width: 420,
+    width: Widths.form,
     shrink: true,
   );
   if (name != null && name.trim().isNotEmpty && name.trim() != pc.name) {
@@ -197,24 +203,24 @@ class _RenameBoxState extends State<_RenameBox> {
 
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.all(20),
+        padding: const EdgeInsets.all(Space.xl),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text('Rename PC', style: ts(context.type.h3, context.colors.textPrimary)),
-            const SizedBox(height: 12),
+            const Gap(Space.md),
             SettingsField(
               controller: _controller,
               autofocus: true,
               onSubmitted: (text) => Navigator.of(context).pop(text),
             ),
-            const SizedBox(height: 16),
+            const Gap(Space.lg),
             Row(
               mainAxisAlignment: MainAxisAlignment.end,
               children: [
                 SecondaryButton(label: 'Cancel', onTap: () => Navigator.of(context).pop()),
-                const SizedBox(width: 8),
+                const Gap(Space.sm),
                 PrimaryButton(
                   label: 'Rename',
                   onTap: () => Navigator.of(context).pop(_controller.text),

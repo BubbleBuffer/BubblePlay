@@ -21,18 +21,18 @@ class PairConfirmView extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         KeyValueRow('PC', confirm.pcName),
-        const SizedBox(height: 4),
+        const Gap(Space.xxs),
         KeyValueRow('PC ID', confirm.pcId, mono: true),
-        const SizedBox(height: 16),
+        const Gap(Space.lg),
         ComparisonNumber(
           confirm.number.toString().padLeft(6, '0'),
           group: 3,
           label: 'Number',
         ),
-        const SizedBox(height: 16),
+        const Gap(Space.lg),
         _outcome(context, close),
         if (waiting) ...[
-          const SizedBox(height: 8),
+          const Gap(Space.sm),
           Text(
             'The same number must show on the PC.',
             style: ts(context.type.uiSmall, c.textTertiary),
@@ -75,7 +75,7 @@ class PairConfirmView extends StatelessWidget {
         Row(
           children: [
             const Spinner(),
-            const SizedBox(width: 10),
+            const Gap(Space.md),
             Expanded(
               child: Text(
                 'Waiting for the PC to confirm',
@@ -88,7 +88,7 @@ class PairConfirmView extends StatelessWidget {
             ),
           ],
         ),
-        const SizedBox(height: 20),
+        const Gap(Space.xl),
         SecondaryButton(label: 'Cancel', onTap: close),
       ],
     );
@@ -125,7 +125,7 @@ class PairConfirmView extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           NoticeBanner(kind: kind, title: title, message: message),
-          const SizedBox(height: 20),
+          const Gap(Space.xl),
           if (primary)
             PrimaryButton(label: label, expand: true, onTap: close)
           else
