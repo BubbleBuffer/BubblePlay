@@ -3,7 +3,7 @@
 The app is on bb_ui 0.8. The root setup and tokens below are 0.8. The component sections from
 `buttons.dart` on were written against 0.7.0: in 0.8 every size there is a token (`ControlSize`,
 `IconSize`, `Space`, a `context.type` role) instead of a number, `mobile` parameters are gone,
-and [the migration guide](https://github.com/BubbleBuffer/bb-ui/blob/dcc9c848e51ea0dd58ab277cf1ca5735e17c3e80/docs/migration-0.8.md)
+and [the migration guide](https://github.com/BubbleBuffer/bb-ui/blob/1e3863ac3c9a0123fb5e502e890005701423a586/docs/migration-0.8.md)
 lists each rename. When a signature here disagrees with the source, the source wins.
 
 Source: `packages/bb_ui/lib` of the bb-ui git dependency (pinned in `app/pubspec.lock`) (barrel `bb_ui.dart`).

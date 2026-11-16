@@ -45,8 +45,8 @@ packages:
     dependency: transitive
     description:
       path: "packages/bb_tokens"
-      ref: dcc9c848e51ea0dd58ab277cf1ca5735e17c3e80
-      resolved-ref: dcc9c848e51ea0dd58ab277cf1ca5735e17c3e80
+      ref: "1e3863ac3c9a0123fb5e502e890005701423a586"
+      resolved-ref: "1e3863ac3c9a0123fb5e502e890005701423a586"
       url: "https://github.com/BubbleBuffer/bb-ui.git"
     source: git
     version: "0.8.0"
@@ -54,8 +54,8 @@ packages:
     dependency: "direct main"
     description:
       path: "packages/bb_ui"
-      ref: dcc9c848e51ea0dd58ab277cf1ca5735e17c3e80
-      resolved-ref: dcc9c848e51ea0dd58ab277cf1ca5735e17c3e80
+      ref: "1e3863ac3c9a0123fb5e502e890005701423a586"
+      resolved-ref: "1e3863ac3c9a0123fb5e502e890005701423a586"
       url: "https://github.com/BubbleBuffer/bb-ui.git"
     source: git
     version: "0.8.0"

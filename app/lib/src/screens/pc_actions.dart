@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
@@ -46,46 +48,53 @@ class PcDetail extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = AppScope.of(context).controller;
-    return Padding(
-      padding: const EdgeInsets.all(Space.xl),
-      child: DetailPanel(
-        eyebrow: 'Selected',
-        title: pc.name,
-        id: pc.id,
-        rows: [
-          KeyValueRow('Relay', pc.relay, mono: true),
-          KeyValueRow('Allowed', pc.allowed),
-          KeyValueRow('Last session', _lastSession(pc)),
-          if (pc.problem != null) ...[
-            const Gap(Space.md),
-            _ProblemNotice(pc.problem!),
+    // Centred in the pane; it scrolls when large text makes it taller than the window.
+    final panel = DetailPanel(
+      eyebrow: 'Selected',
+      title: pc.name,
+      id: pc.id,
+      rows: [
+        KeyValueRow('Relay', pc.relay, mono: true),
+        KeyValueRow('Allowed', pc.allowed),
+        KeyValueRow('Last session', _lastSession(pc)),
+        if (pc.problem != null) ...[
+          const Gap(Space.md),
+          _ProblemNotice(pc.problem!),
+        ],
+      ],
+      actions: [
+        PrimaryButton(
+          label: 'Connect to ${pc.name}',
+          icon: Ico.monitorPlay,
+          expand: true,
+          onTap: () => controller.act(Connect(pcId: pc.id)),
+        ),
+        // Forget goes under Rename when large text leaves no room beside it. Each button keeps
+        // its own width rather than the run's.
+        Wrap(
+          alignment: WrapAlignment.spaceBetween,
+          children: [
+            IntrinsicWidth(
+              child: TextBtn('Rename', icon: Ico.pencil, onTap: () => renamePc(context, pc)),
+            ),
+            IntrinsicWidth(
+              child: TextBtn(
+                'Forget ${pc.name}',
+                icon: Ico.trash,
+                onTap: () => forgetPc(context, pc),
+              ),
+            ),
           ],
-        ],
-        actions: [
-          PrimaryButton(
-            label: 'Connect to ${pc.name}',
-            icon: Ico.monitorPlay,
-            expand: true,
-            onTap: () => controller.act(Connect(pcId: pc.id)),
-          ),
-          // Forget goes under Rename when large text leaves no room beside it. Each button keeps
-          // its own width rather than the run's.
-          Wrap(
-            alignment: WrapAlignment.spaceBetween,
-            children: [
-              IntrinsicWidth(
-                child: TextBtn('Rename', icon: Ico.pencil, onTap: () => renamePc(context, pc)),
-              ),
-              IntrinsicWidth(
-                child: TextBtn(
-                  'Forget ${pc.name}',
-                  icon: Ico.trash,
-                  onTap: () => forgetPc(context, pc),
-                ),
-              ),
-            ],
-          ),
-        ],
+        ),
+      ],
+    );
+    return LayoutBuilder(
+      builder: (context, box) => SingleChildScrollView(
+        padding: const EdgeInsets.all(Space.xl),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(minHeight: math.max(box.maxHeight - 2 * Space.xl, 0)),
+          child: Center(child: panel),
+        ),
       ),
     );
   }

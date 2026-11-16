@@ -12,10 +12,8 @@ abstract final class AppSizes {
   /// The centred column an enrolment step sits in on a wider window.
   static const double stepPage = 440;
 
-  /// The selected PC's (or This PC's) detail pane beside the PC list. Wide enough that a
-  /// paired device's row keeps its Revoke button beside the name (bb_ui's DeviceRow stacks
-  /// it below `Widths.dialog` of room).
-  static const double detailPane = 400;
+  /// The selected PC's (or This PC's) detail pane beside the PC list.
+  static const double detailPane = 380;
 
   /// The share of the window's height a pairing or enrolment panel takes at most.
   static const double flowPaneHeight = .86;
