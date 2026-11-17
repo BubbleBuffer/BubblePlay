@@ -1,5 +1,7 @@
 # BubblePlay mark exports
 
+The suite master (all six icons, the Pawth kit and the standard) lives in BubbleBufferDesign, `iconography/app-icons/`.
+
 The approved master is `bubbleplay-icon.svg`, the unified BubbleBuffer suite icon: the screen cat with an apricot cursor on an ivory tile, built to the Pawth icon standard (BubblePlay E1e, Android adaptive template). Regenerate the Android, Windows and web exports and the visual proof sheets with:
 
 ```powershell
