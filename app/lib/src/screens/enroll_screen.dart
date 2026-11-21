@@ -247,7 +247,7 @@ class _UnlockState extends State<_Unlock> {
         const Gap(Space.sm),
         Text(
           'The passphrase is only used on this device.',
-          style: ts(context.type.uiSmall, colors.textTertiary),
+          style: ts(context.type.uiSmall, colors.textTertiary, weight: Weight.regular),
         ),
         const Gap(Space.xl),
         PrimaryButton(

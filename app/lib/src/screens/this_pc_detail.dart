@@ -71,7 +71,7 @@ class _Header extends StatelessWidget {
           children: [
             Text(
               state.pcName ?? 'This PC',
-              style: tsDisplay(context.type.h1, c.textPrimary, weight: Weight.bold),
+              style: tsDisplay(context.type.h1, c.textPrimary, weight: Weight.displayStrong),
             ),
             if (connected)
               StatusPill(
@@ -176,7 +176,7 @@ class _PairingSection extends StatelessWidget {
       final PairingWaiting waiting => Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text('Pair a device', style: tsDisplay(ty.h3, c.textPrimary, weight: Weight.bold)),
+            Text('Pair a device', style: tsDisplay(ty.h3, c.textPrimary, weight: Weight.displayStrong)),
             const Gap(Space.xxs),
             Text(
               'On the other device, add this PC with the PC ID and the code, or scan the QR code.',
@@ -207,7 +207,7 @@ class _PairingSection extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text('${request.name} wants to pair',
-                style: tsDisplay(ty.h3, c.textPrimary, weight: Weight.bold)),
+                style: tsDisplay(ty.h3, c.textPrimary, weight: Weight.displayStrong)),
             const Gap(Space.md),
             ComparisonNumber(
               request.sasDisplay,

@@ -1,6 +1,6 @@
 # BubblePlay app (Flutter)
 
-One Flutter app in `app/` for Windows and Android, built on [bb-ui](https://github.com/BubbleBuffer/bb-ui) 0.8 (git dependency, no Material; tokens only, enforced by the `bb_lints` analyzer plugin, see [bb-ui-api.md](bb-ui-api.md)). Milestone 1 is every screen except streaming, working against the real backends on both platforms. Milestone 3 adds the Windows "This PC" screen, which shows the host's Devices UI over a named pipe. Streaming is milestone 2. The egui client in `client-win/`, the old Win32 Devices window and the Android View UI are still in the repo and are removed in a later step.
+One Flutter app in `app/` for Windows and Android, built on [bb-ui](https://github.com/BubbleBuffer/bb-ui) 0.9 (git dependency, no Material; tokens only, enforced by the `bb_lints` analyzer plugin, see [bb-ui-api.md](bb-ui-api.md)). Milestone 1 is every screen except streaming, working against the real backends on both platforms. Milestone 3 adds the Windows "This PC" screen, which shows the host's Devices UI over a named pipe. Streaming is milestone 2. The egui client in `client-win/`, the old Win32 Devices window and the Android View UI are still in the repo and are removed in a later step.
 
 ## What is in milestone 1
 

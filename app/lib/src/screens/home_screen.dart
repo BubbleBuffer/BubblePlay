@@ -326,15 +326,15 @@ class _DeviceFooter extends StatelessWidget {
   Widget build(BuildContext context) {
     final controller = AppScope.of(context).controller;
     final id = state.thisDevice.id;
-    final thisDevice = Row(
-      children: [
-        Text('This device', style: ts(context.type.uiSmall, context.colors.textSecondary)),
-        const Gap(Space.sm),
-        Flexible(child: CopyableText(id)),
-      ],
+    final label = Text(
+      'This device',
+      style: ts(context.type.uiSmall, context.colors.textSecondary),
     );
     final pad = compact ? Layout.gutter : Space.xxl;
     if (!compact) {
+      final thisDevice = Row(
+        children: [label, const Gap(Space.sm), Flexible(child: CopyableText(id))],
+      );
       return Padding(
         padding: EdgeInsets.symmetric(horizontal: pad, vertical: Space.md),
         child: Row(
@@ -350,7 +350,8 @@ class _DeviceFooter extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          thisDevice,
+          // The ID goes under the label when a narrow phone or large text leaves no room beside it.
+          InlineOrStacked(main: label, trailing: CopyableText(id), gap: Space.sm),
           const Gap(Space.md),
           SecondaryButton(label: 'Settings', onTap: () => openSettings(context, state)),
           const Gap(Space.sm),

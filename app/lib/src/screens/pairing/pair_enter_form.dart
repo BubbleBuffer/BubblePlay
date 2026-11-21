@@ -69,7 +69,7 @@ class _PairEnterFormState extends State<PairEnterForm> {
                   'and a link.'
               : 'Ask a PC that allows remote pairing. A device that is already paired can '
                   'approve it.',
-          style: ts(context.type.ui, c.textSecondary),
+          style: ts(context.type.ui, c.textSecondary, weight: Weight.regular),
         ),
         const Gap(Space.xl),
         if (withCode) ...[

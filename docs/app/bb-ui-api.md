@@ -1,9 +1,11 @@
 # bb_ui API cheat sheet
 
-The app is on bb_ui 0.8. The root setup and tokens below are 0.8. The component sections from
+The app is on bb_ui 0.9 (0.8's API with token values from the design repository and the
+weights `regular`, `strong`, `display`, `displayStrong`). The root setup and tokens below are
+current. The component sections from
 `buttons.dart` on were written against 0.7.0: in 0.8 every size there is a token (`ControlSize`,
 `IconSize`, `Space`, a `context.type` role) instead of a number, `mobile` parameters are gone,
-and [the migration guide](https://github.com/BubbleBuffer/bb-ui/blob/1e3863ac3c9a0123fb5e502e890005701423a586/docs/migration-0.8.md)
+and [the migration guide](https://github.com/BubbleBuffer/bb-ui/blob/012d9f283b8378fb7197c6238e7068dfd3205c30/docs/migration-0.8.md)
 lists each rename. When a signature here disagrees with the source, the source wins.
 
 Source: `packages/bb_ui/lib` of the bb-ui git dependency (pinned in `app/pubspec.lock`) (barrel `bb_ui.dart`).

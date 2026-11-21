@@ -35,7 +35,7 @@ class PairConfirmView extends StatelessWidget {
           const Gap(Space.sm),
           Text(
             'The same number must show on the PC.',
-            style: ts(context.type.uiSmall, c.textTertiary),
+            style: ts(context.type.uiSmall, c.textTertiary, weight: Weight.regular),
           ),
         ],
       ],

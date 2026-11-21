@@ -15,7 +15,7 @@ dependencies:
   bb_ui:
     git:
       url: https://github.com/BubbleBuffer/bb-ui.git
-      ref: 1e3863ac3c9a0123fb5e502e890005701423a586
+      ref: 012d9f283b8378fb7197c6238e7068dfd3205c30
       path: packages/bb_ui
   file_picker: ^13.3.0
   qr: ^3.0.2

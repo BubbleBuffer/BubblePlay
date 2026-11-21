@@ -172,7 +172,7 @@ class _FeedbackSheetState extends State<FeedbackSheet> {
         const Gap(Space.sm),
         Text(
           'Includes the recent log lines and errors from this device.',
-          style: ts(ty.uiSmall, c.textTertiary),
+          style: ts(ty.uiSmall, c.textTertiary, weight: Weight.regular),
         ),
         if (_failed) ...[
           const Gap(Space.md),
