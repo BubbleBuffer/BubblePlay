@@ -85,7 +85,10 @@ jobs:
           flutter pub get
       - name: Analyze
         working-directory: app
-        run: flutter analyze lib test
+        # dart analyze, not flutter analyze, and on the package rather than `lib test`: only then
+        # does the analyzer run the bb_lints plugin (analysis_options.yaml) and report its
+        # diagnostics. The first run fetches and compiles the plugin.
+        run: dart analyze --fatal-infos
       - name: Widget, golden and contract tests
         working-directory: app
         run: |

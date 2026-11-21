@@ -134,7 +134,7 @@ class _StreamVideoState extends State<StreamVideo> {
     if (texture == null) {
       return Center(
         child: Padding(
-          padding: const EdgeInsets.all(24),
+          padding: const EdgeInsets.all(Space.xl),
           child: Text(
             widget.waiting,
             textAlign: TextAlign.center,

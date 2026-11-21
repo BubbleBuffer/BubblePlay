@@ -17,6 +17,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
+import '../app_tokens.dart';
 import '../logging/app_log.dart';
 import '../model/model.dart';
 import '../screens/settings_screen.dart' show appVersion;
@@ -174,9 +175,11 @@ class FeedbackController {
     );
   }
 
-  Future<T?> _showSheet<T>(BuildContext context, WidgetBuilder builder) => context.mobile
+  /// A bottom sheet in a narrow window, a centred panel otherwise (FeedbackSheet matches).
+  Future<T?> _showSheet<T>(BuildContext context, WidgetBuilder builder) =>
+      context.sizeClass.isCompact
       ? showSheet<T>(context, builder)
-      : showModalPanel<T>(context, builder, width: 560, shrink: true);
+      : showModalPanel<T>(context, builder, width: AppSizes.feedbackWidth, shrink: true);
 
   /// The Flutter UI as PNG, or null when there is no picture to take or it takes too long.
   Future<Uint8List?> _capture(double devicePixelRatio) async {

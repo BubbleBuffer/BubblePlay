@@ -23,7 +23,7 @@ class Gate extends StatelessWidget {
         if (state == null) {
           return Center(
             child: controller.error == null
-                ? const Spinner(size: 24)
+                ? const Spinner(size: IconSize.xl)
                 : _CoreError(onRetry: controller.refresh),
           );
         }
@@ -48,14 +48,14 @@ class Gate extends StatelessWidget {
           children: [
             Positioned.fill(child: screen),
             Positioned(
-              left: 16,
-              right: 16,
-              top: 16,
+              left: Space.lg,
+              right: Space.lg,
+              top: Space.lg,
               child: SafeArea(
                 child: Align(
                   alignment: Alignment.topCenter,
                   child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 480),
+                    constraints: const BoxConstraints(maxWidth: Widths.sheet),
                     child: NoticeBanner(
                       kind: NoticeKind.danger,
                       title: 'That did not work',
@@ -80,9 +80,9 @@ class _CoreError extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.all(24),
+        padding: const EdgeInsets.all(Space.xl),
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 420),
+          constraints: const BoxConstraints(maxWidth: Widths.form),
           child: NoticeBanner(
             kind: NoticeKind.danger,
             title: 'BubblePlay could not start',

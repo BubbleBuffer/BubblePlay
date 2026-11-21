@@ -2,6 +2,7 @@ import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
+import '../app_tokens.dart';
 import '../feedback/feedback_controller.dart';
 import '../logging/app_log.dart';
 import '../model/model.dart';
@@ -14,7 +15,7 @@ const appVersion = '0.1.0';
 Future<void> openSettings(BuildContext context, AppState state) {
   final device = state.thisDevice;
   final body = _SettingsBody(deviceId: device.id, keyPath: device.keyPath);
-  if (context.mobile) {
+  if (context.sizeClass.isCompact) {
     return pushScreen<void>(
       context,
       (page) => ScreenScaffold(title: 'Settings', body: body),
@@ -24,8 +25,8 @@ Future<void> openSettings(BuildContext context, AppState state) {
   return showModalPanel<void>(
     context,
     (panel) => _SettingsPanel(body: body),
-    width: 560,
-    height: 520,
+    width: AppSizes.settingsWidth,
+    height: AppSizes.settingsHeight,
   );
 }
 
@@ -40,7 +41,7 @@ class _SettingsPanel extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Padding(
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 4),
+            padding: const EdgeInsets.fromLTRB(Space.xl, Space.xl, Space.xl, Space.xxs),
             child: Row(
               children: [
                 Expanded(
@@ -102,18 +103,18 @@ class _SettingsBodyState extends State<_SettingsBody> {
   @override
   Widget build(BuildContext context) {
     final env = AppScope.of(context);
-    final mobile = context.mobile;
+    final compact = context.sizeClass.isCompact;
     final theme = env.theme;
     return ListView(
-      padding: mobile ? const EdgeInsets.all(16) : const EdgeInsets.all(24),
+      padding: EdgeInsets.all(compact ? Layout.gutter : Space.xl),
       children: [
         const SettingsHeading('This device'),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         SettingsRow(
           label: 'Device ID',
-          stack: mobile,
+          stack: compact,
           trailing: SizedBox(
-            width: mobile ? null : 240,
+            width: compact ? null : AppSizes.settingsValue,
             child: CopyableText(widget.deviceId),
           ),
         ),
@@ -124,14 +125,14 @@ class _SettingsBodyState extends State<_SettingsBody> {
           trailing: OutlineButton(label: 'Export', onTap: _export),
         ),
         if (_exportFailed) ...[
-          const SizedBox(height: 12),
+          const Gap(Space.md),
           const NoticeBanner(
             kind: NoticeKind.danger,
             message: 'The key could not be exported.',
           ),
         ],
-        const SettingsHeading('Appearance', top: 24),
-        const SizedBox(height: 8),
+        const SettingsHeading('Appearance', top: Space.xl),
+        const Gap(Space.sm),
         if (theme != null)
           SettingsRow(
             label: 'Theme',
@@ -145,8 +146,8 @@ class _SettingsBodyState extends State<_SettingsBody> {
               ),
             ),
           ),
-        const SettingsHeading('About', top: 24),
-        const SizedBox(height: 8),
+        const SettingsHeading('About', top: Space.xl),
+        const Gap(Space.sm),
         SettingsRow(
           label: 'Version',
           trailing: Text(appVersion, style: ts(context.type.ui, context.colors.textSecondary)),
@@ -155,8 +156,8 @@ class _SettingsBodyState extends State<_SettingsBody> {
           label: 'Stored on this device',
           description: 'The key and the list of PCs never leave this device.',
         ),
-        const SettingsHeading('Support', top: 24),
-        const SizedBox(height: 8),
+        const SettingsHeading('Support', top: Space.xl),
+        const Gap(Space.sm),
         SettingsRow(
           label: 'Report a problem',
           description: 'Send a note with the recent logs from this device.',
