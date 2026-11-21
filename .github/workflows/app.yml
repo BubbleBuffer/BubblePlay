@@ -73,7 +73,9 @@ jobs:
         with:
           channel: stable
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          cache: true
+          # The action's SDK cache runs actions/cache by tag, which the
+          # repository's pinned-SHA policy rejects before any step starts.
+          cache: false
       - name: Flutter configuration
         run: |
           flutter --version
