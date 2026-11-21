@@ -4,14 +4,16 @@ import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
+import '../app_tokens.dart';
 import '../model/model.dart';
 import '../devices/devices_controller.dart';
 import 'pc_actions.dart';
 import 'settings_screen.dart';
 import 'this_pc_detail.dart';
 
-/// Your PCs, with "This PC" pinned above them on Windows. Desktop shows the list beside the
-/// selected PC's details; a phone shows the list alone and opens a PC's actions from its row.
+/// Your PCs, with "This PC" pinned above them on Windows. An expanded window shows the list beside
+/// the selected PC's details; a narrower one (a phone, a small window) shows the list alone and
+/// opens a PC's actions from its row.
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.state});
 
@@ -62,7 +64,9 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   Widget build(BuildContext context) {
     final env = AppScope.of(context);
-    final mobile = context.mobile;
+    // The list beside the details needs an expanded window. A narrower one shows the list alone
+    // and opens a PC's actions or This PC from its row.
+    final compact = !context.sizeClass.atLeast(SizeClass.expanded);
     final list = _PcList(
       state: widget.state,
       showThisPc: env.isWindows,
@@ -70,7 +74,7 @@ class _HomeScreenState extends State<HomeScreen> {
       thisPcSelected: _thisPcSelected,
       onSelectThisPc: () {
         final devices = env.devices;
-        if (mobile && devices != null) {
+        if (compact && devices != null) {
           // Narrow window: the detail is a pushed page, like a PC's actions.
           pushScreen<void>(
             context,
@@ -85,16 +89,16 @@ class _HomeScreenState extends State<HomeScreen> {
         _selectedId = pc.id;
         _thisPcSelected = false;
       }),
-      mobile: mobile,
+      compact: compact,
     );
-    if (mobile) return SafeArea(child: list);
+    if (compact) return SafeArea(child: list);
     final selected = _selected;
     return Row(
       children: [
         Expanded(child: list),
         const VLine(height: double.infinity),
         SizedBox(
-          width: 380,
+          width: AppSizes.detailPane,
           child: _thisPcSelected && env.devices != null
               ? ThisPcDetail(devices: env.devices!)
               : selected == null
@@ -115,7 +119,7 @@ class _PcList extends StatelessWidget {
     required this.onSelectThisPc,
     required this.selectedId,
     required this.onSelect,
-    required this.mobile,
+    required this.compact,
   });
 
   final AppState state;
@@ -125,48 +129,48 @@ class _PcList extends StatelessWidget {
   final VoidCallback onSelectThisPc;
   final String? selectedId;
   final ValueChanged<RemotePc> onSelect;
-  final bool mobile;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     final controller = AppScope.of(context).controller;
     final pcs = state.pcs;
-    final pad = mobile ? 16.0 : 32.0;
+    final pad = compact ? Layout.gutter : Space.xxl;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Expanded(
           child: ListView(
-            padding: EdgeInsets.fromLTRB(pad, mobile ? 16 : 24, pad, 16),
+            padding: EdgeInsets.fromLTRB(pad, compact ? Space.lg : Space.xl, pad, Space.lg),
             children: [
               if (showThisPc) ...[
                 const SectionLabel('This PC', icon: Ico.monitorPlay),
-                const SizedBox(height: 8),
+                const Gap(Space.sm),
                 ThisPcRow(
                   host: state.host,
                   devices: devices,
                   selected: thisPcSelected,
                   onSelect: onSelectThisPc,
                 ),
-                const SizedBox(height: 16),
+                const Gap(Space.lg),
                 const HLine(),
-                const SizedBox(height: 24),
+                const Gap(Space.xl),
               ],
               SectionHeader(
                 'Your PCs',
                 subtitle: "Other PCs paired with this device's key.",
-                trailing: mobile
+                trailing: compact
                     ? null
                     : IntrinsicWidth(
                         child: SecondaryButton(
                           label: 'Pair a new PC',
                           icon: Ico.plus,
-                          height: 36,
+                          size: ControlSize.lg,
                           onTap: () => controller.act(const StartPairing()),
                         ),
                       ),
               ),
-              const SizedBox(height: 12),
+              const Gap(Space.md),
               if (pcs.isEmpty)
                 EmptyState(
                   icon: Ico.monitor,
@@ -183,14 +187,14 @@ class _PcList extends StatelessWidget {
                     key: ValueKey(pc.id),
                     pc: pc,
                     selected: pc.id == selectedId,
-                    mobile: mobile,
+                    compact: compact,
                     onSelect: () => onSelect(pc),
                   ),
             ],
           ),
         ),
         const HLine(),
-        _DeviceFooter(state: state, mobile: mobile),
+        _DeviceFooter(state: state, compact: compact),
       ],
     );
   }
@@ -272,13 +276,13 @@ class PcRow extends StatelessWidget {
     super.key,
     required this.pc,
     required this.selected,
-    required this.mobile,
+    required this.compact,
     required this.onSelect,
   });
 
   final RemotePc pc;
   final bool selected;
-  final bool mobile;
+  final bool compact;
   final VoidCallback onSelect;
 
   @override
@@ -291,43 +295,48 @@ class PcRow extends StatelessWidget {
       status: pcStatusPill(pc),
       id: pc.id,
       meta: [pcLastText(pc)],
-      selected: selected && !mobile,
-      onTap: mobile ? connect : onSelect,
-      trailing: mobile
+      selected: selected && !compact,
+      onTap: compact ? connect : onSelect,
+      trailing: compact
           ? IconBtn(
               Ico.more,
-              size: 40,
+              size: ControlSize.xl,
               semanticLabel: 'Actions for ${pc.name}',
               onTap: () => showPcActions(context, pc),
             )
           : (selected
-              ? PrimaryButton(label: 'Connect', height: 32, icon: Ico.monitorPlay, onTap: connect)
-              : SecondaryButton(label: 'Connect', height: 32, onTap: connect)),
+              ? PrimaryButton(
+                  label: 'Connect',
+                  size: ControlSize.md,
+                  icon: Ico.monitorPlay,
+                  onTap: connect,
+                )
+              : SecondaryButton(label: 'Connect', size: ControlSize.md, onTap: connect)),
     );
   }
 }
 
 class _DeviceFooter extends StatelessWidget {
-  const _DeviceFooter({required this.state, required this.mobile});
+  const _DeviceFooter({required this.state, required this.compact});
 
   final AppState state;
-  final bool mobile;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     final controller = AppScope.of(context).controller;
     final id = state.thisDevice.id;
-    final thisDevice = Row(
-      children: [
-        Text('This device', style: ts(context.type.uiSmall, context.colors.textSecondary)),
-        const SizedBox(width: 8),
-        Flexible(child: CopyableText(id, size: 13)),
-      ],
+    final label = Text(
+      'This device',
+      style: ts(context.type.uiSmall, context.colors.textSecondary),
     );
-    final pad = mobile ? 16.0 : 32.0;
-    if (!mobile) {
+    final pad = compact ? Layout.gutter : Space.xxl;
+    if (!compact) {
+      final thisDevice = Row(
+        children: [label, const Gap(Space.sm), Flexible(child: CopyableText(id))],
+      );
       return Padding(
-        padding: EdgeInsets.symmetric(horizontal: pad, vertical: 12),
+        padding: EdgeInsets.symmetric(horizontal: pad, vertical: Space.md),
         child: Row(
           children: [
             Expanded(child: thisDevice),
@@ -337,14 +346,15 @@ class _DeviceFooter extends StatelessWidget {
       );
     }
     return Padding(
-      padding: EdgeInsets.fromLTRB(pad, 12, pad, 16),
+      padding: EdgeInsets.fromLTRB(pad, Space.md, pad, Space.lg),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          thisDevice,
-          const SizedBox(height: 12),
+          // The ID goes under the label when a narrow phone or large text leaves no room beside it.
+          InlineOrStacked(main: label, trailing: CopyableText(id), gap: Space.sm),
+          const Gap(Space.md),
           SecondaryButton(label: 'Settings', onTap: () => openSettings(context, state)),
-          const SizedBox(height: 8),
+          const Gap(Space.sm),
           PrimaryButton(
             label: 'Pair a PC',
             expand: true,

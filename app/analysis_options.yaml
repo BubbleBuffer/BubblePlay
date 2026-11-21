@@ -3,17 +3,28 @@
 #
 # The issues identified by the analyzer are surfaced in the UI of Dart-enabled
 # IDEs (https://dart.dev/tools#ides-and-editors). The analyzer can also be
-# invoked from the command line by running `flutter analyze`.
+# invoked from the command line by running `dart analyze`.
 
 # The following line activates a set of recommended lints for Flutter apps,
 # packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
+
+# bb-ui's token rules (no hand-written spacing, sizes, type, colours or durations in widgets).
+# Only `dart analyze` reports them; `flutter analyze` does not run analyzer plugins.
+plugins:
+  bb_lints:
+    git:
+      url: https://github.com/BubbleBuffer/bb-ui.git
+      ref: 012d9f283b8378fb7197c6238e7068dfd3205c30
+      path: packages/bb_lints
 
 analyzer:
   exclude:
     - build/**
     - android/**
     - windows/**
+    # The vendored cargokit build tool: its own package, not part of the app.
+    - rust_builder/**
 
 linter:
   # The lint rules applied to this project can be customized in the

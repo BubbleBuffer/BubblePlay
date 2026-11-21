@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import 'app_controller.dart';
+import 'app_tokens.dart';
 import 'devices/devices_controller.dart';
 import 'feedback/feedback_controller.dart';
 import 'feedback/shake_detector.dart';
@@ -152,23 +153,32 @@ class _BubblePlayAppState extends State<BubblePlayApp> {
         builder: (context, child) {
           final dark = (brightness ?? choice?.value ?? MediaQuery.platformBrightnessOf(context)) ==
               Brightness.dark;
-          return LayoutBuilder(
-            builder: (context, constraints) => AppTheme(
-              colors: dark ? AppColors.darkTheme : AppColors.light,
-              formFactor: FormFactor.forWidth(constraints.maxWidth),
-              child: AppScope(
-                env: env,
-                child: Builder(
-                  builder: (context) => ColoredBox(
-                    color: context.colors.bgPrimary,
-                    child: DefaultTextStyle(
-                      style: ts(context.type.body, context.colors.textPrimary),
-                      child: ScrollConfiguration(
-                        behavior: const AppScrollBehavior(),
-                        child: FeedbackHost(
-                          navigatorKey: _navigatorKey,
-                          tracker: _tracker,
-                          child: child!,
+          // Sizes and type follow how the person points (a mouse on Windows, a finger on
+          // Android); the layout follows the room the window gives (see SizeClass). Text follows
+          // the system size up to [maxTextScale].
+          return MediaQuery.withClampedTextScaling(
+            maxScaleFactor: maxTextScale,
+            child: LayoutBuilder(
+              builder: (context, constraints) => SizeClassScope(
+                sizeClass: SizeClass.forWidth(constraints.maxWidth),
+                child: AppTheme(
+                  colors: dark ? AppColors.darkTheme : AppColors.light,
+                  density: env.isWindows ? Density.pointer : Density.touch,
+                  child: AppScope(
+                    env: env,
+                    child: Builder(
+                      builder: (context) => ColoredBox(
+                        color: context.colors.bgPrimary,
+                        child: DefaultTextStyle(
+                          style: ts(context.type.body, context.colors.textPrimary),
+                          child: ScrollConfiguration(
+                            behavior: const AppScrollBehavior(),
+                            child: FeedbackHost(
+                              navigatorKey: _navigatorKey,
+                              tracker: _tracker,
+                              child: child!,
+                            ),
+                          ),
                         ),
                       ),
                     ),

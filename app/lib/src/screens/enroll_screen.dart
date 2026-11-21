@@ -2,6 +2,7 @@ import 'package:bb_ui/bb_ui.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
+import '../app_tokens.dart';
 import '../model/model.dart';
 
 /// The file this device stores its own key in. Its passphrase prompt is the unlock step, not an
@@ -50,15 +51,15 @@ class _StepPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final mobile = context.mobile;
+    final compact = context.sizeClass.isCompact;
     final page = Center(
       child: SingleChildScrollView(
         padding: EdgeInsets.symmetric(
-          horizontal: mobile ? 16 : 0,
-          vertical: mobile ? 24 : 32,
+          horizontal: compact ? Layout.gutter : 0,
+          vertical: compact ? Space.xl : Space.xxl,
         ),
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 440),
+          constraints: const BoxConstraints(maxWidth: AppSizes.stepPage),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -67,7 +68,7 @@ class _StepPage extends StatelessWidget {
         ),
       ),
     );
-    return mobile ? SafeArea(child: page) : page;
+    return compact ? SafeArea(child: page) : page;
   }
 }
 
@@ -86,12 +87,12 @@ class _Choose extends StatelessWidget {
               'BubblePlay identifies this device with a key. Create one here or '
               'import a key file from another device.',
         ),
-        const SizedBox(height: 24),
+        const Gap(Space.xl),
         PrimaryButton(
           label: 'Create key',
           onTap: () => controller.act(const CreateKey()),
         ),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         SecondaryButton(
           label: 'Import key file',
           onTap: () => importKeyFile(context),
@@ -128,42 +129,43 @@ class _CreatedState extends State<_Created> {
   @override
   Widget build(BuildContext context) {
     final controller = AppScope.of(context).controller;
-    final mobile = context.mobile;
+    // A narrow window shows the ID and path smaller so they fit on one line.
+    final compact = context.sizeClass.isCompact;
     return _StepPage(
       children: [
         const SectionHeader(
           'Key created',
           subtitle: 'Export a copy of the key to restore this device later.',
         ),
-        const SizedBox(height: 24),
+        const Gap(Space.xl),
         SectionLabel('Device ID'),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         FittedBox(
           fit: BoxFit.scaleDown,
           alignment: Alignment.centerLeft,
           child: CodeDisplay(
             widget.deviceId,
             groups: const [4, 4, 4, 4],
-            size: mobile ? CodeDisplaySize.medium : CodeDisplaySize.large,
+            size: compact ? CodeDisplaySize.medium : CodeDisplaySize.large,
           ),
         ),
-        const SizedBox(height: 20),
+        const Gap(Space.xl),
         const SectionLabel('Stored at', icon: Ico.folder),
-        const SizedBox(height: 8),
-        CopyableText(widget.keyPath, size: mobile ? 12 : 13),
+        const Gap(Space.sm),
+        CopyableText(widget.keyPath, type: compact ? context.type.codeSmall : null),
         if (_saved) ...[
-          const SizedBox(height: 20),
+          const Gap(Space.xl),
           const NoticeBanner(
             kind: NoticeKind.info,
             message: 'Key file saved.',
           ),
         ],
-        const SizedBox(height: 24),
+        const Gap(Space.xl),
         PrimaryButton(
           label: 'Continue',
           onTap: () => controller.act(const CancelFlow()),
         ),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         SecondaryButton(
           label: 'Export key',
           icon: Ico.copy,
@@ -232,28 +234,28 @@ class _UnlockState extends State<_Unlock> {
               ? 'This device has a key. Enter its passphrase to use it.'
               : '${widget.fileName} is protected with a passphrase.',
         ),
-        const SizedBox(height: 20),
+        const Gap(Space.xl),
         if (error != null) ...[
           NoticeBanner(kind: NoticeKind.danger, message: error),
-          const SizedBox(height: 16),
+          const Gap(Space.lg),
         ],
         ObscuredField(
           controller: _passphrase,
           autofocus: true,
           onSubmitted: (_) => _submit(),
         ),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         Text(
           'The passphrase is only used on this device.',
-          style: ts(context.type.uiSmall, colors.textTertiary),
+          style: ts(context.type.uiSmall, colors.textTertiary, weight: Weight.regular),
         ),
-        const SizedBox(height: 24),
+        const Gap(Space.xl),
         PrimaryButton(
           label: 'Unlock',
           onTap: _passphrase.text.isEmpty ? null : _submit,
         ),
         if (!own) ...[
-          const SizedBox(height: 8),
+          const Gap(Space.sm),
           SecondaryButton(
             label: 'Cancel',
             onTap: () => controller.act(const CancelFlow()),
@@ -280,18 +282,18 @@ class _Refused extends StatelessWidget {
           'Key file not accepted',
           subtitle: 'Choose another file, or go back and create a key instead.',
         ),
-        const SizedBox(height: 20),
+        const Gap(Space.xl),
         NoticeBanner(
           kind: NoticeKind.danger,
           title: fileName,
           message: reason,
         ),
-        const SizedBox(height: 24),
+        const Gap(Space.xl),
         PrimaryButton(
           label: 'Choose another file',
           onTap: () => importKeyFile(context),
         ),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         SecondaryButton(
           label: 'Back',
           onTap: () => controller.act(const CancelFlow()),

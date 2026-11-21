@@ -69,21 +69,21 @@ class _PairEnterFormState extends State<PairEnterForm> {
                   'and a link.'
               : 'Ask a PC that allows remote pairing. A device that is already paired can '
                   'approve it.',
-          style: ts(context.type.ui, c.textSecondary),
+          style: ts(context.type.ui, c.textSecondary, weight: Weight.regular),
         ),
-        const SizedBox(height: 20),
+        const Gap(Space.xl),
         if (withCode) ...[
           const SectionLabel('Pairing link (optional)'),
-          const SizedBox(height: 6),
+          const Gap(Space.xs),
           SettingsField(
             controller: _link,
             mono: true,
             placeholder: 'https://relay.example/pair#...',
           ),
-          const SizedBox(height: 16),
+          const Gap(Space.lg),
         ],
         const SectionLabel('PC ID'),
-        const SizedBox(height: 6),
+        const Gap(Space.xs),
         CodeField(
           controller: _pcId,
           groups: _pcIdGroups,
@@ -91,9 +91,9 @@ class _PairEnterFormState extends State<PairEnterForm> {
           semanticLabel: 'PC ID',
         ),
         if (withCode) ...[
-          const SizedBox(height: 16),
+          const Gap(Space.lg),
           const SectionLabel('One-time code'),
-          const SizedBox(height: 6),
+          const Gap(Space.xs),
           CodeField(
             controller: _code,
             groups: _codeGroups,
@@ -101,9 +101,9 @@ class _PairEnterFormState extends State<PairEnterForm> {
             semanticLabel: 'One-time code',
           ),
         ],
-        const SizedBox(height: 16),
+        const Gap(Space.lg),
         const SectionLabel('Relay'),
-        const SizedBox(height: 6),
+        const Gap(Space.xs),
         SettingsField(
           controller: _relay,
           mono: true,
@@ -111,14 +111,14 @@ class _PairEnterFormState extends State<PairEnterForm> {
           onSubmitted: (_) => _submit(),
         ),
         if (error != null) ...[
-          const SizedBox(height: 16),
+          const Gap(Space.lg),
           NoticeBanner(
             kind: NoticeKind.danger,
             title: 'Pairing did not start',
             message: error,
           ),
         ],
-        const SizedBox(height: 20),
+        const Gap(Space.xl),
         Row(
           children: [
             Expanded(
@@ -127,11 +127,11 @@ class _PairEnterFormState extends State<PairEnterForm> {
                 onTap: _submit,
               ),
             ),
-            const SizedBox(width: 8),
+            const Gap(Space.sm),
             SecondaryButton(label: 'Cancel', onTap: () => controller.act(const CancelFlow())),
           ],
         ),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         Align(
           alignment: Alignment.centerLeft,
           child: TextBtn(

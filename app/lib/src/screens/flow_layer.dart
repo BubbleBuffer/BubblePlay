@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart' hide Action, Flow;
 
 import '../app.dart';
+import '../app_tokens.dart';
 import '../model/model.dart';
 import 'pairing/pair_confirm_view.dart';
 import 'pairing/pair_enter_form.dart';
@@ -57,7 +58,7 @@ class FlowLayer extends StatelessWidget {
               child: ColoredBox(color: context.colors.overlay),
             ),
           ),
-          if (context.mobile)
+          if (context.sizeClass.isCompact)
             Positioned.fill(child: _PhonePane(title: _title, onBack: cancel, child: step))
           else
             Positioned.fill(child: _DesktopPane(title: _title, child: step)),
@@ -67,8 +68,8 @@ class FlowLayer extends StatelessWidget {
   }
 }
 
-/// Desktop: a centred 480 px panel on the scrim, scrolling when the content is taller than the
-/// window.
+/// Wider window: a centred 480 px panel on the scrim, scrolling when the content is taller than
+/// the window.
 class _DesktopPane extends StatelessWidget {
   const _DesktopPane({required this.title, required this.child});
 
@@ -80,9 +81,11 @@ class _DesktopPane extends StatelessWidget {
     final c = context.colors;
     return Center(
       child: ConstrainedBox(
-        constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(context).height * 0.86),
+        constraints: BoxConstraints(
+          maxHeight: MediaQuery.sizeOf(context).height * AppSizes.flowPaneHeight,
+        ),
         child: Container(
-          width: 480,
+          width: Widths.sheet,
           decoration: BoxDecoration(
             color: c.bgElevated,
             borderRadius: Radii.panel,
@@ -90,13 +93,13 @@ class _DesktopPane extends StatelessWidget {
             boxShadow: c.shadowMenu,
           ),
           child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.all(Space.xl),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
                 SectionHeader(title),
-                const SizedBox(height: 16),
+                const Gap(Space.lg),
                 child,
               ],
             ),
@@ -107,7 +110,8 @@ class _DesktopPane extends StatelessWidget {
   }
 }
 
-/// Phone: the flow takes the whole screen, with a 44 px bar carrying the back arrow and title.
+/// Narrow window: the flow takes the whole screen, with a 44 px bar carrying the back arrow and
+/// title.
 class _PhonePane extends StatelessWidget {
   const _PhonePane({required this.title, required this.onBack, required this.child});
 
@@ -124,13 +128,14 @@ class _PhonePane extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SizedBox(
-              height: Layout.topbarHeight,
+            ConstrainedBox(
+              // At least the bar's height; taller when large system text needs it.
+              constraints: const BoxConstraints(minHeight: Layout.topbarHeight),
               child: Row(
                 children: [
-                  const SizedBox(width: 4),
+                  const Gap(Space.xxs),
                   IconBtn(Ico.chevronLeft, semanticLabel: 'Back', onTap: onBack),
-                  const SizedBox(width: 4),
+                  const Gap(Space.xxs),
                   Expanded(
                     child: Text(
                       title,
@@ -139,16 +144,21 @@ class _PhonePane extends StatelessWidget {
                       style: ts(context.type.h3, c.textPrimary),
                     ),
                   ),
-                  const SizedBox(width: 16),
+                  const Gap(Space.lg),
                 ],
               ),
             ),
             Expanded(
               child: ListView(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                padding: const EdgeInsets.fromLTRB(
+                  Layout.gutter,
+                  Space.sm,
+                  Layout.gutter,
+                  Space.xl,
+                ),
                 children: [
                   SectionHeader(title, large: false),
-                  const SizedBox(height: 12),
+                  const Gap(Space.md),
                   child,
                 ],
               ),
@@ -176,7 +186,7 @@ class _UnavailableStep extends StatelessWidget {
           kind: NoticeKind.attention,
           message: 'This step needs streaming, which this version does not have.',
         ),
-        const SizedBox(height: 20),
+        const Gap(Space.xl),
         SecondaryButton(label: 'Close', onTap: () => controller.act(const CancelFlow())),
       ],
     );

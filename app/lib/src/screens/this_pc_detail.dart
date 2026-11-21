@@ -21,10 +21,10 @@ class ThisPcDetail extends StatelessWidget {
         builder: (context, _) {
           final state = devices.state;
           return ListView(
-            padding: const EdgeInsets.all(24),
+            padding: const EdgeInsets.all(Space.xl),
             children: [
               _Header(state: state),
-              const SizedBox(height: 20),
+              const Gap(Space.xl),
               if (state.connection case LinkDisconnected(:final reason))
                 _NotConnected(reason: reason)
               else if (state.connection is LinkConnecting)
@@ -37,10 +37,10 @@ class ThisPcDetail extends StatelessWidget {
                     message: message,
                     onDismiss: devices.dismiss,
                   ),
-                  const SizedBox(height: 16),
+                  const Gap(Space.lg),
                 ],
                 _PairingSection(devices: devices, state: state),
-                const SizedBox(height: 28),
+                const Gap(Space.xxl),
                 _DeviceList(devices: devices, state: state),
               ],
             ],
@@ -63,15 +63,15 @@ class _Header extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         const SectionLabel('This PC', icon: Ico.server),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         Wrap(
-          spacing: 10,
-          runSpacing: 6,
+          spacing: Space.md,
+          runSpacing: Space.xs,
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             Text(
               state.pcName ?? 'This PC',
-              style: tsDisplay(context.type.h1, c.textPrimary, weight: 700),
+              style: tsDisplay(context.type.h1, c.textPrimary, weight: Weight.displayStrong),
             ),
             if (connected)
               StatusPill(
@@ -83,12 +83,12 @@ class _Header extends StatelessWidget {
           ],
         ),
         if (pcId != null) ...[
-          const SizedBox(height: 12),
+          const Gap(Space.md),
           Row(
             children: [
               Text('PC ID', style: ts(context.type.uiSmall, c.textSecondary)),
-              const SizedBox(width: 8),
-              Flexible(child: CopyableText(pcId, size: 13)),
+              const Gap(Space.sm),
+              Flexible(child: CopyableText(pcId)),
             ],
           ),
         ],
@@ -104,7 +104,7 @@ class _Connecting extends StatelessWidget {
   Widget build(BuildContext context) => Row(
         children: [
           const Spinner(),
-          const SizedBox(width: 10),
+          const Gap(Space.md),
           Text(
             'Connecting to the BubblePlay host',
             style: ts(context.type.ui, context.colors.textSecondary),
@@ -176,30 +176,30 @@ class _PairingSection extends StatelessWidget {
       final PairingWaiting waiting => Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text('Pair a device', style: tsDisplay(ty.h3, c.textPrimary, weight: 700)),
-            const SizedBox(height: 4),
+            Text('Pair a device', style: tsDisplay(ty.h3, c.textPrimary, weight: Weight.displayStrong)),
+            const Gap(Space.xxs),
             Text(
               'On the other device, add this PC with the PC ID and the code, or scan the QR code.',
-              style: ts(ty.ui, c.textSecondary, weight: 400),
+              style: ts(ty.ui, c.textSecondary, weight: Weight.regular),
             ),
-            const SizedBox(height: 16),
+            const Gap(Space.lg),
             OneTimeCode(
               waiting.codeDisplay,
               groups: const [5, 5],
               label: 'One-time code',
               caption: 'PC ID ${waiting.pcId}',
             ),
-            const SizedBox(height: 16),
+            const Gap(Space.lg),
             Center(
               child: QrFrame(
-                size: 200,
+                size: Sizes.qr,
                 caption: 'Scan with BubblePlay on the other device',
                 child: CustomPaint(painter: _QrPainter(waiting.qrUri, QrFrame.ink)),
               ),
             ),
-            const SizedBox(height: 16),
+            const Gap(Space.lg),
             _Countdown(devices: devices),
-            const SizedBox(height: 12),
+            const Gap(Space.md),
             SecondaryButton(label: 'Cancel pairing', onTap: devices.cancelPairing),
           ],
         ),
@@ -207,14 +207,14 @@ class _PairingSection extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text('${request.name} wants to pair',
-                style: tsDisplay(ty.h3, c.textPrimary, weight: 700)),
-            const SizedBox(height: 12),
+                style: tsDisplay(ty.h3, c.textPrimary, weight: Weight.displayStrong)),
+            const Gap(Space.md),
             ComparisonNumber(
               request.sasDisplay,
               label: 'Comparison number',
               caption: 'Allow only if ${request.name} shows the same number.',
             ),
-            const SizedBox(height: 16),
+            const Gap(Space.lg),
             // Deny comes first (and takes focus first): the safe answer is the one nearest
             // to hand, Allow is the dominant action.
             Row(
@@ -226,7 +226,7 @@ class _PairingSection extends StatelessWidget {
                     onTap: () => devices.deny(request.id),
                   ),
                 ),
-                const SizedBox(width: 8),
+                const Gap(Space.sm),
                 Expanded(
                   child: PrimaryButton(
                     label: 'Allow',
@@ -297,7 +297,7 @@ class _Ended extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           NoticeBanner(kind: kind, title: title, message: message),
-          const SizedBox(height: 12),
+          const Gap(Space.md),
           if (closeOnly)
             PrimaryButton(label: primaryLabel, expand: true, onTap: devices.dismiss)
           else ...[
@@ -307,7 +307,7 @@ class _Ended extends StatelessWidget {
               expand: true,
               onTap: devices.startPairing,
             ),
-            const SizedBox(height: 8),
+            const Gap(Space.sm),
             SecondaryButton(label: 'Close', onTap: devices.dismiss),
           ],
         ],
@@ -347,8 +347,8 @@ class _CountdownState extends State<_Countdown> {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        Icon20(Ico.clock, size: 16, color: context.colors.iconSecondary),
-        const SizedBox(width: 6),
+        Icon20(Ico.clock, size: IconSize.sm, color: context.colors.iconSecondary),
+        const Gap(Space.xs),
         Text(
           left == Duration.zero ? 'Code expired' : 'Expires in $minutes:$seconds',
           style: ts(context.type.ui, context.colors.textSecondary),
@@ -401,11 +401,11 @@ class _DeviceList extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         SectionHeader('Paired devices', large: false),
-        const SizedBox(height: 8),
+        const Gap(Space.sm),
         if (list.isEmpty)
           Text(
             'No devices are paired with this PC yet.',
-            style: ts(context.type.ui, c.textSecondary, weight: 400),
+            style: ts(context.type.ui, c.textSecondary, weight: Weight.regular),
           )
         else
           for (final device in list)
@@ -420,7 +420,7 @@ class _DeviceList extends StatelessWidget {
               trailing: SecondaryButton(
                 label: 'Revoke',
                 danger: true,
-                height: 32,
+                size: ControlSize.md,
                 onTap: () => _revoke(context, device),
               ),
             ),

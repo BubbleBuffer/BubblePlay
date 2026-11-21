@@ -1,6 +1,6 @@
 # BubblePlay app (Flutter)
 
-One Flutter app in `app/` for Windows and Android, built on [bb-ui](https://github.com/BubbleBuffer/bb-ui) v0.7.1 (git dependency, no Material). Milestone 1 is every screen except streaming, working against the real backends on both platforms. Milestone 3 adds the Windows "This PC" screen, which shows the host's Devices UI over a named pipe. Streaming is milestone 2. The egui client in `client-win/`, the old Win32 Devices window and the Android View UI are still in the repo and are removed in a later step.
+One Flutter app in `app/` for Windows and Android, built on [bb-ui](https://github.com/BubbleBuffer/bb-ui) 0.9 (git dependency, no Material; tokens only, enforced by the `bb_lints` analyzer plugin, see [bb-ui-api.md](bb-ui-api.md)). Milestone 1 is every screen except streaming, working against the real backends on both platforms. Milestone 3 adds the Windows "This PC" screen, which shows the host's Devices UI over a named pipe. Streaming is milestone 2. The egui client in `client-win/`, the old Win32 Devices window and the Android View UI are still in the repo and are removed in a later step.
 
 ## What is in milestone 1
 
@@ -84,4 +84,4 @@ Windows, headless against `fake-wss-host` (1080p60 H.264 recording, 20 s, dev pr
 - Online state comes from the relay's unauthenticated `GET /presence?ids=` (max 20 ids, per-prefix rate limit, no gate hold or ntfy). `PresenceService` (`app/lib/src/presence/`) asks on the PC list and every 30 s while it is visible and no session or enrollment is open; failures keep the last value and never show online. A PC with no relay URL stays offline. The Rust and Kotlin cores still report `online: false`; Dart overlays it.
 - Android fills `RemotePc.problem` from the Kotlin core's stored resource (`StateJson.pcProblem`): key changed, not accepted (relay refused or device removed), relay unreachable; anything else is null. Windows never sets a problem yet.
 - Decision 2026-10-30: the old Win32 Devices window, the egui client UI and the Android View UI stay until M2 is accepted, then are removed.
-- bb-ui v0.7.1 has `ObscuredField`, which `app/lib/src/screens/enroll_screen.dart` uses. The `PassphraseField` stand-in is removed.
+- bb-ui (since v0.7.1) has `ObscuredField`, which `app/lib/src/screens/enroll_screen.dart` uses. The `PassphraseField` stand-in is removed.
