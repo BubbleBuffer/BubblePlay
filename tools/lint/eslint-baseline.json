@@ -92,7 +92,7 @@
     "no-magic-numbers": 2
   },
   "worker/public/receiver.js": {
-    "max-lines-per-function": 6,
+    "max-lines-per-function": 5,
     "no-empty": 1,
     "no-magic-numbers": 135,
     "no-unused-vars": 3

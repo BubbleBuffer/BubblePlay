@@ -1,6 +1,6 @@
 # App focus mode
 
-Status: approved 2026-11-21. Phase 1 (host) built on 2026-11-25, unit-tested, not yet run on a live desktop; the clients are not built. Roadmap entry: [App focus mode](../roadmap.md#app-focus-mode).
+Status: approved 2026-11-21. Phase 1 (host) built on 2026-11-25 and phase 2 (browser) on 2026-11-26, both unit-tested and not yet run on a live desktop; the Windows app and Android are not built. Roadmap entry: [App focus mode](../roadmap.md#app-focus-mode).
 
 App focus mode shows one app from the PC instead of the whole desktop. The user picks the app from a list, and the client crops today's single video stream down to that app's window. It needs no change to media, input packets or the relay.
 
@@ -59,7 +59,7 @@ Limits for the fixture: at most 64 windows per list, titles cut to 256 UTF-8 byt
 | Phase | Ships | Checked by |
 | --- | --- | --- |
 | 1. Host | Window list, focus, icons; the fixture (`host/src/window_list.rs`, `window_list_service.rs`, `window_list_capture.rs`) | Unit tests for filtering, the owned-popup union, message limits and the session with a fake backend; fixture consumer test in Rust. Built 2026-11-25; the live run is still open |
-| 2. Browser | Switcher popover, crop, input mapping through the crop, notices and fallbacks | Fixture consumer test in JavaScript; a live run with a menu outside the window, a dialog, an app moved between monitors, a UAC prompt and the lock screen |
+| 2. Browser (built 2026-11-26, `worker/public/app-focus*.js`, `window-list-wire.js`) | Switcher popover, crop, input mapping through the crop, notices and fallbacks. The crop is the viewport's own zoom and pan (`FocusViewport`) plus a clip on `#visual`, so the existing pointer paths map through it, and input is held inside the window; sharp zoom is off while cropped. The controller (`app-focus.js`) sends `follow:false` on entering and restores it on leaving | Fixture consumer test in JavaScript (`worker/test/app-focus.test.mjs`); a live run with a menu outside the window, a dialog, an app moved between monitors, a UAC prompt and the lock screen |
 | 3. Windows app | The same in the Flutter session screen; the crop goes into the video processor's source rectangle | A live run as in phase 2 |
 | 4. Android | The switcher as a sheet; crop and touch mapping | A device run |
 

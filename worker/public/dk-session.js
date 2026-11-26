@@ -2,12 +2,13 @@
 // peer connections and presentation; this module grants access only after the wire checks.
 import { beginViewerHandshake } from "./dk-handshake.js";
 import { parseSdpFingerprint, signBind, verifyBind } from "./dk-crypto.js";
+import { HOST_TYPES as WINDOW_LIST_TYPES, WINDOW_LIST_CAP } from "./window-list-wire.js";
 
 export const VIEWER_CAPS = Object.freeze(["control-aead-v1", "dtls-bind-v1"]);
 // Optional caps: advertised in the hello but never required of the PC.
 export const LOGS_CAP = "client-logs-v1";
 export const PREVIEWS_CAP = "monitor-previews-v1";
-export const VIEWER_HELLO_CAPS = Object.freeze([...VIEWER_CAPS, LOGS_CAP, PREVIEWS_CAP]);
+export const VIEWER_HELLO_CAPS = Object.freeze([...VIEWER_CAPS, LOGS_CAP, PREVIEWS_CAP, WINDOW_LIST_CAP]);
 // ctl messages of the log and report upload; delivered to onLogMessage only when both sides
 // negotiated client-logs-v1, ignored otherwise.
 const LOG_TYPES = new Set(["logs-state", "logs-ack", "feedback-ack"]);
@@ -62,13 +63,13 @@ export function sessionRefusal(reason, message = "") {
  */
 export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin, epoch,
   transport = "webrtc", name = browserDeviceName(), send, onAuthenticated = () => {},
-  onMessage = () => {}, onLogMessage = () => {}, onPreviewMessage = () => {}, onBinary = () => {}, onMediaReady = () => {}, onFailure = () => {},
+  onMessage = () => {}, onLogMessage = () => {}, onPreviewMessage = () => {}, onWindowMessage = () => {}, onBinary = () => {}, onMediaReady = () => {}, onFailure = () => {},
   schedule = setTimeout, cancel = clearTimeout, helloOptions, authTimeoutMs = AUTH_TIMEOUT_MS }) {
   let ended = false, started = false, authenticated = false, capsReceived = false;
   let handshake = null, ctl = null, H = null, pcPublic = null;
   let timer = null, bindTimer = null, localBindSent = false, remoteBindVerified = false;
   let fingerprints = null, pendingBind = null, peerRevision = 0, bindWork = null;
-  let readyNotified = false, logsNegotiated = false, previewsNegotiated = false;
+  let readyNotified = false, logsNegotiated = false, previewsNegotiated = false, windowListNegotiated = false;
   let incoming = Promise.resolve();
   const mediaReady = () => !ended && capsReceived && (transport === "wss" || (localBindSent && remoteBindVerified));
   const sendWire = message => !ended && send(message) !== false;
@@ -159,6 +160,7 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         capsReceived = true;
         logsNegotiated = inner.caps.includes(LOGS_CAP);
         previewsNegotiated = inner.caps.includes(PREVIEWS_CAP);
+        windowListNegotiated = inner.caps.includes(WINDOW_LIST_CAP);
         cancel(timer); timer = null;
         blog("info", "session authenticated", { transport });
         onAuthenticated();
@@ -173,6 +175,10 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
         if (previewsNegotiated) { try { onPreviewMessage(inner); } catch { /* a picture never breaks a session */ } }
         return;
       }
+      if (WINDOW_LIST_TYPES.has(inner.type)) {
+        if (windowListNegotiated) { try { onWindowMessage(inner); } catch { /* app focus never breaks a session */ } }
+        return;
+      }
       // The message is authentic (it opened and was in order). A handler that throws on malformed
       // content costs that message, not the session; only integrity failures above end it.
       try { await onMessage(inner); } catch (error) { blog("warn", "control message dropped", { type: String(inner?.type).slice(0, 40), cause: describe(error) }); }
@@ -185,6 +191,8 @@ export function createViewerSession({ identity, pcId, pinnedPublic, relayOrigin,
     get logsNegotiated() { return logsNegotiated && !ended; },
     /** True once both sides advertised monitor-previews-v1. */
     get previewsNegotiated() { return previewsNegotiated && !ended; },
+    /** True once both sides advertised window-list-v1 (app focus mode). */
+    get windowListNegotiated() { return windowListNegotiated && !ended; },
     get mediaReady() { return mediaReady(); },
     get rtcReady() { return !ended && capsReceived && localBindSent && remoteBindVerified; },
     async start() {

@@ -20,7 +20,7 @@ const hex = value => new Uint8Array(Buffer.from(value, "hex"));
 const localSdp = `v=0\r\na=fingerprint:${hs.dtls.viewer.localFingerprint}\r\n`;
 const remoteSdp = `v=0\r\na=fingerprint:${hs.dtls.viewer.remoteFingerprint}\r\n`;
 const caps = ["control-aead-v1", "dtls-bind-v1"];
-const viewerCaps = [...caps, "client-logs-v1", "monitor-previews-v1"];
+const viewerCaps = [...caps, "client-logs-v1", "monitor-previews-v1", "window-list-v1"];
 const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 async function harness(options = {}) {
