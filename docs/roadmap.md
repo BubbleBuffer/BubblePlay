@@ -66,9 +66,9 @@ An asleep PC cannot be reached. A magic packet has to come from a device on the 
 Status: approved 2026-10-13 (option B). Waits for device IDs and keys, then an NVENC-from-session-0 probe.
 The host starts at Windows sign-in, so a signed-in user is required. Lock-screen and UAC capture are helper-based and pending live acceptance. A service-based host that works before sign-in is a larger change with its own security review. Design and decisions: [unattended-access.md](architecture/unattended-access.md).
 
-### Multi-window streaming
-Status: approved 2026-11-16 as a concept. Phase 0 desk results 2026-11-16; live spikes on Windows hardware and the driver-trust decision are open.
-A session carries several video streams: one client window per host monitor, and an application mode that shows apps instead of the desktop, with a client-side app switcher. Decisions: extra streams multiplex on the existing WSS media socket and add video m-lines on the existing WebRTC peer; target three streams, pending an encoder measurement; every client window has its own toolbar; the single-app view crops a physical monitor first, and the goal for several apps is an app canvas, a virtual monitor the apps are laid out on, which needs a virtual display driver and is skipped if the driver spike fails; Android gets the switcher and single-app view only. Design and decisions: [multi-window.md](architecture/multi-window.md).
+### App focus mode
+Status: approved 2026-11-21; nothing built.
+Show one app from the PC instead of the whole desktop: the user picks it from a list, the host brings it to the front, and the client crops the existing stream to its window. No media, input or relay change. Cut back on 2026-11-21 from a wider multi-window concept (approved 2026-11-16): several monitors at once are deferred, and several apps at once are rejected because they need per-window capture or a virtual display driver. Design and decisions: [app-focus-mode.md](architecture/app-focus-mode.md).
 
 ### More encoders and host platforms
 Status: done 2026-10-14 for Windows (merged from lane/encoders).
