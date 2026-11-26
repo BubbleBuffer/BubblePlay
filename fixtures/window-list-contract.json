@@ -1,0 +1,62 @@
+{
+  "spec": "docs/architecture/app-focus-mode.md",
+  "capability": "window-list-v1",
+  "wireVersion": 1,
+  "limits": {
+    "maxWindows": 64,
+    "maxTitleBytes": 256,
+    "maxProcessBytes": 128,
+    "iconSize": 32,
+    "maxIconBytes": 8192,
+    "minSendIntervalMs": 250,
+    "maxListMessageBytes": 65536
+  },
+  "states": ["foreground", "normal", "minimized"],
+  "focusFailureReasons": ["gone", "elevated", "refused"],
+  "hostMessages": {
+    "windowList": {
+      "note": "host to client between window-list-start and window-list-stop, when the list changed; rect is [left, top, width, height] in virtual-desktop pixels and already includes the visible windows the app owns (menus, dialogs); windows are in z-order, topmost first; a minimized window has its restored rectangle; icon is absent when none was read, monitor when the rectangle is on no monitor",
+      "text": "{\"type\":\"window-list\",\"v\":1,\"seq\":3,\"windows\":[{\"id\":265142,\"title\":\"Report.xlsx - Excel\",\"process\":\"EXCEL.EXE\",\"icon\":\"9f2c4e6a1b3d5f70\",\"rect\":[120,80,1480,820],\"monitor\":\"\\\\\\\\.\\\\DISPLAY1\",\"state\":\"foreground\"},{\"id\":131330,\"title\":\"Notes\",\"process\":\"notepad.exe\",\"rect\":[2700,200,800,600],\"monitor\":\"\\\\\\\\.\\\\DISPLAY2\",\"state\":\"normal\"},{\"id\":66012,\"title\":\"Calculator\",\"process\":\"CalculatorApp.exe\",\"rect\":[300,300,320,500],\"monitor\":\"\\\\\\\\.\\\\DISPLAY1\",\"state\":\"minimized\"}]}"
+    },
+    "focusFailed": {
+      "note": "host to client when a window-focus could not be done",
+      "text": "{\"type\":\"window-focus-failed\",\"v\":1,\"id\":265142,\"reason\":\"elevated\"}"
+    },
+    "icon": {
+      "note": "host to client, the answer to a window-icon request; png is base64 of a 32 px PNG; a client caches it by hash for the session",
+      "text": "{\"type\":\"window-icon\",\"v\":1,\"icon\":\"9f2c4e6a1b3d5f70\",\"png\":\"iVBORw0KGgo=\"}"
+    }
+  },
+  "clientMessages": {
+    "accepted": [
+      { "text": "{\"type\":\"window-focus\",\"v\":1,\"id\":265142}", "kind": "focus", "id": 265142 },
+      { "text": "{\"type\":\"window-focus\",\"id\":7}", "kind": "focus", "id": 7 },
+      { "text": "{\"type\":\"window-icon\",\"v\":1,\"icon\":\"9f2c4e6a1b3d5f70\"}", "kind": "icon", "icon": "9f2c4e6a1b3d5f70" },
+      { "text": "{\"type\":\"window-list-start\",\"v\":1}", "kind": "start" },
+      { "text": "{\"type\":\"window-list-stop\",\"v\":1}", "kind": "stop" }
+    ],
+    "rejected": [
+      { "text": "{\"type\":\"window-focus\",\"v\":1}", "why": "missing id" },
+      { "text": "{\"type\":\"window-focus\",\"v\":1,\"id\":-1}", "why": "negative id" },
+      { "text": "{\"type\":\"window-focus\",\"v\":1,\"id\":4294967296}", "why": "id beyond u32" },
+      { "text": "{\"type\":\"window-focus\",\"v\":1,\"id\":\"7\"}", "why": "id is a string" },
+      { "text": "{\"type\":\"window-focus\",\"v\":2,\"id\":7}", "why": "unknown wire version" },
+      { "text": "{\"type\":\"window-icon\",\"v\":1,\"icon\":\"9F2C4E6A1B3D5F70\"}", "why": "hash not lowercase hex" },
+      { "text": "{\"type\":\"window-icon\",\"v\":1,\"icon\":\"9f2c\"}", "why": "hash too short" },
+      { "text": "{\"type\":\"window-icon\",\"v\":1}", "why": "missing hash" }
+    ],
+    "notWindowList": [
+      "{\"type\":\"media-control\",\"action\":\"monitor\",\"monitor\":\"DISPLAY2\"}",
+      "{\"type\":\"ping\"}"
+    ]
+  },
+  "clientBehaviour": {
+    "open": "send window-list-start when the switcher opens, so lists arrive",
+    "enter": "send media-control follow:false if follow was on, then window-focus with an id from a received list",
+    "crop": "crop the decoded frame to rect minus the streamed monitor's origin, scale to fit, letterbox; map pointer positions back through the crop to monitor-relative absolute input",
+    "notOnStreamedMonitor": "show the full desktop with a notice until the app's monitor is the streamed one again",
+    "closed": "the focused id is missing from a newer list: show the full desktop and open the switcher",
+    "secureDesktop": "show the full desktop while the desktop state is not the normal desktop",
+    "leave": "send window-list-stop, then media-control follow:true if follow was on before entering"
+  }
+}

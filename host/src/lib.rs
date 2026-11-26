@@ -63,6 +63,9 @@ pub mod transport;
 pub mod trusted_devices;
 pub mod vdd;
 pub mod video_encoder;
+pub mod window_list;
+pub mod window_list_capture;
+pub mod window_list_service;
 pub mod wss_media;
 pub mod wss_v4;
 

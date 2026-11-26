@@ -16,8 +16,10 @@ mod host_benchmark;
 use host_benchmark::*;
 mod encode_retry;
 mod producer_wait;
+mod session_support;
 mod session_watchdog;
 mod viewer_display;
+use session_support::*;
 use viewer_display::{DisplayWakePolicy, ViewerDisplayHold};
 
 use bubbleplay_host::activity::Activity;
@@ -54,6 +56,9 @@ use bubbleplay_host::video_encoder::{
     device_encoder_adapter, encoder_adapter, EncoderBackend, EncoderCapabilities,
     EncoderDiscoveryCache, EncoderOverride, EncoderPreference, VideoEncoder,
 };
+use bubbleplay_host::window_list;
+use bubbleplay_host::window_list_capture::Win32Backend;
+use bubbleplay_host::window_list_service::Session as WindowListSession;
 use bubbleplay_host::wss_media;
 
 use std::collections::VecDeque;
@@ -955,112 +960,6 @@ fn run_spike(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Host-to-browser clipboard sync for the unprivileged local host. Text
-/// copied while no viewer is live is never sent: each gap re-baselines.
-#[derive(Default)]
-struct LocalClipboardPoll {
-    next_poll: Option<Instant>,
-    live: bool,
-    id: u32,
-}
-
-impl LocalClipboardPoll {
-    const INTERVAL: Duration = Duration::from_millis(300);
-
-    fn poll(
-        &mut self,
-        viewer_live: bool,
-        now: Instant,
-        input: &mut InputSink,
-        signaling: &mut Signaling,
-    ) {
-        if !viewer_live {
-            self.live = false;
-            return;
-        }
-        if self.live && self.next_poll.is_some_and(|at| now < at) {
-            return;
-        }
-        let reset = !std::mem::replace(&mut self.live, true);
-        self.next_poll = Some(now + Self::INTERVAL);
-        let Some(text) = input.poll_clipboard(reset) else {
-            return;
-        };
-        self.id = self.id.wrapping_add(1);
-        let (png, text) = text.wire();
-        let chunks = bubbleplay_host::clipboard::chunk_text(
-            &text,
-            bubbleplay_host::clipboard::HOST_CHUNK_BYTES,
-        );
-        let count = chunks.len() as u16;
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            signaling.send_clipboard_content_chunk(self.id, index as u16, count, chunk, png);
-        }
-    }
-}
-
-/// Clears the log's active session id when the serve loop ends, however it ends.
-struct SessionLogScope;
-
-impl Drop for SessionLogScope {
-    fn drop(&mut self) {
-        bubbleplay_host::logging::set_session(None);
-    }
-}
-
-/// One info line per viewer session that used monitor previews.
-fn log_preview_summary(stats: bubbleplay_host::monitor_preview_capture::ServiceStats) {
-    info!(
-        sent = stats.sender.sent,
-        bytes = stats.sender.bytes,
-        skipped_unchanged = stats.sender.skipped_unchanged,
-        skipped_gated = stats.sender.skipped_gated,
-        skipped_budget = stats.sender.skipped_budget,
-        capture_failures = stats.capture_failures,
-        max_capture_ms = stats.max_capture_ms,
-        "monitor previews: session summary"
-    );
-}
-
-/// Logs the tray's viewer markers: "viewer session started" once a viewer's
-/// media transport (RTC or WSS) is first up in this session, and "viewer
-/// session ended" when the session ends by any path (peer left, error). The
-/// tray uses these edges for lifecycle logging; current admin demand is
-/// published independently so filtering INFO cannot suppress startup.
-#[derive(Default)]
-struct ViewerSessionLog {
-    live: bool,
-}
-
-impl ViewerSessionLog {
-    fn observe(&mut self, connected: bool) {
-        if connected && !self.live {
-            self.live = true;
-            info!(
-                "{}",
-                bubbleplay_host::admin_agent::client::VIEWER_STARTED_MARKER
-            );
-        } else if !connected && self.live {
-            self.live = false;
-            info!(
-                "{}",
-                bubbleplay_host::admin_agent::client::VIEWER_ENDED_MARKER
-            );
-        }
-    }
-}
-
-impl Drop for ViewerSessionLog {
-    fn drop(&mut self) {
-        if self.live {
-            info!(
-                "{}",
-                bubbleplay_host::admin_agent::client::VIEWER_ENDED_MARKER
-            );
-        }
-    }
-}
-
 /// Full pipeline: signaling + WebRTC + media + input.
 /// WSS carries the session: stop the RTC transport thread and forget its
 /// state, leaving signaling, input and the WSS media path untouched.
@@ -1415,6 +1314,8 @@ fn run_serve(
     // Monitor previews (`monitor-previews-v1`): started once a viewer that advertised the
     // capability is attached, stopped with the viewer session.
     let mut previews: Option<PreviewService> = None;
+    // App focus mode (`window-list-v1`, docs/architecture/app-focus-mode.md).
+    let mut window_list_session: Option<WindowListSession> = None;
     let mut preview_link = monitor_previews::StableLink::default();
     // One WSS stats line: the producer window `$w` (one second, or the sum of a rollup
     // interval) with the link totals as they stand now. `$level` is `debug` or `info`.
@@ -1627,6 +1528,7 @@ fn run_serve(
             if let Some(service) = previews.take() {
                 log_preview_summary(service.finish());
             }
+            window_list_session = None;
             viewer_attached = false;
             // The viewer's media epoch ends with it. A kept egress would keep
             // reconnecting to a retired epoch that the relay refuses.
@@ -2543,6 +2445,29 @@ fn run_serve(
         {
             previews = Some(PreviewService::start(&capture.monitor_selector()));
         }
+        if viewer_attached
+            && window_list_session.is_none()
+            && signaling.viewer_has_cap(window_list::CAPABILITY)
+        {
+            window_list_session = Some(WindowListSession::start(Win32Backend::default()));
+        }
+        if let Some(session) = window_list_session.as_mut() {
+            let tick = session.tick(Instant::now());
+            for message in &tick.messages {
+                signaling.send_text(message);
+            }
+            // The app the client focused is on another monitor: show that one.
+            if let Some(device) = tick.switch_to.filter(|device| {
+                !capture.monitors().is_ok_and(|monitors| {
+                    monitors
+                        .iter()
+                        .any(|m| m.selected && m.selector.eq_ignore_ascii_case(device))
+                })
+            }) {
+                dialog_follow.changed_elsewhere();
+                switch_capture_monitor!(&device);
+            }
+        }
         if let Some(service) = previews.as_ref() {
             let wss_stats = wss_media.as_ref().map(|egress| egress.stats());
             let link = preview_link.observe(
@@ -3320,6 +3245,13 @@ fn run_serve(
                 }
                 // Applied at the beginning of this tick, before transport and file work.
                 SignalEvent::PeerLeft => {}
+                SignalEvent::WindowList(control) => {
+                    if let Some(session) = window_list_session.as_mut() {
+                        for message in session.on_control(control) {
+                            signaling.send_text(&message);
+                        }
+                    }
+                }
                 SignalEvent::Qos {
                     seq: _,
                     at_ms: _,

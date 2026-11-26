@@ -83,7 +83,7 @@ pub struct FollowWindow {
 }
 
 /// A monitor rectangle in desktop coordinates; `right`/`bottom` exclusive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
