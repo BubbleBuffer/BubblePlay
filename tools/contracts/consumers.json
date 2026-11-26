@@ -129,6 +129,15 @@
         "client-win"
       ]
     },
+    "window-list-contract.json": {
+      "consumers": [
+        "worker",
+        "host"
+      ],
+      "gaps": {
+        "worker": "app focus mode phase 2 (docs/architecture/app-focus-mode.md): the browser switcher and crop are not built yet"
+      }
+    },
     "wss-contract.json": {
       "consumers": [
         "client-win",

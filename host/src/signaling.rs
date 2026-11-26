@@ -205,9 +205,9 @@ pub struct BenchRoiActivity {
     pub unsupported_frames: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub temporal_frames: u64,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub temporal_priming_frames: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis_p95_us: Option<u32>,
@@ -310,12 +310,9 @@ impl BenchRoiActivity {
     }
 }
 
-fn u64_is_zero(value: &u64) -> bool {
-    *value == 0
-}
-
-fn u32_is_zero(value: &u32) -> bool {
-    *value == 0
+/// `skip_serializing_if` for numeric fields that are left out when zero.
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,10 +337,6 @@ fn host_capabilities_message(
         follow_window: follow_window.map(|_| crate::follow_window::PROTOCOL_VERSION),
         audio: audio_enabled.then_some(1),
     }
-}
-
-fn u8_is_zero(value: &u8) -> bool {
-    *value == 0
 }
 
 fn bench_status_wire(msg: &SignalMsg) -> Result<String> {
@@ -480,28 +473,28 @@ pub struct BenchHybridActivity {
     pub png_bytes: u64,
     pub png_us_total: u64,
     pub png_us_max: u32,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hevc_tile_bytes: u64,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hevc_tile_copy_us_total: u64,
-    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hevc_tile_copy_us_max: u32,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hevc_tile_encode_us_total: u64,
-    #[serde(default, skip_serializing_if = "u32_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hevc_tile_encode_us_max: u32,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hevc_tile_encoder_opens: u64,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub hevc_tile_encoder_failures: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis_p95_us: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis_max_us: Option<u32>,
     pub validation_frames: u64,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub validation_unavailable_frames: u64,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub validation_failed_frames: u64,
     #[serde(default)]
     pub deferred_validation_ready_frames: u64,
@@ -515,13 +508,13 @@ pub struct BenchHybridActivity {
     pub deferred_validation_pending_max_age_frames: Option<u32>,
     #[serde(default)]
     pub damage_audit_frames: u64,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub damage_audit_metadata_unavailable_frames: u64,
     #[serde(default)]
     pub damage_audit_changed_ctbs: u64,
     #[serde(default)]
     pub damage_audit_covered_ctbs: u64,
-    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub damage_audit_missed_ctbs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_submit_p95_us: Option<u32>,
@@ -888,7 +881,7 @@ pub enum SignalMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow: Option<bool>,
         /// Only `audio: 1` on a protocol-4 start opts into BPA1 packets.
-        #[serde(default, skip_serializing_if = "u8_is_zero")]
+        #[serde(default, skip_serializing_if = "is_zero")]
         audio: u8,
     },
     #[serde(rename = "peer-left")]
@@ -941,6 +934,8 @@ pub struct QosPresentation {
 pub enum SignalEvent {
     /// Both device-key DTLS bindings succeeded for the current peer.
     Bound,
+    /// App focus mode control (`window_list::parse_client`).
+    WindowList(crate::window_list::ClientControl),
     SecureDeny,
     /// Worker accepted our hello.
     Registered,
@@ -1619,6 +1614,10 @@ impl Signaling {
                                 continue;
                             }
                         };
+                        if let Some(control) = crate::window_list::parse_client(&text) {
+                            events.push(SignalEvent::WindowList(control));
+                            continue;
+                        }
                         let parsed: SignalMsg = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(e) => {

@@ -145,10 +145,9 @@ impl HostProtocol {
     ) -> Result<Self> {
         let pc_id = identity.id();
         let mut pc_caps = vec!["control-aead-v1".to_owned(), "dtls-bind-v1".to_owned()];
-        if upload.is_some() {
-            pc_caps.push(CAP_CLIENT_LOGS.to_owned());
-        }
+        pc_caps.extend(upload.is_some().then(|| CAP_CLIENT_LOGS.to_owned()));
         pc_caps.push(crate::monitor_previews::CAPABILITY.to_owned());
+        pc_caps.push(crate::window_list::CAPABILITY.to_owned());
         let session = Session::new(
             SessionConfig {
                 identity,
@@ -2189,7 +2188,7 @@ mod tests {
         let messages = open_ctl(&mut opener, &host.take_effects());
         assert_eq!(
             messages[0],
-            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","client-logs-v1","monitor-previews-v1"]})
+            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","client-logs-v1","monitor-previews-v1","window-list-v1"]})
         );
         // Without the upload the cap is absent, as before.
         let scratch2 = Scratch::new();
@@ -2198,7 +2197,7 @@ mod tests {
         let messages = open_ctl(&mut pc_opener(), &plain.take_effects());
         assert_eq!(
             messages[0],
-            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","monitor-previews-v1"]})
+            json!({"type":"caps","caps":["control-aead-v1","dtls-bind-v1","monitor-previews-v1","window-list-v1"]})
         );
     }
 

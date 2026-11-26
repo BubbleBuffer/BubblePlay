@@ -1,6 +1,6 @@
 # App focus mode
 
-Status: approved 2026-11-21; nothing is built. Roadmap entry: [App focus mode](../roadmap.md#app-focus-mode).
+Status: approved 2026-11-21. Phase 1 (host) built on 2026-11-25, unit-tested, not yet run on a live desktop; the clients are not built. Roadmap entry: [App focus mode](../roadmap.md#app-focus-mode).
 
 App focus mode shows one app from the PC instead of the whole desktop. The user picks the app from a list, and the client crops today's single video stream down to that app's window. It needs no change to media, input packets or the relay.
 
@@ -27,7 +27,7 @@ Out of scope: several apps on screen at once, resizing apps on the PC, launching
 
 ## Behaviour
 
-- **Entering.** "Show apps" in the session toolbar opens the switcher. Picking an app sends `window-focus`. The host restores the window if it is minimized and brings it to the foreground. If the window is on another monitor, the host switches the stream there through the existing monitor-switch path.
+- **Entering.** "Show apps" in the session toolbar opens the switcher and sends `window-list-start`; the host then sends the list while it changes. Picking an app sends `window-focus`. The host restores the window if it is minimized and brings it to the foreground. If the window is on another monitor, the host switches the stream there through the existing monitor-switch path.
 - **The picture.** The client crops the stream to the app's window rectangle, widened to include the visible windows the app owns (menus, dialogs, tooltips), and scales it to fit. Margins are letterboxed.
 - **Input.** The client maps its pointer through the crop: crop offset plus the scaled position, giving an absolute position on the monitor as today. The host sees ordinary absolute input. Cursor position feedback is offset the same way.
 - **The app moves or resizes on the PC.** The crop follows the next `window-list`. During a fast move the crop can lag the picture by up to one sampling interval.
@@ -35,21 +35,22 @@ Out of scope: several apps on screen at once, resizing apps on the PC, launching
 - **The app spans two monitors.** The client crops the part on the streamed monitor.
 - **The app is covered** by another window on the PC: the crop shows what covers it. Picking the app again brings it to the front.
 - **The app closes.** The client returns to the full desktop and opens the switcher.
-- **Follow active window** is paused while focus mode is on, because it would move the stream away from the app; leaving focus mode restores the user's setting.
+- **Follow active window** is paused while focus mode is on, because it would move the stream away from the app. The client does this: it sends `follow:false` on entering and restores the user's setting on leaving. The host needs no state for it, since follow already resets with each session.
 - **UAC and lock screen.** The client shows the full secure desktop as today, then returns to the crop.
-- **Leaving.** "Show full desktop" in the toolbar. It is also how the Start menu and taskbar are reached.
+- **Leaving.** "Show full desktop" in the toolbar, which sends `window-list-stop`. It is also how the Start menu and taskbar are reached.
 
 ## Wire contract
 
-Capability `windowList: 1` in `host-capabilities`. Clients hide focus mode when it is absent. Messages travel as `ctl` kinds on the existing control channel. The contract lives in a new shared fixture, `window-list-contract.json`, tested from Rust and JavaScript first; the Windows app and Android add consumer tests when they adopt it.
+Capability string `window-list-v1`, advertised by both sides in the encrypted `caps` hello, as monitor previews do. The host starts a session only for a viewer that advertises it; clients hide focus mode when the host does not. Messages travel as `ctl` kinds on the existing control channel. The shared fixture is [`window-list-contract.json`](../../fixtures/window-list-contract.json), tested from Rust; the browser adds its consumer test in phase 2.
 
 | Message | Direction | Carries |
 | --- | --- | --- |
-| `window-list` | Host to client | Every switchable window: `id`, `title`, `process`, `icon` (hash), `rect` in virtual-desktop pixels including owned popups, `monitor` selector, `state` (`foreground`, `normal`, `minimized`). Sent when focus mode is on and the list or a rectangle changes, at most four times a second. |
-| `window-focus` | Client to host | Window `id`. Starts focus mode on the host side (list updates begin, follow pauses). |
-| `window-focus-failed` | Host to client | Window `id` and `reason`: `gone`, `elevated` (needs the admin-input helper), `refused`. |
+| `window-list-start` | Client to host | The switcher opened: send lists from now on. |
+| `window-list` | Host to client | Every switchable window in z-order, topmost first: `id`, `title`, `process`, `icon` (hash, when one was read), `rect` as `[left, top, width, height]` in virtual-desktop pixels including owned popups, `monitor` selector (absent when off every monitor), `state` (`foreground`, `normal`, `minimized`; a minimized window carries its restored rectangle). Sent when it changed, at most four times a second. |
+| `window-focus` | Client to host | Window `id`, which must come from a list the client received. |
+| `window-focus-failed` | Host to client | Window `id` and `reason`: `gone` (closed, or never listed), `elevated`, `refused`. |
 | `window-icon` | Client to host, then host to client | An icon hash; the answer carries a 32 px PNG, cached by the client for the session. |
-| `focus-mode-off` | Client to host | Stops list updates and restores follow. |
+| `window-list-stop` | Client to host | Focus mode ended: stop sending lists. |
 
 Limits for the fixture: at most 64 windows per list, titles cut to 256 UTF-8 bytes, icons at most 8 KiB, the whole message well inside the relay's 512 KiB signaling limit (`SIGNAL_LIMIT` in `relay-rs/core/src/limits.rs`).
 
@@ -57,7 +58,7 @@ Limits for the fixture: at most 64 windows per list, titles cut to 256 UTF-8 byt
 
 | Phase | Ships | Checked by |
 | --- | --- | --- |
-| 1. Host | Window list, focus, icons, follow pause; the fixture | Unit tests for filtering, owned-popup union and message limits; fixture consumer test in Rust |
+| 1. Host | Window list, focus, icons; the fixture (`host/src/window_list.rs`, `window_list_service.rs`, `window_list_capture.rs`) | Unit tests for filtering, the owned-popup union, message limits and the session with a fake backend; fixture consumer test in Rust. Built 2026-11-25; the live run is still open |
 | 2. Browser | Switcher popover, crop, input mapping through the crop, notices and fallbacks | Fixture consumer test in JavaScript; a live run with a menu outside the window, a dialog, an app moved between monitors, a UAC prompt and the lock screen |
 | 3. Windows app | The same in the Flutter session screen; the crop goes into the video processor's source rectangle | A live run as in phase 2 |
 | 4. Android | The switcher as a sheet; crop and touch mapping | A device run |
@@ -66,9 +67,9 @@ Limits for the fixture: at most 64 windows per list, titles cut to 256 UTF-8 byt
 
 | Unknown | How to settle it | Phase |
 | --- | --- | --- |
-| Window rectangles in physical pixels | The main host process sets no per-monitor DPI awareness that this review found, so `GetWindowRect` may return scaled values. Check on a 150% display; use `DWMWA_EXTENDED_FRAME_BOUNDS` to leave out the invisible resize borders. | 1 |
-| Finding owned popups | Menus belong to the app's thread rather than its owner chain. Collect visible top-level windows of the same thread and process that touch the app's rectangle; test with menus, context menus, combo boxes and an IME window. | 1 |
-| Bringing a window to the foreground | Windows limits which process may take the foreground. Test from the host while it injects input, and through the admin-input helper for elevated apps. | 1 |
+| Window rectangles in physical pixels | The sampling thread sets per-monitor DPI awareness and reads `DWMWA_EXTENDED_FRAME_BOUNDS`, so rectangles should match the captured frame. Check on a 150% display and with mixed scaling across monitors. | 1 |
+| Finding owned popups | Built as: visible windows above the app, of its process, owned by it or on its UI thread (but not its other switchable windows), that touch the app's rectangle or another such window within 8 px. Test with menus, submenus, context menus, combo boxes, an IME window and a browser with two windows. | 1 |
+| Bringing a window to the foreground | Built as restore, `BringWindowToTop`, `SetForegroundWindow`, then a check of the foreground window; failure reports `elevated` or `refused`. Windows limits which process may take the foreground, so test from the host while it injects input. Raising elevated apps through the admin-input helper is not built. | 1 |
 | Crop lag during a move | Measure with a fast drag; if visible, send rectangles more often while the app is moving. | 2 |
 
 ## Deferred: simultaneous monitors
