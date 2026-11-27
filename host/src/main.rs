@@ -3247,24 +3247,11 @@ fn run_serve(
                     if !signaling.application_ready() {
                         continue;
                     }
-                    if let Some(files) = file_service.as_ref() {
-                        match control {
-                            bubbleplay_host::file_control::ClientControl::Batch(batch) => {
-                                let batch_id = batch.batch_id.clone();
-                                let refusal = files.announce_batch(batch).err();
-                                if let Some(reason) = refusal {
-                                    warn!(reason, "file batch announcement refused");
-                                }
-                                signaling.send_text(
-                                    &bubbleplay_host::file_control::file_batch_ack_message(
-                                        &batch_id, refusal,
-                                    ),
-                                );
-                            }
-                            bubbleplay_host::file_control::ClientControl::Request(request) => {
-                                files.grant_download(&request);
-                            }
-                        }
+                    if let Some(ack) = file_service
+                        .as_ref()
+                        .and_then(|files| files.handle_control(control))
+                    {
+                        signaling.send_text(&ack);
                     }
                 }
                 // Applied at the beginning of this tick, before transport and file work.

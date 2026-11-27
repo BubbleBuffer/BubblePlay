@@ -34,10 +34,12 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 mod requests;
+mod upload_batch;
 
 use crate::file_auth::Authorizations;
 use crate::file_control::{
-    file_offer_message, random_id128, BatchAnnouncement, DownloadRequest, FileOfferItem,
+    file_batch_ack_message, file_offer_message, random_id128, BatchAnnouncement, ClientControl,
+    DownloadRequest, FileOfferItem,
 };
 use crate::file_hash::Sha256;
 use crate::file_transfer::{
@@ -278,14 +280,38 @@ impl FileService {
         self.lock().rate_cap_bps = bps;
     }
 
+    /// A sealed file control message from the viewer; the text to send back, if any.
+    pub fn handle_control(&self, control: ClientControl) -> Option<String> {
+        match control {
+            ClientControl::Batch(batch) => {
+                let batch_id = batch.batch_id.clone();
+                let refusal = self.announce_batch(batch).err();
+                if let Some(reason) = refusal {
+                    warn!(reason, "file batch announcement refused");
+                }
+                Some(file_batch_ack_message(&batch_id, refusal))
+            }
+            ClientControl::Request(request) => {
+                self.grant_download(&request);
+                None
+            }
+            ClientControl::Cancel(batch_id) => {
+                self.cancel_batch(&batch_id);
+                None
+            }
+        }
+    }
+
     /// The viewer announced an upload batch over the sealed control channel. Only announced
     /// batches are accepted on the file socket. `Err` is the `file-batch-ack` error code.
     pub fn announce_batch(&self, announcement: BatchAnnouncement) -> Result<(), &'static str> {
-        let mut state = self.lock();
-        if state.epoch.is_none() {
-            return Err("not-ready");
-        }
-        state.auth.announce(announcement, Instant::now())
+        self.lock().announce(announcement)
+    }
+
+    /// The viewer gave up on a batch over the sealed control channel: its uploads stop and the
+    /// file socket cannot complete it any more.
+    pub fn cancel_batch(&self, batch_id: &str) {
+        self.lock().auth.forget_batch(batch_id);
     }
 
     /// The viewer asked for items of a host offer over the sealed control channel. Only those
@@ -334,6 +360,14 @@ struct Bound {
 }
 
 impl Shared {
+    /// Admits an announced batch for the bound viewer; `not-ready` before one is bound.
+    fn announce(&mut self, announcement: BatchAnnouncement) -> Result<(), &'static str> {
+        if self.epoch.is_none() {
+            return Err("not-ready");
+        }
+        self.auth.announce(announcement, Instant::now())
+    }
+
     fn bound(&self) -> Option<Bound> {
         self.epoch.clone().map(|epoch| Bound {
             epoch,
@@ -618,6 +652,8 @@ struct Batch {
     id: Option<String>,
     saved: Vec<PathBuf>,
     purpose: Option<Purpose>,
+    /// Files the viewer announced; the batch is placed only when all of them are saved.
+    expected: usize,
 }
 
 enum SendPhase {
@@ -653,6 +689,7 @@ struct Session {
     clock: Instant,
     send_wait_until: Option<Instant>,
     drop_upload: Option<DropUpload>,
+    set_files: fn(&[PathBuf]) -> Result<u32>,
 }
 
 struct DropUpload {
@@ -680,6 +717,7 @@ impl Session {
             clock: Instant::now(),
             send_wait_until: None,
             drop_upload: None,
+            set_files: crate::clipboard::set_files,
         }
     }
 
@@ -697,6 +735,7 @@ impl Session {
             }
             let mut progressed = false;
             self.poll_drop(ws, shared)?;
+            self.sweep_dead_batches(ws, shared)?;
             loop {
                 if !self.is_live(shared) {
                     return Ok(());
@@ -936,7 +975,7 @@ impl Session {
             || drop.offers[meta.batch_index as usize].is_some()
             || drop.offers.iter().flatten().any(|(prior, _)| *prior == id)
         {
-            return send_cancel(ws, id, "invalid-drop");
+            return self.cancel_drop(ws, "invalid-drop", shared);
         }
         let index = meta.batch_index as usize;
         drop.hashes[index] = announced;
@@ -1187,6 +1226,7 @@ impl Session {
                 id: Some(meta.batch_id.clone()),
                 saved: Vec::new(),
                 purpose: Some(meta.purpose),
+                expected: meta.batch_count as usize,
             };
         }
         let (file, partial) = match create_partial(&self.config.downloads_dir, id, &meta.name) {
@@ -1198,6 +1238,7 @@ impl Session {
                     meta.batch_index as usize,
                     Instant::now(),
                 );
+                self.abandon_batch(shared, &meta.batch_id);
                 return send_cancel(ws, id, "write-failed");
             }
         };
@@ -1329,6 +1370,7 @@ impl Session {
             Err(code) => {
                 let _ = fs::remove_file(&receiving.partial);
                 lock(shared).stats.uploads_failed += 1;
+                self.abandon_batch(shared, &receiving.meta.batch_id);
                 warn!(
                     transfer = id,
                     error = code,
@@ -1337,7 +1379,7 @@ impl Session {
                 send_result(ws, id, Some(code))?;
             }
         }
-        if receiving.meta.batch_index + 1 == receiving.meta.batch_count {
+        if self.batch_complete() {
             self.finish_batch(shared);
         }
         Ok(())
@@ -1375,69 +1417,7 @@ impl Session {
         if let Some(ws) = ws {
             let _ = send_cancel(ws, id, code);
         }
-        // The files of the batch that did arrive still reach the clipboard.
-        if receiving.meta.batch_index + 1 == receiving.meta.batch_count {
-            self.finish_batch(shared);
-        }
-    }
-
-    /// The last file of a batch is done: put the saved files on the
-    /// clipboard, and ask for a paste when the batch was a paste.
-    fn finish_batch(&mut self, shared: &Mutex<Shared>) {
-        self.finish_batch_with(shared, crate::clipboard::set_files);
-    }
-
-    fn finish_batch_with(
-        &mut self,
-        shared: &Mutex<Shared>,
-        set_files: impl FnOnce(&[PathBuf]) -> Result<u32>,
-    ) {
-        let batch = std::mem::take(&mut self.batch);
-        if batch.saved.is_empty() {
-            return;
-        }
-        if !self.config.clipboard {
-            info!(
-                files = batch.saved.len(),
-                "clipboard placement skipped (BUBBLEPLAY_FILE_CLIPBOARD=0)"
-            );
-            return;
-        }
-        // The upload belongs to the viewer this socket is bound to. A newer
-        // viewer must never see its files on the clipboard or a paste for them.
-        if !lock(shared).is_bound(&self.bound) {
-            info!(
-                files = batch.saved.len(),
-                "uploaded files not placed: viewer changed"
-            );
-            return;
-        }
-        // EmptyClipboard may message a hung owner. Never hold the mutex the
-        // input/session thread uses for take_outbox, epochs and rate updates.
-        match set_files(&batch.saved) {
-            Ok(seq) => {
-                let mut state = lock(shared);
-                // Recorded even when stale, so our own write is never offered back.
-                state.own_clipboard_seq = Some(seq);
-                if !state.is_bound(&self.bound) {
-                    info!(
-                        files = batch.saved.len(),
-                        "uploaded files were placed while the viewer changed; no paste"
-                    );
-                    return;
-                }
-                info!(
-                    files = batch.saved.len(),
-                    "uploaded files placed on the clipboard"
-                );
-                if batch.purpose == Some(Purpose::Paste) {
-                    state.outbox.pastes += 1;
-                }
-            }
-            Err(error) => {
-                warn!(error = %format!("{error:#}"), "cannot place uploaded files on the clipboard")
-            }
-        }
+        self.abandon_batch(shared, &receiving.meta.batch_id);
     }
 
     // --- downloads (host -> client) ---------------------------------------
@@ -1891,6 +1871,8 @@ mod tests {
                         .map(|m| AnnouncedFile {
                             name: m.name.clone(),
                             size: m.size,
+                            mime: m.mime.clone(),
+                            mtime_ms: m.mtime_ms,
                             sha256,
                         })
                         .collect(),

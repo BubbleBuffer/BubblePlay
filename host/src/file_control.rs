@@ -5,8 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::file_transfer::{
-    DropPoint, Purpose, MAX_BATCH_FILES, MAX_FILE_BYTES, MAX_NAME_BYTES, PROTOCOL_VERSION,
-    SHA256_BYTES,
+    DropPoint, Purpose, MAX_BATCH_FILES, MAX_FILE_BYTES, MAX_MIME_BYTES, MAX_NAME_BYTES,
+    PROTOCOL_VERSION, SHA256_BYTES,
 };
 
 /// A batch or offer id: 32 lowercase hex digits.
@@ -60,6 +60,8 @@ pub const MAX_BATCH_TEXT_BYTES: usize = 192 * 1024;
 pub struct AnnouncedFile {
     pub name: String,
     pub size: u64,
+    pub mime: String,
+    pub mtime_ms: u64,
     pub sha256: [u8; SHA256_BYTES],
 }
 
@@ -85,6 +87,8 @@ pub struct DownloadRequest {
 pub enum ClientControl {
     Batch(BatchAnnouncement),
     Request(DownloadRequest),
+    /// `file-batch-cancel`: the viewer gave up on this batch.
+    Cancel(String),
 }
 
 /// Parses a decrypted control text; `None` when it is not a file control or is malformed.
@@ -121,19 +125,30 @@ pub fn parse_client_control(text: &str) -> Option<ClientControl> {
             let mut files = Vec::with_capacity(list.len());
             for entry in list {
                 let entry = entry.as_object()?;
-                if entry
-                    .keys()
-                    .any(|key| !["name", "size", "sha256"].contains(&key.as_str()))
-                {
+                if entry.keys().any(|key| {
+                    !["name", "size", "mime", "mtimeMs", "sha256"].contains(&key.as_str())
+                }) {
                     return None;
                 }
                 let name = entry.get("name")?.as_str()?.to_owned();
                 let size = entry.get("size")?.as_u64()?;
+                let mime = entry.get("mime")?.as_str()?.to_owned();
+                let mtime_ms = entry.get("mtimeMs")?.as_u64()?;
                 let sha256 = parse_sha256_hex(entry.get("sha256")?.as_str()?)?;
-                if name.is_empty() || name.len() > MAX_NAME_BYTES || size > MAX_FILE_BYTES {
+                if name.is_empty()
+                    || name.len() > MAX_NAME_BYTES
+                    || size > MAX_FILE_BYTES
+                    || mime.len() > MAX_MIME_BYTES
+                {
                     return None;
                 }
-                files.push(AnnouncedFile { name, size, sha256 });
+                files.push(AnnouncedFile {
+                    name,
+                    size,
+                    mime,
+                    mtime_ms,
+                    sha256,
+                });
             }
             Some(ClientControl::Batch(BatchAnnouncement {
                 batch_id,
@@ -141,6 +156,16 @@ pub fn parse_client_control(text: &str) -> Option<ClientControl> {
                 drop,
                 files,
             }))
+        }
+        "file-batch-cancel" => {
+            if object
+                .keys()
+                .any(|key| !["type", "protocol", "batchId"].contains(&key.as_str()))
+            {
+                return None;
+            }
+            let batch_id = object.get("batchId")?.as_str()?;
+            valid_id128(batch_id).then(|| ClientControl::Cancel(batch_id.to_owned()))
         }
         "file-request" => {
             let only = ["type", "protocol", "offerId", "ids"];
@@ -213,6 +238,11 @@ mod tests {
             let parsed = matches!(parse_client_control(text), Some(ClientControl::Batch(_)));
             assert_eq!(parsed, case["accepted"].as_bool().unwrap(), "{text}");
         }
+        for case in signaling["fileBatchCancel"]["cases"].as_array().unwrap() {
+            let text = case["text"].as_str().unwrap();
+            let parsed = matches!(parse_client_control(text), Some(ClientControl::Cancel(_)));
+            assert_eq!(parsed, case["accepted"].as_bool().unwrap(), "{text}");
+        }
         for case in signaling["fileRequest"]["cases"].as_array().unwrap() {
             let text = case["text"].as_str().unwrap();
             let parsed = matches!(parse_client_control(text), Some(ClientControl::Request(_)));
@@ -264,7 +294,7 @@ mod tests {
             return false;
         };
         value["type"] == "file-offer"
-            && value["protocol"] == 1
+            && value["protocol"] == 2
             && value["offerId"].as_str().is_some_and(valid_id128)
             && matches!(value["source"].as_str(), Some("clipboard" | "sendto"))
             && items.len() <= MAX_BATCH_FILES as usize

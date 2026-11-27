@@ -26,11 +26,22 @@ fn an_unannounced_offer_is_refused_and_leaves_nothing_behind() {
 fn an_offer_that_differs_from_its_announcement_is_refused() {
     let (mut session, mut ws, mut client, shared, dir) = native_test_session();
     announce(&shared, &[meta("a.bin", 3)], digest(b"abc"));
-    for wrong in [meta("a.bin", 4), meta("b.bin", 3), {
-        let mut paste = meta("a.bin", 3);
-        paste.purpose = Purpose::Paste;
-        paste
-    }] {
+    for wrong in [
+        meta("a.bin", 4),
+        meta("b.bin", 3),
+        OfferMeta {
+            purpose: Purpose::Paste,
+            ..meta("a.bin", 3)
+        },
+        OfferMeta {
+            mime: "text/plain".into(),
+            ..meta("a.bin", 3)
+        },
+        OfferMeta {
+            mtime_ms: 9,
+            ..meta("a.bin", 3)
+        },
+    ] {
         session
             .on_packet(&mut ws, &offer_packet(41, &wrong), &shared)
             .unwrap();
@@ -127,17 +138,16 @@ fn a_request_is_served_only_for_an_item_the_viewer_asked_for_over_control() {
         offer_id: offer_id.into(),
         id: 1,
     };
-    // Guessing an id, and the right id nobody asked for.
-    for guess in [format!("{:032x}", 1), offer_id.clone()] {
+    // Guessing an id is an unknown offer; the right id nobody asked for is unauthorized.
+    for (guess, expected) in [
+        (format!("{:032x}", 1), "unknown-offer"),
+        (offer_id.clone(), "unauthorized"),
+    ] {
         session
             .requests
             .push_back((9, request(&guess), Instant::now()));
         session.start_next_request(&mut ws, &shared).unwrap();
-        let reason = cancel_reason(&mut client);
-        assert!(
-            reason == "unknown-offer" || reason == "unauthorized",
-            "{reason}"
-        );
+        assert_eq!(cancel_reason(&mut client), expected);
         assert!(session.sending.is_none());
     }
     // Control: asked for over the sealed channel, served once.
@@ -156,5 +166,161 @@ fn a_request_is_served_only_for_an_item_the_viewer_asked_for_over_control() {
         .push_back((11, request(&offer_id), Instant::now()));
     session.start_next_request(&mut ws, &shared).unwrap();
     assert_eq!(cancel_reason(&mut client), "unauthorized");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// A clipboard writer that counts its calls (one counter per test).
+macro_rules! placement_counter {
+    () => {
+        static PLACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn place(_: &[PathBuf]) -> Result<u32> {
+            PLACED.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }
+    };
+}
+
+fn batch_meta(index: u32, count: u32) -> OfferMeta {
+    OfferMeta {
+        name: format!("f{index}.bin"),
+        purpose: Purpose::Paste,
+        batch_index: index,
+        batch_count: count,
+        ..meta("x", 3)
+    }
+}
+
+fn announce_paste_batch(shared: &Mutex<Shared>, count: u32) {
+    let metas: Vec<OfferMeta> = (0..count).map(|index| batch_meta(index, count)).collect();
+    announce(shared, &metas, digest(b"abc"));
+}
+
+#[test]
+fn a_batch_missing_one_of_its_files_is_never_placed_or_pasted() {
+    placement_counter!();
+    let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+    session.config.clipboard = true;
+    session.set_files = place;
+    announce_paste_batch(&shared, 2);
+    // The relay dropped file 0 and delivered only the last-index file.
+    let last = batch_meta(1, 2);
+    let abc = digest(b"abc");
+    session
+        .on_packet(&mut ws, &offer_packet(41, &last), &shared)
+        .unwrap();
+    read_packet(&mut client);
+    session.on_data(&mut ws, 41, 0, b"abc", &shared).unwrap();
+    session.on_done(&mut ws, 41, &abc, &shared).unwrap();
+    assert!(matches!(
+        ft::decode(&read_non_ack(&mut client)).unwrap().body,
+        Body::Result(ResultPayload { ok: true, .. })
+    ));
+    assert_eq!(PLACED.load(Ordering::SeqCst), 0);
+    assert_eq!(lock(&shared).outbox.pastes, 0);
+    // Control: the missing file arrives after all, and the batch is placed once.
+    session
+        .on_packet(&mut ws, &offer_packet(42, &batch_meta(0, 2)), &shared)
+        .unwrap();
+    read_packet(&mut client);
+    session.on_data(&mut ws, 42, 0, b"abc", &shared).unwrap();
+    session.on_done(&mut ws, 42, &abc, &shared).unwrap();
+    assert_eq!(PLACED.load(Ordering::SeqCst), 1);
+    assert_eq!(lock(&shared).outbox.pastes, 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_failed_file_abandons_the_whole_batch() {
+    placement_counter!();
+    let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+    session.config.clipboard = true;
+    session.set_files = place;
+    announce_paste_batch(&shared, 3);
+    let abc = digest(b"abc");
+    for (id, index) in [(41, 0), (42, 1)] {
+        session
+            .on_packet(&mut ws, &offer_packet(id, &batch_meta(index, 3)), &shared)
+            .unwrap();
+        read_packet(&mut client);
+        // File 1 carries other bytes than announced.
+        let (bytes, hash) = if index == 1 {
+            (&b"abd"[..], digest(b"abd"))
+        } else {
+            (&b"abc"[..], abc)
+        };
+        session.on_data(&mut ws, id, 0, bytes, &shared).unwrap();
+        session.on_done(&mut ws, id, &hash, &shared).unwrap();
+        read_non_ack(&mut client);
+    }
+    session
+        .on_packet(&mut ws, &offer_packet(43, &batch_meta(2, 3)), &shared)
+        .unwrap();
+    assert_eq!(cancel_reason(&mut client), "unannounced");
+    assert_eq!(PLACED.load(Ordering::SeqCst), 0);
+    assert_eq!(lock(&shared).outbox.pastes, 0);
+    assert!(session.batch.saved.is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_cancelled_or_expired_batch_stops_its_upload_and_removes_the_partial_file() {
+    let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+    announce_paste_batch(&shared, 1);
+    session
+        .on_packet(&mut ws, &offer_packet(41, &batch_meta(0, 1)), &shared)
+        .unwrap();
+    read_packet(&mut client);
+    session.on_data(&mut ws, 41, 0, b"a", &shared).unwrap();
+    session.sweep_dead_batches(&mut ws, &shared).unwrap();
+    assert!(session.receiving.is_some(), "a live batch is left alone");
+    // `file-batch-cancel` over the sealed channel forgets the batch.
+    lock(&shared).auth.forget_batch(&format!("{:032x}", 1));
+    session.sweep_dead_batches(&mut ws, &shared).unwrap();
+    assert_eq!(cancel_reason(&mut client), "cancelled");
+    assert!(session.receiving.is_none());
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_drop_offer_refused_after_its_announcement_frees_the_batch() {
+    let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+    let metas = [drop_meta(0, 2), drop_meta(1, 2)];
+    announce(&shared, &metas, digest(b"abc"));
+    session
+        .on_packet(&mut ws, &offer_packet(5, &metas[0]), &shared)
+        .unwrap();
+    read_packet(&mut client);
+    // The same transfer id again for the other file of the batch.
+    session
+        .on_packet(&mut ws, &offer_packet(5, &metas[1]), &shared)
+        .unwrap();
+    assert_eq!(cancel_reason(&mut client), "invalid-drop");
+    assert!(session.drop_upload.is_none());
+    assert!(!lock(&shared)
+        .auth
+        .has_batch(&format!("{:032x}", 1), Instant::now()));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_batch_announced_before_the_viewer_is_bound_is_not_ready() {
+    let (_session, _ws, _client, shared, dir) = native_test_session();
+    let batch = || BatchAnnouncement {
+        batch_id: format!("{:032x}", 1),
+        purpose: Purpose::Save,
+        drop: None,
+        files: vec![AnnouncedFile {
+            name: "a.bin".into(),
+            size: 3,
+            mime: String::new(),
+            mtime_ms: 0,
+            sha256: digest(b"abc"),
+        }],
+    };
+    rebind(&mut lock(&shared), None);
+    assert_eq!(lock(&shared).announce(batch()), Err("not-ready"));
+    rebind(&mut lock(&shared), Some("test"));
+    assert_eq!(lock(&shared).announce(batch()), Ok(()));
     fs::remove_dir_all(dir).unwrap();
 }

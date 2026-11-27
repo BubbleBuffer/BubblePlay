@@ -28,7 +28,7 @@ test("a picker-open offer replacement or withdrawal shows an error and downloads
         return new Promise(resolve => { finishPicker = resolve; });
       };
       const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: class { constructor() { socketCalls++; } } });
-      const offer = { type: "file-offer", protocol: 1, offerId: "00000000000000000000000000000001", source: "clipboard", items: [{ id: 1, name: "original.txt", size: 1 }] };
+      const offer = { type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000001", source: "clipboard", items: [{ id: 1, name: "original.txt", size: 1 }] };
       client.setOffer(offer);
       const parts = new Map();
       const root = { hidden: true, querySelector(selector) { if (!parts.has(selector)) parts.set(selector, element()); return parts.get(selector); } };

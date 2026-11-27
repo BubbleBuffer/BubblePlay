@@ -4,15 +4,21 @@
 //! nothing by itself. Every upload batch is announced over the sealed control channel
 //! (`file-batch`) with each file's size and SHA-256 before the host accepts its OFFER, and every
 //! download is asked for over the same channel (`file-request`) before the host serves its
-//! REQUEST. See `docs/architecture/file-transfer.md`.
+//! REQUEST. A batch that injects input (paste, drop) has a hard deadline from its announcement,
+//! so the relay cannot hold bytes back and have them typed in later. See
+//! `docs/architecture/file-transfer.md`.
 
 use std::time::{Duration, Instant};
 
 use crate::file_control::BatchAnnouncement;
-use crate::file_transfer::{DropPoint, OfferMeta, SHA256_BYTES};
+use crate::file_transfer::{DropPoint, OfferMeta, Purpose, SHA256_BYTES};
 
-/// An announced batch is dropped when this long passes without progress on it.
-const BATCH_IDLE: Duration = Duration::from_secs(15 * 60);
+/// A save batch is dropped when this long passes without progress on it.
+const SAVE_IDLE: Duration = Duration::from_secs(15 * 60);
+/// A paste or drop batch must be complete this long after its announcement ...
+const INJECT_BASE: Duration = Duration::from_secs(60);
+/// ... plus one second per MiB announced (a floor of 1 MiB/s for large files).
+const INJECT_BYTES_PER_SEC: u64 = 1024 * 1024;
 /// A download grant is dropped when the REQUEST does not follow this soon.
 const GRANT_TTL: Duration = Duration::from_secs(60);
 /// Announced batches the host holds at once.
@@ -31,6 +37,16 @@ struct AnnouncedBatch {
     announcement: BatchAnnouncement,
     progress: Vec<Progress>,
     deadline: Instant,
+    /// Progress extends the deadline (save batches only).
+    refresh: bool,
+}
+
+impl AnnouncedBatch {
+    fn touch(&mut self, now: Instant) {
+        if self.refresh {
+            self.deadline = now + SAVE_IDLE;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -74,13 +90,28 @@ impl Authorizations {
             return Err("duplicate-batch");
         }
         if self.batches.len() >= MAX_BATCHES {
-            return Err("busy");
+            // Only a batch that has not started anything is safe to give up.
+            let idle = self
+                .batches
+                .iter()
+                .position(|batch| batch.progress.iter().all(|p| *p == Progress::Pending))
+                .ok_or("busy")?;
+            self.batches.remove(idle);
         }
         let progress = vec![Progress::Pending; announcement.files.len()];
+        let refresh = announcement.purpose == Purpose::Save;
+        let total: u64 = announcement.files.iter().map(|file| file.size).sum();
+        let deadline = now
+            + if refresh {
+                SAVE_IDLE
+            } else {
+                INJECT_BASE + Duration::from_secs(total / INJECT_BYTES_PER_SEC)
+            };
         self.batches.push(AnnouncedBatch {
             announcement,
             progress,
-            deadline: now + BATCH_IDLE,
+            deadline,
+            refresh,
         });
         Ok(())
     }
@@ -107,6 +138,8 @@ impl Authorizations {
             || same_drop != meta.drop
             || file.name != meta.name
             || file.size != meta.size
+            || file.mime != meta.mime
+            || file.mtime_ms != meta.mtime_ms
         {
             return Err("mismatch");
         }
@@ -114,8 +147,9 @@ impl Authorizations {
             return Err("replayed");
         }
         batch.progress[index] = Progress::Started;
-        batch.deadline = now + BATCH_IDLE;
-        Ok(file.sha256)
+        let sha256 = file.sha256;
+        batch.touch(now);
+        Ok(sha256)
     }
 
     /// The file started by `begin_file` finished (verified or not). Its batch is forgotten once
@@ -129,10 +163,17 @@ impl Authorizations {
             if let Some(slot) = batch.progress.get_mut(index) {
                 *slot = Progress::Ended;
             }
-            batch.deadline = now + BATCH_IDLE;
+            batch.touch(now);
         }
         self.batches
             .retain(|batch| batch.progress.iter().any(|p| *p != Progress::Ended));
+    }
+
+    /// True while `batch_id` is announced and unexpired: what an upload in progress needs.
+    pub fn has_batch(&self, batch_id: &str, now: Instant) -> bool {
+        self.batches
+            .iter()
+            .any(|batch| batch.announcement.batch_id == batch_id && batch.deadline > now)
     }
 
     /// Drops what an abandoned batch still held (a cancelled drop, a closed socket).
@@ -175,7 +216,6 @@ impl Authorizations {
 mod tests {
     use super::*;
     use crate::file_control::AnnouncedFile;
-    use crate::file_transfer::Purpose;
 
     fn id(n: u32) -> String {
         format!("{n:032x}")
@@ -192,6 +232,8 @@ mod tests {
                 .map(|(i, size)| AnnouncedFile {
                     name: format!("f{i}.bin"),
                     size: *size,
+                    mime: String::new(),
+                    mtime_ms: 0,
                     sha256: [i as u8; SHA256_BYTES],
                 })
                 .collect(),
@@ -227,6 +269,15 @@ mod tests {
         let mut renamed = offer(1, 0, 2, 5);
         renamed.name = "other.bin".into();
         assert_eq!(auth.begin_file(&renamed, now), Err("mismatch"));
+        for (mime, mtime_ms) in [("text/plain", 0), ("", 9)] {
+            let mut meta = offer(1, 0, 2, 5);
+            (meta.mime, meta.mtime_ms) = (mime.into(), mtime_ms);
+            assert_eq!(
+                auth.begin_file(&meta, now),
+                Err("mismatch"),
+                "{mime} {mtime_ms}"
+            );
+        }
         assert_eq!(auth.begin_file(&offer(1, 0, 2, 5), now), Ok([0; 32]));
         assert_eq!(auth.begin_file(&offer(1, 0, 2, 5), now), Err("replayed"));
         assert_eq!(auth.begin_file(&offer(1, 1, 2, 7), now), Ok([1; 32]));
@@ -244,7 +295,7 @@ mod tests {
         let now = Instant::now();
         let mut auth = Authorizations::default();
         auth.announce(announcement(1, &[5]), now).unwrap();
-        let later = now + BATCH_IDLE + Duration::from_secs(1);
+        let later = now + INJECT_BASE + Duration::from_secs(1);
         assert_eq!(
             auth.begin_file(&offer(1, 0, 1, 5), later),
             Err("unannounced")
@@ -267,5 +318,76 @@ mod tests {
         assert!(auth.take_grant(&id(9), 2, now));
         auth.grant(&id(9), &[1], now);
         assert!(!auth.take_grant(&id(9), 1, now + GRANT_TTL + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn an_input_injecting_batch_has_a_hard_deadline_that_progress_does_not_extend() {
+        let now = Instant::now();
+        let mut auth = Authorizations::default();
+        auth.announce(announcement(1, &[5, 7]), now).unwrap();
+        let near_end = now + INJECT_BASE - Duration::from_secs(1);
+        assert_eq!(auth.begin_file(&offer(1, 0, 2, 5), near_end), Ok([0; 32]));
+        auth.end_file(&id(1), 0, near_end);
+        let late = now + INJECT_BASE + Duration::from_secs(1);
+        assert!(
+            !auth.has_batch(&id(1), late),
+            "a relay cannot keep a paste alive by trickling"
+        );
+        assert_eq!(
+            auth.begin_file(&offer(1, 1, 2, 7), late),
+            Err("unannounced")
+        );
+        // The deadline allows a second per MiB announced.
+        let big = 600 * 1024 * 1024;
+        auth.announce(announcement(2, &[big]), now).unwrap();
+        assert!(auth.has_batch(&id(2), now + INJECT_BASE + Duration::from_secs(599)));
+        assert!(!auth.has_batch(&id(2), now + INJECT_BASE + Duration::from_secs(601)));
+    }
+
+    #[test]
+    fn a_save_batch_lives_on_progress() {
+        let now = Instant::now();
+        let mut auth = Authorizations::default();
+        let mut save = announcement(1, &[5, 7]);
+        save.purpose = Purpose::Save;
+        auth.announce(save, now).unwrap();
+        let mut first = offer(1, 0, 2, 5);
+        first.purpose = Purpose::Save;
+        let later = now + SAVE_IDLE - Duration::from_secs(1);
+        assert!(auth.begin_file(&first, later).is_ok());
+        assert!(auth.has_batch(&id(1), later + SAVE_IDLE - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_full_table_gives_up_its_oldest_unstarted_batch_only() {
+        let now = Instant::now();
+        let mut auth = Authorizations::default();
+        for batch in 1..=MAX_BATCHES as u32 {
+            auth.announce(announcement(batch, &[5]), now).unwrap();
+        }
+        auth.begin_file(&offer(1, 0, 1, 5), now).unwrap();
+        auth.announce(announcement(100, &[5]), now).unwrap();
+        assert!(
+            auth.has_batch(&id(1), now),
+            "a batch with a file in progress stays"
+        );
+        assert!(
+            !auth.has_batch(&id(2), now),
+            "the oldest unstarted batch made room"
+        );
+        for batch in 3..=MAX_BATCHES as u32 {
+            auth.begin_file(&offer(batch, 0, 1, 5), now).unwrap();
+        }
+        auth.begin_file(&offer(100, 0, 1, 5), now).unwrap();
+        assert_eq!(auth.announce(announcement(101, &[5]), now), Err("busy"));
+    }
+
+    #[test]
+    fn forgetting_a_batch_refuses_its_later_offers() {
+        let now = Instant::now();
+        let mut auth = Authorizations::default();
+        auth.announce(announcement(1, &[5]), now).unwrap();
+        auth.forget_batch(&id(1));
+        assert_eq!(auth.begin_file(&offer(1, 0, 1, 5), now), Err("unannounced"));
     }
 }

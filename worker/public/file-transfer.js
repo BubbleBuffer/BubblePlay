@@ -1,4 +1,4 @@
-// File transfer protocol v1, used by the web receiver; the Rust relay
+// File transfer protocol v2 (hex ids, announced batches), used by the web receiver; the Rust relay
 // (relay-rs/core/src/protocol.rs) validates the same messages. Intent and wire contract: docs/architecture/file-transfer.md. Shared
 // vectors: fixtures/file-transfer-contract.json (also tested from Rust in
 // host/src/file_transfer.rs and from Kotlin).
@@ -7,6 +7,8 @@
 //   magic "BPF1" | type u8 | flags u8 = 0 | reserved u16 = 0 |
 //   transferId u32 LE | seq u32 LE (DATA chunk index, otherwise 0)
 
+/** `protocol` of the sealed file messages and the `fileTransfer` capability a host must advertise. */
+export const FT_PROTOCOL = 2;
 export const FT_MAGIC = [0x42, 0x50, 0x46, 0x31];
 export const FT_HEADER_BYTES = 16;
 export const FT_MAX_DATA_BYTES = 64 * 1024;
@@ -175,30 +177,34 @@ export function encodeRequest(transferId, offerId, id) { return jsonPacket(FT.RE
 
 /**
  * Sealed control message announcing an upload batch before its OFFER packets. `files` is
- * `[{ name, size, sha256 (hex) }]`; `drop` only for purpose "drop". The host accepts the batch's
- * OFFER packets only when they match this announcement.
+ * `[{ name, size, mime, mtimeMs, sha256 (hex) }]`; `drop` only for purpose "drop". The host accepts
+ * the batch's OFFER packets only when they match this announcement, so nothing that reaches a saved
+ * file comes from the unsealed file socket.
  */
 export function fileBatchMessage(batchId, purpose, files, drop) {
   return {
-    type: "file-batch", protocol: 1, batchId, purpose,
+    type: "file-batch", protocol: FT_PROTOCOL, batchId, purpose,
     ...(drop !== undefined ? { drop: { x: drop.x, y: drop.y, generation: drop.generation, viewportRevision: drop.viewportRevision } } : {}),
-    files: files.map(file => ({ name: file.name, size: file.size, sha256: file.sha256 })),
+    files: files.map(file => ({ name: file.name, size: file.size, mime: file.mime, mtimeMs: file.mtimeMs, sha256: file.sha256 })),
   };
 }
 
+/** Sealed control message: the viewer gave up on a batch; the PC stops it and frees its slot. */
+export function fileBatchCancelMessage(batchId) { return { type: "file-batch-cancel", protocol: FT_PROTOCOL, batchId }; }
+
 /** Sealed control message asking the PC for items of its current offer (before the REQUEST packet). */
-export function fileRequestMessage(offerId, ids) { return { type: "file-request", protocol: 1, offerId, ids }; }
+export function fileRequestMessage(offerId, ids) { return { type: "file-request", protocol: FT_PROTOCOL, offerId, ids }; }
 
 /** Validates the host's `file-batch-ack` control message. */
 export function validBatchAck(message) {
-  return plainObject(message) && message.type === "file-batch-ack" && message.protocol === 1 &&
+  return plainObject(message) && message.type === "file-batch-ack" && message.protocol === FT_PROTOCOL &&
     validId128(message.batchId) && typeof message.ok === "boolean" &&
     (message.error === undefined || (typeof message.error === "string" && message.error.length <= MAX_ERROR_CODE_CHARS));
 }
 
 /** Validates host -> client `file-offer` signaling text. */
 export function validFileOffer(message) {
-  return plainObject(message) && message.type === "file-offer" && message.protocol === 1 &&
+  return plainObject(message) && message.type === "file-offer" && message.protocol === FT_PROTOCOL &&
     validId128(message.offerId) && (message.source === "clipboard" || message.source === "sendto") &&
     Array.isArray(message.items) && message.items.length <= FT_MAX_BATCH_FILES &&
     message.items.every(item => plainObject(item) && uint32(item.id) &&

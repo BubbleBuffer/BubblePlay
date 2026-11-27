@@ -39,7 +39,7 @@ import { createSessionState } from "/session-state.js";
 import { createWssMediaSocket } from "/wss-media-socket.js";
 import { createRecoveryTracker } from "/recovery-tracker.js";
 import { createWssAudioSession } from "/wss-audio.js";
-import { FileTransferClient } from "/file-client.js";
+import { FileTransferClient, FT_PROTOCOL } from "/file-client.js";
 import { touchPc } from "/devicekey-store.js";
 import { pcListUrl, registerProof, relayOrigin, viewerHello } from "/dk-relay.js";
 import { b64u } from "/dk-crypto.js";
@@ -1092,7 +1092,7 @@ async function handleEndpointSignal(socket, generation, msg) {
       };
       sessionState.hostCapabilitiesGeneration = generation;
       // File transfer hook (3/5): all file UI stays hidden without the capability.
-      setFileTransferAvailable(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= 1);
+      setFileTransferAvailable(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= FT_PROTOCOL);
       nativeFileDropAvailable = Number.isInteger(msg.fileDrop) && msg.fileDrop >= 1;
       nativeFileDropPreviewAvailable = msg.fileDropPreview === 1 && nativeFileDropAvailable && fileUi.enabled;
       if (!nativeFileDropPreviewAvailable) fileDragPreview.cancel();

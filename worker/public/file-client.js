@@ -18,9 +18,9 @@ import {
   FT_ACK_EVERY_BYTES, FT_ACK_EVERY_MS, FT_BLOB_DOWNLOAD_MAX_BYTES, FT_WINDOW_BYTES,
   FileIncoming, FileSendWindow, Sha256, decodeFilePacket, encodeAccept, encodeAck, encodeCancel, encodeData,
   encodeDone, encodeOffer, encodeRequest, encodeResult, validDropPoint, validFileOffer, validOfferMeta,
-  fileRequestMessage, randomId128, validBatchAck,
+  FT_PROTOCOL, fileRequestMessage, randomId128, validBatchAck,
 } from "./file-transfer.js";
-import { ensureAnnounced } from "./file-announce.js";
+import { ensureAnnounced, settleBatch } from "./file-announce.js";
 import { describeFileError } from "./file-errors.js";
 
 const PING_MS = 15_000;
@@ -33,7 +33,7 @@ const nameEncoder = new TextEncoder();
 
 class TransferAborted extends Error {}
 
-export { describeFileError };
+export { describeFileError, FT_PROTOCOL };
 
 export class FileTransferClient extends EventTarget {
   constructor({ socketUrl, socketTicket = () => null, sendControl = () => false, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() } = {}) {
@@ -185,7 +185,7 @@ export class FileTransferClient extends EventTarget {
     row.finishedAt = this.now();
     if (row.transferId !== null) this.byTransferId.delete(row.transferId);
     if (row.sink && state !== "done") { const sink = row.sink; row.sink = null; Promise.resolve().then(() => sink.abort?.()).catch(() => { /* a sink that cannot abort has nothing left to release */ }); }
-    row.file = null;
+    row.file = null; settleBatch(this, row, TERMINAL);
     this.wake();
     this.changed();
     this.scheduleIdleClose();

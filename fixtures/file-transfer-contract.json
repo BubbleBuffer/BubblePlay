@@ -1,5 +1,5 @@
 {
-  "protocol": 1,
+  "protocol": 2,
   "magic": "BPF1",
   "headerBytes": 16,
   "header": {
@@ -353,90 +353,95 @@
   "signaling": {
     "fileOffer": [
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000007\",\"items\":[{\"id\":1,\"name\":\"report.pdf\",\"size\":1234}],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000007\",\"items\":[{\"id\":1,\"name\":\"report.pdf\",\"size\":1234}],\"source\":\"clipboard\"}",
         "accepted": true
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000008\",\"items\":[],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000008\",\"items\":[],\"source\":\"clipboard\"}",
         "accepted": true,
         "note": "items [] withdraws the previous offer"
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"a.txt\",\"size\":1},{\"id\":2,\"name\":\"b.bin\",\"size\":2147483648}],\"source\":\"sendto\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"a.txt\",\"size\":1},{\"id\":2,\"name\":\"b.bin\",\"size\":2147483648}],\"source\":\"sendto\"}",
         "accepted": true
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"\",\"size\":1}],\"source\":\"sendto\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"\",\"size\":1}],\"source\":\"sendto\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"a\",\"size\":2147483649}],\"source\":\"sendto\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"a\",\"size\":2147483649}],\"source\":\"sendto\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[],\"source\":\"disk\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000009\",\"items\":[],\"source\":\"disk\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000009\",\"items\":[],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[],\"source\":\"clipboard\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":-1,\"items\":[],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":-1,\"items\":[],\"source\":\"clipboard\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":0,\"name\":\"f\",\"size\":1},{\"id\":1,\"name\":\"f\",\"size\":1},{\"id\":2,\"name\":\"f\",\"size\":1},{\"id\":3,\"name\":\"f\",\"size\":1},{\"id\":4,\"name\":\"f\",\"size\":1},{\"id\":5,\"name\":\"f\",\"size\":1},{\"id\":6,\"name\":\"f\",\"size\":1},{\"id\":7,\"name\":\"f\",\"size\":1},{\"id\":8,\"name\":\"f\",\"size\":1},{\"id\":9,\"name\":\"f\",\"size\":1},{\"id\":10,\"name\":\"f\",\"size\":1},{\"id\":11,\"name\":\"f\",\"size\":1},{\"id\":12,\"name\":\"f\",\"size\":1},{\"id\":13,\"name\":\"f\",\"size\":1},{\"id\":14,\"name\":\"f\",\"size\":1},{\"id\":15,\"name\":\"f\",\"size\":1},{\"id\":16,\"name\":\"f\",\"size\":1},{\"id\":17,\"name\":\"f\",\"size\":1},{\"id\":18,\"name\":\"f\",\"size\":1},{\"id\":19,\"name\":\"f\",\"size\":1},{\"id\":20,\"name\":\"f\",\"size\":1},{\"id\":21,\"name\":\"f\",\"size\":1},{\"id\":22,\"name\":\"f\",\"size\":1},{\"id\":23,\"name\":\"f\",\"size\":1},{\"id\":24,\"name\":\"f\",\"size\":1},{\"id\":25,\"name\":\"f\",\"size\":1},{\"id\":26,\"name\":\"f\",\"size\":1},{\"id\":27,\"name\":\"f\",\"size\":1},{\"id\":28,\"name\":\"f\",\"size\":1},{\"id\":29,\"name\":\"f\",\"size\":1},{\"id\":30,\"name\":\"f\",\"size\":1},{\"id\":31,\"name\":\"f\",\"size\":1},{\"id\":32,\"name\":\"f\",\"size\":1},{\"id\":33,\"name\":\"f\",\"size\":1},{\"id\":34,\"name\":\"f\",\"size\":1},{\"id\":35,\"name\":\"f\",\"size\":1},{\"id\":36,\"name\":\"f\",\"size\":1},{\"id\":37,\"name\":\"f\",\"size\":1},{\"id\":38,\"name\":\"f\",\"size\":1},{\"id\":39,\"name\":\"f\",\"size\":1},{\"id\":40,\"name\":\"f\",\"size\":1},{\"id\":41,\"name\":\"f\",\"size\":1},{\"id\":42,\"name\":\"f\",\"size\":1},{\"id\":43,\"name\":\"f\",\"size\":1},{\"id\":44,\"name\":\"f\",\"size\":1},{\"id\":45,\"name\":\"f\",\"size\":1},{\"id\":46,\"name\":\"f\",\"size\":1},{\"id\":47,\"name\":\"f\",\"size\":1},{\"id\":48,\"name\":\"f\",\"size\":1},{\"id\":49,\"name\":\"f\",\"size\":1},{\"id\":50,\"name\":\"f\",\"size\":1},{\"id\":51,\"name\":\"f\",\"size\":1},{\"id\":52,\"name\":\"f\",\"size\":1},{\"id\":53,\"name\":\"f\",\"size\":1},{\"id\":54,\"name\":\"f\",\"size\":1},{\"id\":55,\"name\":\"f\",\"size\":1},{\"id\":56,\"name\":\"f\",\"size\":1},{\"id\":57,\"name\":\"f\",\"size\":1},{\"id\":58,\"name\":\"f\",\"size\":1},{\"id\":59,\"name\":\"f\",\"size\":1},{\"id\":60,\"name\":\"f\",\"size\":1},{\"id\":61,\"name\":\"f\",\"size\":1},{\"id\":62,\"name\":\"f\",\"size\":1},{\"id\":63,\"name\":\"f\",\"size\":1},{\"id\":64,\"name\":\"f\",\"size\":1}],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":0,\"name\":\"f\",\"size\":1},{\"id\":1,\"name\":\"f\",\"size\":1},{\"id\":2,\"name\":\"f\",\"size\":1},{\"id\":3,\"name\":\"f\",\"size\":1},{\"id\":4,\"name\":\"f\",\"size\":1},{\"id\":5,\"name\":\"f\",\"size\":1},{\"id\":6,\"name\":\"f\",\"size\":1},{\"id\":7,\"name\":\"f\",\"size\":1},{\"id\":8,\"name\":\"f\",\"size\":1},{\"id\":9,\"name\":\"f\",\"size\":1},{\"id\":10,\"name\":\"f\",\"size\":1},{\"id\":11,\"name\":\"f\",\"size\":1},{\"id\":12,\"name\":\"f\",\"size\":1},{\"id\":13,\"name\":\"f\",\"size\":1},{\"id\":14,\"name\":\"f\",\"size\":1},{\"id\":15,\"name\":\"f\",\"size\":1},{\"id\":16,\"name\":\"f\",\"size\":1},{\"id\":17,\"name\":\"f\",\"size\":1},{\"id\":18,\"name\":\"f\",\"size\":1},{\"id\":19,\"name\":\"f\",\"size\":1},{\"id\":20,\"name\":\"f\",\"size\":1},{\"id\":21,\"name\":\"f\",\"size\":1},{\"id\":22,\"name\":\"f\",\"size\":1},{\"id\":23,\"name\":\"f\",\"size\":1},{\"id\":24,\"name\":\"f\",\"size\":1},{\"id\":25,\"name\":\"f\",\"size\":1},{\"id\":26,\"name\":\"f\",\"size\":1},{\"id\":27,\"name\":\"f\",\"size\":1},{\"id\":28,\"name\":\"f\",\"size\":1},{\"id\":29,\"name\":\"f\",\"size\":1},{\"id\":30,\"name\":\"f\",\"size\":1},{\"id\":31,\"name\":\"f\",\"size\":1},{\"id\":32,\"name\":\"f\",\"size\":1},{\"id\":33,\"name\":\"f\",\"size\":1},{\"id\":34,\"name\":\"f\",\"size\":1},{\"id\":35,\"name\":\"f\",\"size\":1},{\"id\":36,\"name\":\"f\",\"size\":1},{\"id\":37,\"name\":\"f\",\"size\":1},{\"id\":38,\"name\":\"f\",\"size\":1},{\"id\":39,\"name\":\"f\",\"size\":1},{\"id\":40,\"name\":\"f\",\"size\":1},{\"id\":41,\"name\":\"f\",\"size\":1},{\"id\":42,\"name\":\"f\",\"size\":1},{\"id\":43,\"name\":\"f\",\"size\":1},{\"id\":44,\"name\":\"f\",\"size\":1},{\"id\":45,\"name\":\"f\",\"size\":1},{\"id\":46,\"name\":\"f\",\"size\":1},{\"id\":47,\"name\":\"f\",\"size\":1},{\"id\":48,\"name\":\"f\",\"size\":1},{\"id\":49,\"name\":\"f\",\"size\":1},{\"id\":50,\"name\":\"f\",\"size\":1},{\"id\":51,\"name\":\"f\",\"size\":1},{\"id\":52,\"name\":\"f\",\"size\":1},{\"id\":53,\"name\":\"f\",\"size\":1},{\"id\":54,\"name\":\"f\",\"size\":1},{\"id\":55,\"name\":\"f\",\"size\":1},{\"id\":56,\"name\":\"f\",\"size\":1},{\"id\":57,\"name\":\"f\",\"size\":1},{\"id\":58,\"name\":\"f\",\"size\":1},{\"id\":59,\"name\":\"f\",\"size\":1},{\"id\":60,\"name\":\"f\",\"size\":1},{\"id\":61,\"name\":\"f\",\"size\":1},{\"id\":62,\"name\":\"f\",\"size\":1},{\"id\":63,\"name\":\"f\",\"size\":1},{\"id\":64,\"name\":\"f\",\"size\":1}],\"source\":\"clipboard\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":7,\"items\":[],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":7,\"items\":[],\"source\":\"clipboard\"}",
         "accepted": false,
         "note": "offer ids are 32 lowercase hex digits"
       }
     ],
     "hostCapabilities": {
-      "text": "{\"type\":\"host-capabilities\",\"serviceMode\":false,\"coldBoot\":false,\"secureDesktop\":false,\"secureText\":false,\"fileTransfer\":1}",
-      "note": "clients show file UI only when fileTransfer >= 1"
+      "text": "{\"type\":\"host-capabilities\",\"serviceMode\":false,\"coldBoot\":false,\"secureDesktop\":false,\"secureText\":false,\"fileTransfer\":2}",
+      "note": "clients show file UI only when fileTransfer >= 2"
     },
     "fileBatch": {
-      "note": "client -> host over the sealed control channel, before the batch OFFER packets; the host admits only offers matching it (name, size, purpose, drop point, count, SHA-256)",
+      "note": "client -> host over the sealed control channel, before the batch OFFER packets; the host admits only offers matching it (name, size, mime, mtime, purpose, drop point, count, SHA-256); every file entry carries all five fields",
       "cases": [
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"paste\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"paste\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"mime\":\"text/plain\",\"mtimeMs\":1700000000000,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
           "accepted": true
         },
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"drop\",\"drop\":{\"x\":1,\"y\":2,\"generation\":1,\"viewportRevision\":0},\"files\":[{\"name\":\"a.txt\",\"size\":0,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"drop\",\"drop\":{\"x\":1,\"y\":2,\"generation\":1,\"viewportRevision\":0},\"files\":[{\"name\":\"a.txt\",\"size\":0,\"mime\":\"text/plain\",\"mtimeMs\":1700000000000,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
           "accepted": true
         },
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"drop\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"drop\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"mime\":\"text/plain\",\"mtimeMs\":1700000000000,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
           "accepted": false,
           "note": "drop needs a drop point"
         },
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"drop\":{\"x\":1,\"y\":2,\"generation\":1,\"viewportRevision\":0},\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"drop\":{\"x\":1,\"y\":2,\"generation\":1,\"viewportRevision\":0},\"files\":[{\"name\":\"a.txt\",\"size\":5,\"mime\":\"text/plain\",\"mtimeMs\":1700000000000,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
           "accepted": false,
           "note": "only drop carries a drop point"
         },
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"mime\":\"\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "accepted": false,
+          "note": "mtimeMs is required"
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[]}",
           "accepted": false,
           "note": "at least one file"
         },
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"abc\"}]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"mime\":\"text/plain\",\"mtimeMs\":1700000000000,\"sha256\":\"abc\"}]}",
           "accepted": false,
           "note": "sha256 is 64 lowercase hex digits"
         },
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":7,\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":7,\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"mime\":\"text/plain\",\"mtimeMs\":1700000000000,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
           "accepted": false,
           "note": "batch ids are 32 hex digits"
         },
         {
-          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":2147483649,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "text": "{\"type\":\"file-batch\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":2147483649,\"mime\":\"text/plain\",\"mtimeMs\":1700000000000,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
           "accepted": false,
           "note": "over 2 GiB"
         }
@@ -446,13 +451,26 @@
       "note": "host -> client; error is one of not-ready, duplicate-batch, busy",
       "cases": [
         {
-          "text": "{\"type\":\"file-batch-ack\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"ok\":true}",
+          "text": "{\"type\":\"file-batch-ack\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"ok\":true}",
           "ok": true
         },
         {
-          "text": "{\"type\":\"file-batch-ack\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"ok\":false,\"error\":\"busy\"}",
+          "text": "{\"type\":\"file-batch-ack\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\",\"ok\":false,\"error\":\"busy\"}",
           "ok": false,
           "error": "busy"
+        }
+      ]
+    },
+    "fileBatchCancel": {
+      "note": "client -> host over the sealed control channel when the viewer gives up on a batch (cancelled, failed locally, no ack); the host stops the batch's uploads and refuses its later offers",
+      "cases": [
+        {
+          "text": "{\"type\":\"file-batch-cancel\",\"protocol\":2,\"batchId\":\"00000000000000000000000000abcdef\"}",
+          "accepted": true
+        },
+        {
+          "text": "{\"type\":\"file-batch-cancel\",\"protocol\":2,\"batchId\":7}",
+          "accepted": false
         }
       ]
     },
@@ -460,15 +478,15 @@
       "note": "client -> host over the sealed control channel; the host serves a REQUEST packet only for an offerId/id pair asked for here, once",
       "cases": [
         {
-          "text": "{\"type\":\"file-request\",\"protocol\":1,\"offerId\":\"00000000000000000000000000abcdef\",\"ids\":[1,2]}",
+          "text": "{\"type\":\"file-request\",\"protocol\":2,\"offerId\":\"00000000000000000000000000abcdef\",\"ids\":[1,2]}",
           "accepted": true
         },
         {
-          "text": "{\"type\":\"file-request\",\"protocol\":1,\"offerId\":\"00000000000000000000000000abcdef\",\"ids\":[]}",
+          "text": "{\"type\":\"file-request\",\"protocol\":2,\"offerId\":\"00000000000000000000000000abcdef\",\"ids\":[]}",
           "accepted": false
         },
         {
-          "text": "{\"type\":\"file-request\",\"protocol\":1,\"offerId\":4,\"ids\":[1]}",
+          "text": "{\"type\":\"file-request\",\"protocol\":2,\"offerId\":4,\"ids\":[1]}",
           "accepted": false
         }
       ]
