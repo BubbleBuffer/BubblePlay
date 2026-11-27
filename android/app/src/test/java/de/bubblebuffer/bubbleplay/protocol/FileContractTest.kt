@@ -128,11 +128,14 @@ class FileContractTest {
             val packets = case.getJSONArray("packets")
             var check: ReceiveCheck? = null
             var outcome: String? = null
+            // The sessions carry the hash in DONE; a real download takes it from the sealed offer instead.
+            val sealed = (0 until packets.length()).mapNotNull { FileWire.parse(hex(packets.getString(it))).packet }
+                .firstOrNull { it.type == FileWire.DONE }?.payload?.let(FileWire::hex) ?: "0".repeat(64)
             for (j in 0 until packets.length()) {
                 val p = FileWire.parse(hex(packets.getString(j))).packet
                 assertNotNull("$name #$j", p)
                 when (p!!.type) {
-                    FileWire.OFFER -> check = ReceiveCheck(FileWire.parseMeta(p.payload)!!.size)
+                    FileWire.OFFER -> check = ReceiveCheck(FileWire.parseMeta(p.payload)!!.size, sealed)
                     FileWire.DATA -> outcome = check!!.onData(p.seq, p.payload)
                     FileWire.DONE -> outcome = check!!.onDone(p.payload) ?: "ok"
                 }

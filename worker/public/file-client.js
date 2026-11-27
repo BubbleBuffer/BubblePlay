@@ -18,7 +18,7 @@ import {
   FT_ACK_EVERY_BYTES, FT_ACK_EVERY_MS, FT_BLOB_DOWNLOAD_MAX_BYTES, FT_WINDOW_BYTES,
   FileIncoming, FileSendWindow, Sha256, decodeFilePacket, encodeAccept, encodeAck, encodeCancel, encodeData,
   encodeDone, encodeOffer, encodeRequest, encodeResult, validDropPoint, validFileOffer, validOfferMeta,
-  FT_PROTOCOL, fileRequestMessage, randomId128, validBatchAck,
+  FT_PROTOCOL, bytesToHex, fileRequestMessage, randomId128, validBatchAck,
 } from "./file-transfer.js";
 import { ensureAnnounced, settleBatch } from "./file-announce.js";
 import { describeFileError } from "./file-errors.js";
@@ -122,10 +122,14 @@ export class FileTransferClient extends EventTarget {
     }
     if (!offer) return [];
     const ids = [];
-    for (const item of items) {
+    for (const asked of items) {
+      // Name, size and SHA-256 come from the sealed offer, never from the caller or the file socket.
+      const item = offer.items.find(candidate => candidate.id === asked.id);
+      if (!item) continue;
       const row = this.addRow("download", item.name, item.size, "save");
       row.offerId = offer.offerId;
       row.itemId = item.id;
+      row.sealedSha256 = item.sha256;
       row.sinkFor = sinkFor;
       ids.push(row.id);
     }
@@ -170,7 +174,7 @@ export class FileTransferClient extends EventTarget {
     const row = {
       id: this.nextRowId++, direction, name, size, purpose, state: "queued", error: null,
       bytes: 0, startedAt: null, finishedAt: null, transferId: null,
-      file: null, meta: null, offerId: null, itemId: null, sinkFor: null, sink: null,
+      file: null, meta: null, offerId: null, itemId: null, sealedSha256: null, sinkFor: null, sink: null,
     };
     this.rows.push(row);
     return row;
@@ -485,7 +489,11 @@ export class FileTransferClient extends EventTarget {
     if (row.writeError) throw Object.assign(new Error(), { code: "save-failed" });
     row.state = "verifying";
     this.changed();
-    const verdict = row.incoming.onDone(Array.from(row.doneHash), Array.from(row.hash.finish()));
+    // The bytes must match the hash the PC sealed in its offer; the DONE hash on the unsealed socket is only a cross-check.
+    const actual = row.hash.finish();
+    const verdict = bytesToHex(actual) !== row.sealedSha256
+      ? (row.incoming.received !== row.size ? "size-mismatch" : "hash-mismatch")
+      : row.incoming.onDone(Array.from(row.doneHash), Array.from(actual));
     if (verdict) {
       this.sendBinary(encodeResult(row.transferId, false, verdict));
       this.fail(row, verdict);

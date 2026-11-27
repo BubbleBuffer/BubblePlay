@@ -707,7 +707,7 @@ class FileTransfers(
                     Log.w(TAG, "download create failed: ${e.message}")
                     return abortDownload(active, ERR_STORAGE)
                 }
-                active.check = ReceiveCheck(item.size)
+                active.check = ReceiveCheck(item.size, item.sha256)
                 ws?.let { send(it, FileWire.encode(FileWire.ACCEPT, active.tid)) }
                 progress(force = true)
             }

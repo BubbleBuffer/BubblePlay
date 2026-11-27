@@ -86,7 +86,7 @@ class FileWireTest {
 
     @Test
     fun aDownloadOfferFromTheFileSocketMustAgreeWithTheSealedOffer() {
-        val item = FileWire.Item(1, "report.pdf", 1234)
+        val item = FileWire.Item(1, "report.pdf", 1234, "application/pdf", 0, "a".repeat(64))
         // The file socket may carry another name or type; only the offer id and the size have to match.
         val other = FileWire.Meta("evil.exe", 1234, "application/x-msdownload", 0, "save", id(9), 0, 1)
         assertTrue(FileWire.matchesOffer(item, id(9), other))
@@ -116,20 +116,27 @@ class FileWireTest {
 
     @Test
     fun fileOfferMessage() {
-        val msg = JSONObject("""{"type":"file-offer","protocol":2,"offerId":"${id(5)}","source":"clipboard",
-            "items":[{"id":1,"name":"a.txt","size":3},{"id":2,"name":"b.png","size":2048}]}""")
+        val msg = JSONObject("""{"type":"file-offer","protocol":3,"offerId":"${id(5)}","source":"clipboard",
+            "items":[{"id":1,"name":"a.txt","size":3,"mime":"text/plain","mtimeMs":5,"sha256":"${"b".repeat(64)}"},{"id":2,"name":"b.png","size":2048,"mime":"","mtimeMs":0,"sha256":"${"c".repeat(64)}"}]}""")
         val offer = FileWire.parseOfferMessage(msg)!!
         assertEquals(id(5), offer.offerId)
         assertEquals(2, offer.items.size)
         assertEquals(2051L, offer.totalBytes)
-        val withdrawn = FileWire.parseOfferMessage(JSONObject("""{"type":"file-offer","protocol":2,"offerId":"${id(6)}","source":"sendto","items":[]}"""))!!
+        val withdrawn = FileWire.parseOfferMessage(JSONObject("""{"type":"file-offer","protocol":3,"offerId":"${id(6)}","source":"sendto","items":[]}"""))!!
         assertEquals(0, withdrawn.items.size)
         assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("protocol", 1))) // an older host is rejected, not misparsed
+        assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("protocol", 2))) // a v2 offer carries no sealed hash
+        assertEquals("b".repeat(64), offer.items[0].sha256)
+        for (bad in listOf<JSONObject.() -> Unit>({ remove("sha256") }, { put("sha256", "ABCD") }, { remove("mime") }, { remove("mtimeMs") })) {
+            val broken = JSONObject(msg.toString())
+            broken.getJSONArray("items").getJSONObject(0).apply(bad)
+            assertNull(FileWire.parseOfferMessage(broken))
+        }
         assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("source", "disk")))
         val dup = JSONObject(msg.toString())
         dup.getJSONArray("items").getJSONObject(1).put("id", 1)
         assertNull(FileWire.parseOfferMessage(dup))
-        val many = JSONObject(msg.toString()).put("items", org.json.JSONArray((0..64).map { JSONObject().put("id", it).put("name", "f$it").put("size", 1) }))
+        val many = JSONObject(msg.toString()).put("items", org.json.JSONArray((0..64).map { JSONObject().put("id", it).put("name", "f$it").put("size", 1).put("mime", "").put("mtimeMs", 0).put("sha256", "0".repeat(64)) }))
         assertNull(FileWire.parseOfferMessage(many))
     }
 }

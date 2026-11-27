@@ -213,6 +213,11 @@ pub struct FileOfferItem {
     pub id: u32,
     pub name: String,
     pub size: u64,
+    pub mime: String,
+    #[serde(rename = "mtimeMs")]
+    pub mtime_ms: u64,
+    /// SHA-256 of the file, 64 lowercase hex digits. The viewer verifies the download against it.
+    pub sha256: String,
 }
 
 pub fn file_offer_message(offer_id: &str, items: &[FileOfferItem], source: &str) -> String {
@@ -277,6 +282,9 @@ mod tests {
             id: 1,
             name: "report.pdf".into(),
             size: 1234,
+            mime: "application/pdf".into(),
+            mtime_ms: 1_700_000_000_000,
+            sha256: "a".repeat(64),
         }];
         let built = file_offer_message(&test_id(7), &items, "clipboard");
         assert!(valid_file_offer_text(&built));
@@ -300,7 +308,7 @@ mod tests {
             return false;
         };
         value["type"] == "file-offer"
-            && value["protocol"] == 2
+            && value["protocol"] == 3
             && value["offerId"].as_str().is_some_and(valid_id128)
             && matches!(value["source"].as_str(), Some("clipboard" | "sendto"))
             && items.len() <= MAX_BATCH_FILES as usize
@@ -312,6 +320,14 @@ mod tests {
                     && item["size"]
                         .as_u64()
                         .is_some_and(|size| size <= MAX_FILE_BYTES)
+                    && item["mime"]
+                        .as_str()
+                        .is_some_and(|mime| mime.len() <= MAX_MIME_BYTES)
+                    && item["mtimeMs"].as_u64().is_some()
+                    && item["sha256"].as_str().is_some_and(|hash| {
+                        hash.len() == SHA256_BYTES * 2
+                            && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    })
             })
     }
 }

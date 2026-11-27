@@ -21,8 +21,8 @@
 use crate::file_control::valid_id128;
 use serde::{Deserialize, Serialize};
 
-/// `fileTransfer` capability and `protocol` of the sealed file messages (2: hex ids, announced batches).
-pub const PROTOCOL_VERSION: u8 = 2;
+/// `fileTransfer` capability and `protocol` of the sealed file messages (3: hex ids, announced batches, sealed download hashes).
+pub const PROTOCOL_VERSION: u8 = 3;
 pub const MAGIC: [u8; 4] = *b"BPF1";
 pub const HEADER_BYTES: usize = 16;
 pub const MAX_DATA_BYTES: usize = 64 * 1024;

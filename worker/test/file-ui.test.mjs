@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { FileTransferClient } from "../public/file-client.js";
+const ZERO_SHA = "0".repeat(64);
 import { installFileTransferUi } from "../public/file-ui.js";
 
 function element() {
@@ -20,7 +21,7 @@ test("a picker-open offer replacement or withdrawal shows an error and downloads
   globalThis.document = { body: element(), createElement: element, addEventListener() {} };
   globalThis.showDirectoryPicker = async () => { throw new Error("single-file offer uses the save picker"); };
   try {
-    for (const replacementItems of [[{ id: 1, name: "replacement.txt", size: 2 }], []]) {
+    for (const replacementItems of [[{ id: 1, name: "replacement.txt", size: 2, mime: "", mtimeMs: 0, sha256: ZERO_SHA }], []]) {
       let finishPicker, writableCalls = 0, socketCalls = 0;
       const pickerCalls = [];
       globalThis.showSaveFilePicker = options => {
@@ -28,7 +29,7 @@ test("a picker-open offer replacement or withdrawal shows an error and downloads
         return new Promise(resolve => { finishPicker = resolve; });
       };
       const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: class { constructor() { socketCalls++; } } });
-      const offer = { type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000001", source: "clipboard", items: [{ id: 1, name: "original.txt", size: 1 }] };
+      const offer = { type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", source: "clipboard", items: [{ id: 1, name: "original.txt", size: 1, mime: "", mtimeMs: 0, sha256: ZERO_SHA }] };
       client.setOffer(offer);
       const parts = new Map();
       const root = { hidden: true, querySelector(selector) { if (!parts.has(selector)) parts.set(selector, element()); return parts.get(selector); } };
@@ -72,7 +73,7 @@ test("an unchanged picker offer downloads its captured id and hides its chip", a
   globalThis.showSaveFilePicker = async () => ({ createWritable() { throw new Error("only sink selection is tested"); } });
   try {
     const client = new EventTarget();
-    client.offer = { offerId: "00000000000000000000000000000007", items: [{ id: 3, name: "a.txt", size: 1 }] };
+    client.offer = { offerId: "00000000000000000000000000000007", items: [{ id: 3, name: "a.txt", size: 1, mime: "", mtimeMs: 0, sha256: ZERO_SHA }] };
     client.transfers = [];
     const downloads = [];
     client.download = (...args) => { downloads.push(args); client.dispatchEvent(new Event("change")); };

@@ -67,7 +67,7 @@ See the shared [session UI](../docs/architecture/session-ui.md). One view (`ui/S
 
 ### File transfer (v1)
 
-See [file-transfer behavior](../docs/architecture/file-transfer.md) and the [shared fixture](../fixtures/file-transfer-contract.json). All of it is hidden unless the host's `host-capabilities` carries `fileTransfer` >= 1.
+See [file-transfer behavior](../docs/architecture/file-transfer.md) and the [shared fixture](../fixtures/file-transfer-contract.json). All of it is hidden unless the host's `host-capabilities` carries `fileTransfer` >= 3.
 
 - **Socket:** a second OkHttp WebSocket, `/file-ws?epoch=<mediaEpoch>&pc=<id>`, using the current signaling ticket. It opens on demand, sends `hello`, waits for `file-peer` present (10 s), pings every 15 s and closes after 60 s idle. One transfer runs per direction; the rest queue.
 - **Upload:**

@@ -6,6 +6,9 @@ import {
 } from "../public/file-transfer.js";
 import { describeFileError, FileTransferClient } from "../public/file-client.js";
 
+const sha = bytes => createHash("sha256").update(bytes).digest("hex");
+const ZERO_SHA = "0".repeat(64);
+
 test("file socket closes without sending a hello when no ticket is available", () => {
   const sent = [];
   let closed = 0;
@@ -37,9 +40,10 @@ test("incremental SHA-256 matches node:crypto across block boundaries", () => {
 
 /** A fake relay + PC: answers the client like the relay and host do. */
 class FakeHost {
-  constructor({ files = {}, corrupt = false, peerPresent = true, deferDropResult = false, manualDownload = false } = {}) {
+  constructor({ files = {}, corrupt = false, tamper = false, peerPresent = true, deferDropResult = false, manualDownload = false } = {}) {
     this.files = files;
     this.corrupt = corrupt;
+    this.tamper = tamper;
     this.peerPresent = peerPresent;
     this.deferDropResult = deferDropResult;
     this.manualDownload = manualDownload;
@@ -80,7 +84,7 @@ class FakeHost {
     if (message.type === "file-batch") {
       const error = Array.isArray(this.ackOverride) ? this.ackOverride.shift() : this.ackOverride;
       if (!error) this.announced.set(message.batchId, message);
-      setTimeout(() => client.onBatchAck({ type: "file-batch-ack", protocol: 2, batchId: message.batchId, ok: !error, ...(error ? { error } : {}) }), 0);
+      setTimeout(() => client.onBatchAck({ type: "file-batch-ack", protocol: 3, batchId: message.batchId, ok: !error, ...(error ? { error } : {}) }), 0);
     } else if (message.type === "file-request") {
       for (const id of message.ids) this.granted.add(`${message.offerId}/${id}`);
     }
@@ -143,12 +147,15 @@ class FakeHost {
         if (this.manualDownload) break;
         const { file } = this.pending;
         let seq = 0;
+        const sent = createHash("sha256");
         for (let offset = 0; offset < file.bytes.length; offset += 65536) {
           const chunk = Buffer.from(file.bytes.subarray(offset, offset + 65536));
-          if (this.corrupt && offset === 0) chunk[0] ^= 0xff;
+          if ((this.corrupt || this.tamper) && offset === 0) chunk[0] ^= 0xff;
+          sent.update(chunk);
           this.deliver(ws, encodeData(id, seq++, chunk));
         }
-        this.deliver(ws, encodeDone(id, createHash("sha256").update(file.bytes).digest()));
+        // A relay that alters the bytes also controls the DONE hash and can match it to what it sent.
+        this.deliver(ws, encodeDone(id, this.tamper ? sent.digest() : createHash("sha256").update(file.bytes).digest()));
         break;
       }
       default: break;
@@ -279,7 +286,7 @@ test("downloads an offered file, verifies it and closes the sink", async () => {
   const bytes = randomBytes(2 * 1024 * 1024 + 3);
   const host = new FakeHost({ files: { 4: { name: "report.pdf", bytes } } });
   const client = host.client(() => "wss://x");
-  assert.ok(client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000009", items: [{ id: 4, name: "report.pdf", size: bytes.length }], source: "sendto" }));
+  assert.ok(client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000009", items: [{ id: 4, name: "report.pdf", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "sendto" }));
   const sink = memorySink();
   const ids = client.download(client.offer.items, async () => sink);
   const [row] = await settled(client, ids);
@@ -312,7 +319,7 @@ test("a download exceeding the outstanding window fails without queuing more dis
   let release;
   sink.write = data => new Promise(resolve => { sink.parts.push(Buffer.from(data)); release = resolve; });
   try {
-    client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "slow.bin", size: bytes.length }], source: "clipboard" });
+    client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "slow.bin", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "clipboard" });
     const ids = client.download(client.offer.items, async () => sink);
     await activeDownload(client);
     const { id } = host.pending;
@@ -348,7 +355,7 @@ test("written and ACKed bytes reopen the download window for a compliant sender"
   const firstWrite = new Promise(resolve => { release = resolve; });
   sink.write = async data => { if (!sink.parts.length) await firstWrite; sink.parts.push(Buffer.from(data)); };
   try {
-    client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "slow.bin", size: bytes.length }], source: "clipboard" });
+    client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "slow.bin", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "clipboard" });
     const ids = client.download(client.offer.items, async () => sink);
     await activeDownload(client);
     const { id } = host.pending;
@@ -379,12 +386,12 @@ test("written and ACKed bytes reopen the download window for a compliant sender"
 test("a captured download offer cannot be replaced or withdrawn before download starts", () => {
   const host = new FakeHost();
   const client = host.client(() => "wss://x");
-  const original = { type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a", size: 1 }], source: "clipboard" };
+  const original = { type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a", size: 1, mime: "", mtimeMs: 0, sha256: ZERO_SHA }], source: "clipboard" };
   client.setOffer(original);
   const captured = client.offer;
   let sinkCalls = 0;
   const sinkFor = async () => { sinkCalls++; return memorySink(); };
-  for (const items of [[{ id: 1, name: "replacement", size: 9 }], []]) {
+  for (const items of [[{ id: 1, name: "replacement", size: 9, mime: "", mtimeMs: 0, sha256: ZERO_SHA }], []]) {
     client.setOffer({ ...original, offerId: "00000000000000000000000000000002", items });
     assert.throws(() => client.download(captured.items, sinkFor, captured.offerId), {
       code: "offer-replaced", message: "The PC replaced these files. Try again.",
@@ -399,7 +406,7 @@ test("a damaged download is rejected and its partial output discarded", async ()
   const bytes = randomBytes(200_000);
   const host = new FakeHost({ files: { 1: { name: "a.bin", bytes } }, corrupt: true });
   const client = host.client(() => "wss://x");
-  client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a.bin", size: bytes.length }], source: "clipboard" });
+  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a.bin", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "clipboard" });
   const sink = memorySink();
   const [row] = await settled(client, client.download(client.offer.items, async () => sink));
   assert.equal(row.state, "failed");
@@ -409,10 +416,34 @@ test("a damaged download is rejected and its partial output discarded", async ()
   client.reset();
 });
 
+test("a download altered by the relay, with a DONE hash to match, fails against the sealed hash and is discarded", async () => {
+  const bytes = randomBytes(200_000);
+  const host = new FakeHost({ files: { 1: { name: "a.bin", bytes } }, tamper: true });
+  const client = host.client(() => "wss://x");
+  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a.bin", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "clipboard" });
+  const sink = memorySink();
+  const [row] = await settled(client, client.download(client.offer.items, async () => sink));
+  assert.equal(row.state, "failed");
+  assert.equal(row.error, "hash-mismatch");
+  assert.ok(sink.aborted && !sink.closed, "nothing is saved");
+  client.reset();
+});
+
+test("an offer without a sealed hash is not accepted", () => {
+  const client = new FakeHost().client(() => "wss://x");
+  const item = { id: 1, name: "a", size: 1, mime: "", mtimeMs: 0, sha256: ZERO_SHA };
+  const offer = items => ({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items, source: "clipboard" });
+  assert.equal(client.setOffer(offer([item])), true);
+  const { sha256, ...unsealed } = item;
+  assert.equal(client.setOffer(offer([unsealed])), false);
+  assert.equal(client.setOffer(offer([{ ...item, sha256: "AB".repeat(32) }])), false);
+  assert.equal(client.setOffer({ ...offer([item]), protocol: 2 }), false);
+});
+
 test("a withdrawn file is reported, and a user cancel sends CANCEL", async () => {
   const host = new FakeHost();
   const client = host.client(() => "wss://x");
-  client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000002", items: [{ id: 5, name: "gone.txt", size: 3 }], source: "clipboard" });
+  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000002", items: [{ id: 5, name: "gone.txt", size: 3, mime: "", mtimeMs: 0, sha256: ZERO_SHA }], source: "clipboard" });
   const sink = memorySink();
   const [gone] = await settled(client, client.download(client.offer.items, async () => sink));
   assert.equal(gone.error, "unknown-offer");
@@ -429,13 +460,13 @@ test("a withdrawn file is reported, and a user cancel sends CANCEL", async () =>
 
 test("offers replace each other and an empty offer withdraws", () => {
   const client = new FileTransferClient({ socketUrl: () => null });
-  client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a", size: 1 }], source: "clipboard" });
-  client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000002", items: [{ id: 1, name: "b", size: 2 }, { id: 2, name: "c", size: 3 }], source: "sendto" });
+  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a", size: 1, mime: "", mtimeMs: 0, sha256: ZERO_SHA }], source: "clipboard" });
+  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000002", items: [{ id: 1, name: "b", size: 2, mime: "", mtimeMs: 0, sha256: ZERO_SHA }, { id: 2, name: "c", size: 3, mime: "", mtimeMs: 0, sha256: ZERO_SHA }], source: "sendto" });
   assert.equal(client.offer.offerId, "00000000000000000000000000000002");
   assert.equal(client.offer.items.length, 2);
-  assert.equal(client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000003", items: [{ id: 1, name: "", size: 1 }], source: "sendto" }), false);
+  assert.equal(client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000003", items: [{ id: 1, name: "", size: 1, mime: "", mtimeMs: 0, sha256: ZERO_SHA }], source: "sendto" }), false);
   assert.equal(client.offer.offerId, "00000000000000000000000000000002", "invalid offers are ignored");
-  client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000004", items: [], source: "clipboard" });
+  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000004", items: [], source: "clipboard" });
   assert.equal(client.offer, null);
 });
 
@@ -458,7 +489,7 @@ test("a batch that fails after its announcement is cancelled over the sealed cha
   const [row] = await settled(client, ids);
   assert.equal(row.error, "busy");
   const batch = host.controls.find(message => message.type === "file-batch");
-  assert.deepEqual(host.controls.filter(message => message.type === "file-batch-cancel"), [{ type: "file-batch-cancel", protocol: 2, batchId: batch.batchId }]);
+  assert.deepEqual(host.controls.filter(message => message.type === "file-batch-cancel"), [{ type: "file-batch-cancel", protocol: 3, batchId: batch.batchId }]);
   client.reset();
 });
 
@@ -477,7 +508,7 @@ test("a download is saved under the name and size of the sealed offer, not the f
   const bytes = randomBytes(10);
   const host = new FakeHost({ files: { 4: { name: "evil.exe", bytes } } });
   const client = host.client(() => "wss://x");
-  assert.ok(client.setOffer({ type: "file-offer", protocol: 2, offerId: "00000000000000000000000000000009", items: [{ id: 4, name: "report.pdf", size: bytes.length }], source: "sendto" }));
+  assert.ok(client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000009", items: [{ id: 4, name: "report.pdf", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "sendto" }));
   let asked;
   const ids = client.download(client.offer.items, async item => { asked = item; return memorySink(); });
   await settled(client, ids);

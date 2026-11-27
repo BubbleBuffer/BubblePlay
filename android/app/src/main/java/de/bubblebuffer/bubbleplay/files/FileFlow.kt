@@ -71,7 +71,8 @@ class AckSchedule(private val everyBytes: Long = FileWire.ACK_BYTES, private val
  * What a receiver checks before RESULT ok: chunks arrive in order, never past
  * the announced size, and DONE's SHA-256 matches what was written.
  */
-class ReceiveCheck(val size: Long) {
+/** Verifies one download: size, order and the SHA-256 the PC sealed in its offer ([sealedSha256], lowercase hex). */
+class ReceiveCheck(val size: Long, private val sealedSha256: String) {
     private val digest = MessageDigest.getInstance("SHA-256")
     var received = 0L
         private set
@@ -90,7 +91,10 @@ class ReceiveCheck(val size: Long) {
     /** Null when the file is complete and intact, else the error code for RESULT. */
     fun onDone(sha256: ByteArray): String? {
         if (received != size) return ERR_SIZE
-        if (!MessageDigest.isEqual(digest.digest(), sha256)) return ERR_HASH
+        val actual = digest.digest()
+        // The bytes must match the sealed hash; the DONE hash on the unsealed socket is only a cross-check.
+        if (FileWire.hex(actual) != sealedSha256) return ERR_HASH
+        if (!MessageDigest.isEqual(actual, sha256)) return ERR_HASH
         return null
     }
 
