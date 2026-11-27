@@ -766,7 +766,7 @@ test('m3 static files are served with the cookie, and HEAD has no body', { timeo
   const cookie = await approveBrowser(relay, ntfy);
   const index = await httpRequest(relay.port, { path: '/', headers: { Cookie: cookie } });
   assert.equal(index.status, 200);
-  assert.match(index.headers['content-type'] ?? '', /text\/html/);
+  assert.match(['content-type', 'content-security-policy', 'x-frame-options', 'x-content-type-options'].map((name) => index.headers[name]).join('|'), /^text\/html.*\|default-src 'self'; script-src 'self' 'wasm-unsafe-eval'.*frame-ancestors 'none'\|DENY\|nosniff$/);
   const css = await httpRequest(relay.port, { path: '/bubbleplay.css', headers: { Cookie: cookie } });
   assert.equal(css.status, 200);
   const head = await httpRequest(relay.port, { method: 'HEAD', path: '/', headers: { Cookie: cookie } });

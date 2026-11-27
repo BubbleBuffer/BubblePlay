@@ -254,6 +254,35 @@ async fn assets_responses_are_no_store_with_security_headers() {
 }
 
 #[tokio::test]
+async fn html_pages_carry_the_csp_and_framing_headers() {
+    let site = site();
+    for uri in ["/", "/pair", "/sub/page.html"] {
+        let response = get(&site, uri).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let csp = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        for directive in [
+            "default-src 'self'",
+            "script-src 'self' 'wasm-unsafe-eval'",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(csp.contains(directive), "{uri}: {directive} in {csp}");
+        }
+        assert_eq!(response.headers()["x-frame-options"], "DENY", "{uri}");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        // The test config's public origin is https, so HSTS is sent.
+        assert!(response.headers().contains_key("strict-transport-security"));
+    }
+    let script = get(&site, "/app.js").await;
+    assert!(!script.headers().contains_key("content-security-policy"));
+}
+
+#[tokio::test]
 async fn assets_head_reports_length_without_a_body() {
     let site = site();
     let response = send(

@@ -105,8 +105,9 @@ impl crate::Relay {
     /// headers added last. The order is native's (app.rs): healthz, the body cap, the gate, then
     /// `GET /presence`, the admin API, a WebSocket route or the static assets.
     pub(crate) async fn on_fetch(&self, req: Request) -> Result<Response> {
+        let https = req.url().is_ok_and(|url| url.scheme() == "https");
         let response = self.route(req).await?;
-        http::finish(response)
+        http::finish(response, https)
     }
 
     async fn route(&self, req: Request) -> Result<Response> {

@@ -11,7 +11,6 @@ import { b64urlDecode, pcListUrl, registerProof, relayOrigin, viewerHello } from
 const noMonitorPreviews = { reset() {}, onFirstFrame() {}, onMonitorList() {}, onMessage() {} };
 
 const source = readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8").replaceAll("\r\n", "\n");
-const index = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
 const epoch = "8f7c62d194a04e3bb9e18cd604cf5a20";
 const ticket = "test-only-secret-socket-ticket";
 const contract = JSON.parse(readFileSync(new URL("../../fixtures/device-keys-contract.json", import.meta.url)));
@@ -331,7 +330,7 @@ test("diagnostic snapshots, reports, telemetry and HUD do not read or spread cre
     assert.ok(path.length > 0);
     assert.doesNotMatch(path, /sessionState\.signalingTicket|sessionState\.signalingPc|\.\.\.msg|\.\.\.message|\.\.\.hello/);
   }
-  const bootstrap = index.slice(index.indexOf("(() => {"), index.indexOf("})();") + 5);
+  const bootstrap = readFileSync(new URL("../public/dk-bootstrap.js", import.meta.url), "utf8");
   assert.match(bootstrap, /window\.BPLog\?\.info\("trace"/);
   assert.doesNotMatch(bootstrap, /WebSocket|ticket|sessionState\.signalingPc|hello-ok|fetch\(/);
 });

@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use bp_relay_core::gate::{
     Hold, HoldCheck, Prefix, Request as GateRequest, Response as GateResponse, Verdict,
 };
+use bp_relay_core::headers::security_headers;
 use bp_relay_core::presence::PRESENCE_PATH;
 use bp_relay_core::relay::{AdminError, UpgradeRequest, ct_eq};
 use serde_json::{Value, json};
@@ -37,23 +38,30 @@ const GATE_BODY_LIMIT: usize = 16 * 1024;
 const HOLD_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub fn router(state: AppState) -> Router {
+    // HSTS only where the configured public origin is https; a loopback http server never sends it.
+    let https = state.public_origin.starts_with("https://");
     Router::new()
         .fallback(dispatch)
-        .layer(middleware::from_fn(common_headers))
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            common_headers(https, request, next)
+        }))
         .with_state(state)
 }
 
-async fn common_headers(request: Request, next: Next) -> Response {
+async fn common_headers(https: bool, request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    let headers = response.headers_mut();
-    headers.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    for (name, value) in security_headers(content_type.as_deref(), https) {
+        if let Ok(name) = HeaderName::from_bytes(name.as_bytes()) {
+            response
+                .headers_mut()
+                .insert(name, HeaderValue::from_static(value));
+        }
+    }
     response
 }
 

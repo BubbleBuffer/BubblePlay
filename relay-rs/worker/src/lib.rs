@@ -62,7 +62,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let url = req.url()?;
     let path = url.path().to_owned();
     if path.starts_with(INTERNAL_PREFIX) {
-        return http::finish(http::status(404)?);
+        return http::finish(http::status(404)?, url.scheme() == "https");
     }
     let front = env
         .durable_object(RELAY_BINDING)?

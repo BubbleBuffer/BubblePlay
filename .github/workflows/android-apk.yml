@@ -25,7 +25,10 @@ jobs:
     # workflow_run fires in this repository's context even when the triggering
     # run came from a fork, so require a successful Checks push run on this
     # repository's own master before anything reaches build01 and the phone.
+    # Private repository only: the job streams the APK to the publish host over SSH, which only build01
+    # reaches, and a public repository must not use build01. A public repository skips it.
     if: >-
+      github.event.repository.private &&
       github.repository == 'BubbleBuffer/BubblePlay' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event.workflow_run.conclusion == 'success' &&

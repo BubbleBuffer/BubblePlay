@@ -117,7 +117,8 @@ user (local DXGI capture + SendInput). The relay token reaches the host only as
   Start-menu shortcut and a per-user "Apps" entry (HKCU `...\Uninstall\BubblePlay`).
 - Config: `%LOCALAPPDATA%\BubblePlay\host.json` (`worker`, `tokenDpapiHex`,
   optional `monitor`; secrets CurrentUser DPAPI) and
-  `tray.json` (`adminMode`, `startAtLogin`).
+  `tray.json` (`startAtLogin`). The Admin-mode switch is not in it; it is the HKLM policy
+  described under Admin mode below.
 - Logs: JSON lines, one file per UTC day, in `%LOCALAPPDATA%\BubblePlay\logs`
   (`host-YYYY-MM-DD.jsonl`, `tray-YYYY-MM-DD.jsonl`), kept 7 days (20 MiB and
   20 files per source at most); the elevated agent logs to
@@ -199,8 +200,9 @@ user (local DXGI capture + SendInput). The relay token reaches the host only as
   no host). It sends no normal-desktop frames. Its separate version handshake
   drives the tray's "Secure desktop helper needs update" action.
   Admin mode off permits view plus parameterless UAC deny; on adds mouse,
-  keyboard and Unicode text. Policy comes from the console user's tray.json
-  at each request, fails off, and is enforced again inside the helper.
+  keyboard and Unicode text. Policy is the HKLM `AdminMode` registry value bound
+  to the console user's SID (`tray.json` grants nothing); it is read at each
+  request, fails off, and is enforced again inside the helper.
   See the architecture page and fixture for active secure states and deny
   results. Protected capture/input and task launch remain unverified live.
 - Agent security: only the admin-owned copy in `%ProgramFiles%\BubblePlay\agent`
@@ -217,10 +219,12 @@ user (local DXGI capture + SendInput). The relay token reaches the host only as
 
   The host connects only to a server whose image is the Program Files agent.
   `--dev` (tests) works only unelevated.
-- Residual risk: while the agent runs (Admin mode on and a viewer connected,
-  plus the 30 s grace), any process running as the same user at medium
-  integrity can connect to the pipe and drive elevated windows.
-  Turn Admin mode on only when you need it.
+- Residual risk: while Admin mode is on, any process of the same user in the
+  same session can connect to the agent pipe and drive elevated windows. The
+  agent identifies no particular client; it checks the policy and the client's
+  session. It does not only run while a viewer is connected: the user can start
+  the `\BubblePlay\AdminAgent` task directly (its ACL grants the user read and
+  execute). Turn Admin mode on only when you need it, and off afterwards.
 - The SYSTEM helper likewise trusts processes running as the console user:
   they can connect to its pipe, view secure frames and, while Admin mode is on,
   send protected input. They cannot change the HKLM `AdminMode` policy without

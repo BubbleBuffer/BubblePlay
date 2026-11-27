@@ -138,13 +138,18 @@ pub fn status(code: u16) -> Result<Response> {
     Ok(Response::empty()?.with_status(code))
 }
 
-/// The security headers native's router adds to every response. A WebSocket upgrade (101) gets
-/// none: native does add them there, which is a known difference.
-pub fn finish(mut response: Response) -> Result<Response> {
+/// The security headers native's router adds to every response, from the shared policy in
+/// `bp_relay_core::headers`. `https` is whether the request came over https (HSTS only then). A
+/// WebSocket upgrade (101) gets none: native does add them there, which is a known difference.
+pub fn finish(mut response: Response, https: bool) -> Result<Response> {
     if response.status_code() != 101 {
+        let content_type = response.headers().get("Content-Type")?;
         let headers = response.headers_mut();
-        headers.set("X-Content-Type-Options", "nosniff")?;
-        headers.set("Referrer-Policy", "no-referrer")?;
+        for (name, value) in
+            bp_relay_core::headers::security_headers(content_type.as_deref(), https)
+        {
+            headers.set(name, value)?;
+        }
     }
     Ok(response)
 }
