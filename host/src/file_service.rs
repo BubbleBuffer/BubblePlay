@@ -1323,17 +1323,7 @@ impl Session {
                     "file upload saved"
                 );
                 lock(shared).stats.uploads_ok += 1;
-                send(
-                    ws,
-                    Packet {
-                        transfer_id: id,
-                        seq: 0,
-                        body: Body::Result(ResultPayload {
-                            ok: true,
-                            error: None,
-                        }),
-                    },
-                )?;
+                send_result(ws, id, None)?;
                 self.batch.saved.push(path);
             }
             Err(code) => {
@@ -1344,17 +1334,7 @@ impl Session {
                     error = code,
                     "file upload rejected; partial file removed"
                 );
-                send(
-                    ws,
-                    Packet {
-                        transfer_id: id,
-                        seq: 0,
-                        body: Body::Result(ResultPayload {
-                            ok: false,
-                            error: Some(code.to_string()),
-                        }),
-                    },
-                )?;
+                send_result(ws, id, Some(code))?;
             }
         }
         if receiving.meta.batch_index + 1 == receiving.meta.batch_count {
@@ -1753,6 +1733,21 @@ fn send_cancel(ws: &mut Socket, id: u32, reason: &str) -> Result<()> {
             seq: 0,
             body: Body::Cancel(CancelPayload {
                 reason: reason.to_string(),
+            }),
+        },
+    )
+}
+
+/// The RESULT of an upload: accepted, or rejected with `error`.
+fn send_result(ws: &mut Socket, id: u32, error: Option<&str>) -> Result<()> {
+    send(
+        ws,
+        Packet {
+            transfer_id: id,
+            seq: 0,
+            body: Body::Result(ResultPayload {
+                ok: error.is_none(),
+                error: error.map(str::to_string),
             }),
         },
     )
