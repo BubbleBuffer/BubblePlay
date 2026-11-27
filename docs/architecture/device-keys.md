@@ -231,7 +231,9 @@ The transcript is `"bubbleplay-auth-v1"`, the relay origin, the `mediaEpoch` str
 
 **Browser caveat:** the relay serves the browser's JavaScript. A relay that turns hostile can ship script that captures the passphrase or uses the unlocked key while the page is open. Device keys protect a browser against everyone else, and against a relay that only forwards; not against its operator. The Android app and the PC do not have this problem, because their code does not come from the relay. For the self-hosted setup the operator is the owner.
 
-## Permissions
+## Permissions (planned, not built)
+
+**Planned.** Per-device permissions do not exist yet (see the gaps in phase 1 above): every paired device has full access today, and nothing below is enforced. The section is the design the later phases build to, so it is written in the present tense of that design.
 
 Each trusted key has permissions, set at pairing and editable in the tray. The host enforces them after the handshake. Defaults are for pairing at the PC; remote pairing pre-fills view and input, and a voucher can never exceed the voucher's own permissions or grant "Before sign-in". A separate per-device switch, **May vouch**, is on by default for devices paired at the PC and off for devices paired remotely.
 
