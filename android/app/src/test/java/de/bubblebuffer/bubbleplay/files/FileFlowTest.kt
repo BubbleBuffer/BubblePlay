@@ -1,6 +1,7 @@
 package de.bubblebuffer.bubbleplay.files
 
 import de.bubblebuffer.bubbleplay.protocol.FileWire
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -120,4 +121,42 @@ class FileFlowTest {
         ReceiveCheck(20, sealed).apply { assertNull(onData(0, a)); assertEquals(ReceiveCheck.ERR_SEQUENCE, onData(0, a)) }
         ReceiveCheck(0, FileWire.hex(sha())).apply { assertNull(onDone(sha())) }
     }
+
+    @Test
+    fun anAnnouncedBatchIsAnnouncedAgainAfterAnEpochChange() {
+        val batch = AnnounceTracker()
+        batch.state = Announce.ACKED // the host admitted it, then rebound and forgot every batch
+        batch.retried = true
+        batch.reannounce()
+        assertEquals(Announce.NEW, batch.state)
+        assertFalse(batch.retried)
+        // The batch is not cancelled by the epoch change itself; it goes out again as a new announcement.
+        assertFalse(batch.takeCancel())
+    }
+
+    @Test
+    fun cancellingAnAnnouncedBatchSendsTheSealedCancelOnce() {
+        val id = "%032x".format(7)
+        val sent = ArrayList<JSONObject>()
+        fun cancel(batch: AnnounceTracker) { if (batch.takeCancel()) sent += FileWire.batchCancelMessage(id) }
+
+        val unannounced = AnnounceTracker()
+        cancel(unannounced) // the PC never heard of it
+        assertTrue(sent.isEmpty())
+
+        val acked = AnnounceTracker().apply { state = Announce.ACKED }
+        cancel(acked)
+        cancel(acked)
+        assertEquals(1, sent.size)
+        assertEquals("file-batch-cancel", sent[0].getString("type"))
+        assertEquals(FileWire.PROTOCOL, sent[0].getInt("protocol"))
+        assertEquals(id, sent[0].getString("batchId"))
+
+        // After an epoch change the new announcement can be cancelled again.
+        acked.reannounce()
+        acked.state = Announce.SENT
+        cancel(acked)
+        assertEquals(2, sent.size)
+    }
 }
+

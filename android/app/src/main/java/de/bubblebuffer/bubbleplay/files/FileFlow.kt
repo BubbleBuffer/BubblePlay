@@ -3,6 +3,34 @@ package de.bubblebuffer.bubbleplay.files
 import de.bubblebuffer.bubbleplay.protocol.FileWire
 import java.security.MessageDigest
 
+/** Where an upload batch stands with the PC: announced over the sealed control channel, then admitted (ACKED), before any OFFER. */
+enum class Announce { NEW, SENT, RETRY, ACKED, FAILED }
+
+/** The announcement bookkeeping of one upload batch, kept apart from threads and timers so the JVM can test it. */
+class AnnounceTracker {
+    var state = Announce.NEW
+    /** Counts announcements, so a timer of an earlier one (before an epoch change) does not fail the new one. */
+    var seq = 0
+    /** The PC answered `not-ready` once and the announcement was repeated. */
+    var retried = false
+    /** The PC was told (`file-batch-cancel`) to drop this batch. */
+    var cancelSent = false
+
+    /** A new signaling epoch: the host forgot every announced batch when it rebound, so this one is announced again. */
+    fun reannounce() {
+        state = Announce.NEW
+        retried = false
+        cancelSent = false
+    }
+
+    /** True once per announcement when the PC knows the batch and must be told to drop it; marks it told. */
+    fun takeCancel(): Boolean {
+        if (cancelSent || (state != Announce.SENT && state != Announce.ACKED)) return false
+        cancelSent = true
+        return true
+    }
+}
+
 /**
  * Sender-side flow control: at most [limit] bytes un-ACKed. ACKs carry the
  * receiver's running total, so they must never go backwards or past what was

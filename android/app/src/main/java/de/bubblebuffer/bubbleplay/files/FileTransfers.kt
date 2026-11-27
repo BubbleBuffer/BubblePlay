@@ -88,17 +88,11 @@ class FileTransfers(
         val purpose: String, val batch: Batch, val batchIndex: Int, val sha256: ByteArray,
     )
 
-    /** Where a batch stands with the PC: announced over the sealed control channel, then admitted (ACKED), before any OFFER. */
-    private enum class Announce { NEW, SENT, RETRY, ACKED, FAILED }
-
     private class Batch(val id: String, val purpose: String, var count: Int) {
-        var announce = Announce.NEW
-        /** Counts announcements, so a timer of an earlier one (before an epoch change) does not fail the new one. */
-        var announceSeq = 0
-        /** The PC answered `not-ready` once and the announcement was repeated. */
-        var retried = false
-        /** The PC was told (`file-batch-cancel`) to drop this batch. */
-        var cancelSent = false
+        val track = AnnounceTracker()
+        var announce by track::state
+        var announceSeq by track::seq
+        var retried by track::retried
         val jobs = ArrayList<Upload>()
         var finished = 0
         var saved = 0
@@ -224,9 +218,7 @@ class FileTransfers(
         // batch that already lost or finished a file cannot be completed any more.
         for (batch in ups.map { it.batch }.distinct()) {
             if (batch.finished > 0) { abandonBatch(batch); continue }
-            batch.announce = Announce.NEW
-            batch.retried = false
-            batch.cancelSent = false
+            batch.track.reannounce()
         }
         progress(force = true)
     }
@@ -505,8 +497,7 @@ class FileTransfers(
 
     /** Tells the PC to drop an announced batch (once): its slot is freed and nothing of it is pasted or dropped later. */
     private fun cancelOnPc(batch: Batch) {
-        if (batch.cancelSent || (batch.announce != Announce.SENT && batch.announce != Announce.ACKED)) return
-        batch.cancelSent = true
+        if (!batch.track.takeCancel()) return
         sendControl(FileWire.batchCancelMessage(batch.id))
     }
 
