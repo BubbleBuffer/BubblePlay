@@ -1,5 +1,5 @@
 //! Fail-closed identity and protected-image checks for both ends of the pipe.
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use std::{
     ffi::OsStr,
     os::windows::{ffi::OsStrExt, fs::MetadataExt},
@@ -170,22 +170,35 @@ pub fn protected_image(path: &Path) -> Result<()> {
             .eq_ignore_ascii_case(&expected.to_string_lossy()),
         "unexpected helper image"
     );
-    let root = crate::admin_agent::trust::program_files().unwrap();
-    let mut p = Some(path);
-    while let Some(part) = p {
+    let root = crate::admin_agent::trust::program_files()
+        .ok_or_else(|| anyhow::anyhow!("Program Files missing"))?;
+    for part in image_chain(path, &root)? {
         ensure!(
             std::fs::symlink_metadata(part)?.file_attributes() & 0x400 == 0,
             "reparse point in helper image path"
         );
-        if part.starts_with(&root) {
-            protected_acl(part)?;
-        }
-        if part == root {
-            break;
-        }
-        p = part.parent();
+        protected_acl(part)?;
     }
     Ok(())
+}
+
+/// The image and every parent up to and including `root`, innermost first: the paths whose ACL and
+/// reparse state decide whether the image can be trusted. Windows paths compare without case, so a
+/// differently cased root still matches; a path that never reaches `root` is an error, not a path
+/// with nothing to check.
+fn image_chain<'a>(path: &'a Path, root: &Path) -> Result<Vec<&'a Path>> {
+    let key = |p: &Path| p.to_string_lossy().to_lowercase();
+    let root_key = key(root);
+    let mut chain = Vec::new();
+    let mut part = Some(path);
+    while let Some(current) = part {
+        chain.push(current);
+        if key(current) == root_key {
+            return Ok(chain);
+        }
+        part = current.parent();
+    }
+    bail!("helper image is not under Program Files")
 }
 pub fn guard() -> Result<()> {
     ensure!(
@@ -267,6 +280,18 @@ pub fn query_sddl(sid: &str, access: u32) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_chain_reaches_a_differently_cased_root_and_fails_closed_otherwise() {
+        let image = Path::new(r"C:\PROGRAM FILES\BubblePlay\helper.exe");
+        let chain = image_chain(image, Path::new(r"c:\Program Files")).unwrap();
+        assert_eq!(chain.len(), 3, "image, its folder and the root are all checked");
+        assert!(image_chain(image, Path::new(r"C:\Program Files (x86)")).is_err());
+        assert!(
+            image_chain(Path::new(r"C:\Users\x\helper.exe"), Path::new(r"C:\Program Files"))
+                .is_err()
+        );
+    }
+
     use super::*;
     #[test]
     fn object_acls_grant_only_required_console_rights() {
