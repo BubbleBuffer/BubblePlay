@@ -180,5 +180,5 @@ test("desktop mouse drags stay captured and clamp to the picture edge", () => {
   // or outside the browser window (edge hold needs the remote cursor at the edge).
   assert.match(client, /inputSurface\.addEventListener\("pointerdown", e => \{ if \(e\.pointerType === "mouse" && pointerMode === "desktop"\) \{ try \{ inputSurface\.setPointerCapture\(e\.pointerId\); \} catch \{[^}]*\} \}/);
   // Absolute moves outside the picture (letterbox, outside the window) are clamped, not dropped.
-  assert.match(client, /const x = clamp\(\(e\.clientX - r\.left\) \/ r\.width, 0, 1\);\s*const y = clamp\(\(e\.clientY - r\.top\) \/ r\.height, 0, 1\);/);
+  assert.match(client, /const \{ x, y \} = viewport\.clampPoint\(clamp\(\(e\.clientX - r\.left\) \/ r\.width, 0, 1\), clamp\(\(e\.clientY - r\.top\) \/ r\.height, 0, 1\)\);/);
 });

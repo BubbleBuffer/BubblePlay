@@ -483,6 +483,13 @@ body.is-fullscreen.strip-peek #session-strip { transform: none; box-shadow: 0 4p
 .pop-row[aria-checked="true"] { box-shadow: inset 2px 0 0 var(--bright-apricot); }
 .pop-row[aria-checked="true"] .pop-row-trail { color: var(--bright-apricot); }
 
+/* App focus mode: the switcher rows carry the app's icon in the first column. */
+.app-icon { grid-column: 1; grid-row: 1 / span 2; width: 18px; height: 18px; }
+.app-icon img { display: block; width: 18px; height: 18px; object-fit: contain; }
+.app-row .pop-row-title,
+.app-row .pop-row-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#app-focus-status[hidden] { display: none; }
+
 /* Follow active window: a switch row; the small track mirrors input.switch. */
 .follow-row[aria-checked="true"] { box-shadow: none; }
 .pop-switch { grid-column: 3; grid-row: 1 / span 2; position: relative; width: 34px; height: 20px; background: var(--dark-surface); border: 1px solid var(--thread-strong); border-radius: 4px 6px 3px 5px; }

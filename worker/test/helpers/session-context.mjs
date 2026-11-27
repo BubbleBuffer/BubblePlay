@@ -13,6 +13,8 @@ export function sessionSandbox(sandbox = {}) {
     if (Object.hasOwn(sandbox, key)) { sessionState[key] = sandbox[key]; delete sandbox[key]; }
   }
   sandbox.sessionState = sandbox.sessionState ?? sessionState;
+  // App focus mode is a no-op unless a test says otherwise.
+  sandbox.appFocus ??= { reset() {}, setCapable() {}, setMonitors() {}, setSecure() {}, onMessage() {} };
   for (const key of SESSION_FIELDS) {
     Object.defineProperty(sandbox, key, {
       get: () => sandbox.sessionState[key], set: value => { sandbox.sessionState[key] = value; },

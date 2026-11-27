@@ -67,7 +67,7 @@ Status: approved 2026-10-13 (option B). Waits for device IDs and keys, then an N
 The host starts at Windows sign-in, so a signed-in user is required. Lock-screen and UAC capture are helper-based and pending live acceptance. A service-based host that works before sign-in is a larger change with its own security review. Design and decisions: [unattended-access.md](architecture/unattended-access.md).
 
 ### App focus mode
-Status: approved 2026-11-21; host part built 2026-11-25 on lane/app-focus-mode, not yet run live; clients not built.
+Status: approved 2026-11-21; host part built 2026-11-25 and browser viewer 2026-11-26, not yet run live; Windows app and Android not built.
 Show one app from the PC instead of the whole desktop: the user picks it from a list, the host brings it to the front, and the client crops the existing stream to its window. No media, input or relay change. Cut back on 2026-11-21 from a wider multi-window concept (approved 2026-11-16): several monitors at once are deferred, and several apps at once are rejected because they need per-window capture or a virtual display driver. Design and decisions: [app-focus-mode.md](architecture/app-focus-mode.md).
 
 ### More encoders and host platforms

@@ -72,12 +72,16 @@
   <div class="strip-status">
     <div id="connection-status" data-state="connecting" role="status" aria-live="polite" title="Connecting to the host"><span class="status-dot" aria-hidden="true"></span><span id="connection-status-label">Connecting…</span></div>
     <button id="connection-retry" class="strip-chip strip-chip-accent" type="button" hidden>Retry</button>
+    <button id="strip-full-desktop" class="strip-chip" type="button" hidden>Show full desktop</button>
+    <span id="app-focus-status" class="strip-chip" role="status" aria-live="polite" hidden></span>
     <div id="secure-desktop-status" hidden role="status" aria-live="polite" title="Windows secure desktop · protected input"><span aria-hidden="true">◆</span><span class="secure-short">Secure desktop</span><span class="sr-only">Windows secure desktop · protected input</span></div>
   </div>
   <div class="strip-actions" role="toolbar" aria-label="Session actions">
     <button class="strip-item only-touch" data-ui-action="keyboard" type="button" aria-label="Show keyboard" aria-pressed="false" title="Keyboard"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="2"/><path d="M6 9h.01M9 9h.01M12 9h.01M15 9h.01M18 9h.01M6 13h.01M9 13h.01M12 13h.01M15 13h3M7 16h10"/></svg></button>
     <button id="strip-monitors" class="strip-item" data-ui-action="monitors" data-popover="pop-monitors" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Monitors" title="Monitors"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M9 20h6M12 16v4"/></svg></button>
-    <button id="strip-touch-mode" class="strip-item only-touch" data-ui-action="pointer" type="button" aria-pressed="false" aria-label="Touch mode: Work" title="Touch mode"><svg class="ui-icon mode-work-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m10 8.5 6 3.6-2.9.7-1.2 2.9z"/></svg><svg class="ui-icon mode-game-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/><path d="M12 2.5v5M12 16.5v5M2.5 12h5M16.5 12h5"/></svg></button>
+    <!-- Apps (app focus mode): shown only when the host offers window-list-v1. -->
+    <button id="strip-apps" class="strip-item" data-popover="pop-apps" type="button" hidden aria-haspopup="dialog" aria-expanded="false" aria-label="Show apps" title="Show apps"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 6.5h.01"/></svg></button>
+    <button id="strip-touch-mode"class="strip-item only-touch" data-ui-action="pointer" type="button" aria-pressed="false" aria-label="Touch mode: Work" title="Touch mode"><svg class="ui-icon mode-work-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m10 8.5 6 3.6-2.9.7-1.2 2.9z"/></svg><svg class="ui-icon mode-game-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/><path d="M12 2.5v5M12 16.5v5M2.5 12h5M16.5 12h5"/></svg></button>
     <button id="strip-shortcuts" class="strip-item" data-ui-action="shortcuts" data-popover="pop-shortcuts" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Shortcuts" title="Shortcuts"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 9V6.5A2.5 2.5 0 1 0 6.5 9H9Zm0 0h6M9 9v6m6-6V6.5A2.5 2.5 0 1 1 17.5 9H15Zm0 0v6m0 0h2.5a2.5 2.5 0 1 1-2.5 2.5V15Zm0 0H9m0 0v2.5A2.5 2.5 0 1 1 6.5 15H9Z"/></svg></button>
     <button id="strip-keys" class="strip-item only-touch" data-ui-action="keys" data-popover="pop-keys" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Keys" title="Keys"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="m8.5 13 3.5-3.5 3.5 3.5"/></svg><span id="latch-label" class="latch-label" aria-hidden="true"></span></button>
     <button id="strip-arrows" class="strip-item only-touch" data-ui-action="arrows" data-popover="pop-arrows" type="button" aria-haspopup="dialog" aria-expanded="false" aria-label="Arrow keys" title="Arrow keys"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3.5-2.5 3h5zM12 20.5l-2.5-3h5zM3.5 12l3-2.5v5zM20.5 12l-3-2.5v5z"/></svg></button>
@@ -114,7 +118,15 @@
   </div>
 </div>
 
-<div id="pop-shortcuts" class="bp-popover" role="dialog" aria-labelledby="pop-shortcuts-title" hidden>
+<div id="pop-apps" class="bp-popover" role="dialog" aria-labelledby="pop-apps-title" hidden>
+  <div id="pop-apps-title" class="pop-caption">Apps</div>
+  <div id="app-list-status" class="pop-note" role="status" aria-live="polite">Waiting for apps…</div>
+  <div id="app-list" class="pop-list" role="radiogroup" aria-labelledby="pop-apps-title"></div>
+  <div class="pop-divider" role="separator"></div>
+  <button id="app-full-desktop" class="pop-row" type="button" hidden><span class="pop-row-title">Show full desktop</span></button>
+</div>
+
+<div id="pop-shortcuts"class="bp-popover" role="dialog" aria-labelledby="pop-shortcuts-title" hidden>
   <div id="pop-shortcuts-title" class="pop-caption">Send to the remote PC</div>
   <div id="shortcut-list" class="pop-list"></div>
   <div class="pop-divider only-desktop" role="separator"></div>

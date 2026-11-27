@@ -14,7 +14,7 @@ import { createPeer } from "/peer.js";
 import { createKeyboardDraft } from "/keyboard-draft.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
- import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, RemoteCursor, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
+ import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, RemoteCursor, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture } from "/input.js";
 import { CODEC, createSignalingRecycleDiagnostic, drawBaseThenHybrid, FramePresentationTelemetry, HevcTileCache, HybridTileCache, prepareHybridWssFrame, presentWssFrameImmediately, probeHevcTileDecoderSupport } from "/media.js";
 import { cropGain } from "/sharp-viewport.js";
 import { createSharpSession } from "/sharp-session.js";
@@ -46,6 +46,10 @@ import { b64u } from "/dk-crypto.js";
 import { createViewerSession } from "/dk-session.js";
 import { createLogUploader } from "/dk-upload.js";
 import { createMonitorPreviews } from "/monitor-previews.js";
+import { newNativePresentation } from "/native-presentation.js";
+import { createAppFocus } from "/app-focus.js";
+import { createAppFocusUi } from "/app-focus-ui.js";
+import { FocusViewport } from "/app-focus-viewport.js";
 import { createFileDragPreviewController, filesFromPaste, installFileTransferUi, mapFileDropPoint } from "/file-ui.js";
 
 const debugTrace = (stage, detail = {}) => window.__bubbleplayDebugTrace?.trace(stage, detail);
@@ -228,6 +232,7 @@ function handleDesktopState(message) {
   if (["enabled", "suspended", "read-only"].includes(message.input)) sessionState.desktopInputState = message.input;
   if (sessionState.desktopInputState !== "enabled") releaseInput(false);
   const secureDesktop = sessionState.desktopKind === "secure";
+  appFocus.setSecure(secureDesktop);
   if (secureDesktop) clearRemoteClipboard();
   document.body.classList.toggle("secure-desktop", secureDesktop);
   secureDesktopStatus.hidden = !secureDesktop;
@@ -590,7 +595,7 @@ function applyDefaultMonitor() {
 function handleMonitorList(message) {
   if (!Array.isArray(message.monitors) || message.monitors.length > 16) return;
   monitorList = message.monitors.filter(m => m && typeof m.selector === "string" && m.selector.length <= 128)
-    .map(m => ({ selector: m.selector, name: typeof m.name === "string" ? m.name : m.selector, width: Number(m.width) || 0, height: Number(m.height) || 0, selected: !!m.selected }));
+    .map(m => ({ selector: m.selector, name: typeof m.name === "string" ? m.name : m.selector, width: Number(m.width) || 0, height: Number(m.height) || 0, originX: Number(m.origin_x) || 0, originY: Number(m.origin_y) || 0, selected: !!m.selected }));
   monitorListRevision++;
   if (typeof message.follow === "boolean") hostFollowState = message.follow;
   const selected = monitorList.find(m => m.selected);
@@ -602,6 +607,7 @@ function handleMonitorList(message) {
   }
   monitorSwitchPending = null;
   monitorErrorNotice = null;
+  appFocus.setMonitors(monitorList);
   try { monitorPreviews.onMonitorList(monitorList); } catch { /* a picture never blocks a switch */ }
   renderMonitorList();
   applyDefaultMonitor();
@@ -643,11 +649,11 @@ function renderFollowWindow() {
   if (!group || !row) return;
   group.hidden = !hostFollowCapable;
   row.setAttribute("aria-checked", String(followWindowShown()));
-  row.disabled = monitorList.length === 1;
+  row.disabled = monitorList.length === 1 || appFocus.active;
 }
-function sendFollowWindow() {
+function sendFollowWindow(follow = settings.followWindow) {
   if (!hostFollowCapable) return;
-  sendControl({ type: "media-control", action: "follow", follow: settings.followWindow, protocol: WSS_PROTOCOL, epoch: sessionState.mediaEpoch, reason: "user-follow" });
+  sendControl({ type: "media-control", action: "follow", follow, protocol: WSS_PROTOCOL, epoch: sessionState.mediaEpoch, reason: "user-follow" });
 }
 function applyFollowCapability(message) {
   hostFollowCapable = Number.isInteger(message.followWindow) && message.followWindow >= 1;
@@ -966,6 +972,7 @@ async function handleSignal(socket, generation, ev) {
               logUploader.start();
             }
           } catch (error) { try { globalThis.BPLog?.warn("receiver", "log upload did not start", { cause: String(error?.message ?? error).slice(0, 160) }); } catch { /* logging never breaks the viewer */ } }
+          appFocus.setCapable(session.windowListNegotiated);
           sendStreamMode("signaling-start");
           if (sessionState.wssSelected) requestWssMediaStart();
           else startPeer(sessionState.peerGeneration);
@@ -973,12 +980,14 @@ async function handleSignal(socket, generation, ev) {
         onMessage: message => { if (current()) return handleEndpointSignal(socket, generation, message); },
         onLogMessage: message => { if (current()) logUploader?.handle(message); },
         onPreviewMessage: message => { if (current()) monitorPreviews.onMessage(message); },
+        onWindowMessage: message => { if (current()) appFocus.onMessage(message); },
         onBinary: (kind, bytes) => { if (current() && kind === "cursor") handleCursorState(bytes, "signaling"); },
         onMediaReady: () => { if (current()) openAuthenticatedMedia(); },
         onFailure: (refusal, reason) => { if (current()) { viewerLog("warn", "session-refused", { reason: String(reason || "unknown").slice(0, 80), title: refusal?.title }); handleSessionFailure(refusal, reason); } },
       });
       sessionState.authenticatedSession = session;
       monitorPreviews.reset();
+      appFocus.reset();
       await session.start();
       break;
     }
@@ -1163,6 +1172,7 @@ setInterval(() => {
 function endAuthenticatedSession(refusal) {
   sessionState.terminalSignalingFailure = true;
   monitorPreviews.reset();
+  appFocus.reset();
   sessionState.authenticatedSession?.close();
   sessionState.authenticatedSession = null;
   clearTimeout(sessionState.reconnectTimer); sessionState.reconnectTimer = null;
@@ -2588,25 +2598,7 @@ function startNativeVideo(track, generation = sessionState.peerGeneration) {
   video.srcObject = new MediaStream([track]);
   stage.classList.add("native-video-input");
   activeVideo = video;
-  nativePresentation = {
-    generation,
-    supported: typeof video.requestVideoFrameCallback === "function",
-    firstFrameAtMs: null,
-    firstFramePerformanceMs: null,
-    framesPresented: 0,
-    fps: 0,
-    recentFrameGapMs: null,
-    maxFrameGapMs: 0,
-    width: 0,
-    height: 0,
-    mediaTime: null,
-    presentationTime: null,
-    expectedDisplayTime: null,
-    processingDurationMs: null,
-    lastFrameAtMs: null,
-    rtpTimestamps: false,
-    lastRtpTimestamp: null,
-  };
+  nativePresentation = newNativePresentation(generation, typeof video.requestVideoFrameCallback === "function");
   let lastFrameAt = null;
   let fpsWindowStartedAt = null;
   let framesInFpsWindow = 0;
@@ -3025,8 +3017,7 @@ document.addEventListener("mousemove", (e) => {
     // Absolute fallback over the displayed video (not its letterbox): 0..65535.
     const r = videoContentRect(activeVideo || screenMedia());
     if (r.width === 0 || r.height === 0) return;
-    const x = clamp((e.clientX - r.left) / r.width, 0, 1);
-    const y = clamp((e.clientY - r.top) / r.height, 0, 1);
+    const { x, y } = viewport.clampPoint(clamp((e.clientX - r.left) / r.width, 0, 1), clamp((e.clientY - r.top) / r.height, 0, 1));
     updateRemoteCursor(cursor => cursor.setNormalized(x, y));
     locallyAuthoritativeCursor = true; mousePointerActive = true; queueAbsolute(x * 65535, y * 65535); showTouchCursor();
   }
@@ -3366,7 +3357,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 // responds locally while the real input travels over the low-latency motion
 // lane, and every local zoom path keeps that cursor as its focus.
 const gestures = new TouchGesture();
-const viewport = new Viewport(innerWidth, innerHeight);
+const viewport = new FocusViewport(innerWidth, innerHeight);
 const remoteCursor = new RemoteCursor();
 cursorReconciler = new CursorReconciler(remoteCursor);
 const touchCursor = document.getElementById("touch-cursor");
@@ -3490,11 +3481,11 @@ function syncViewport() { const area = streamArea(); viewport.resize(area.width,
 function renderTouchCursor() { cursorAppearance.render({ pointerMode, inputReady: sessionState.inputReady, point: remoteCursor.screenPoint(viewport), overlayVisible: touchCursorVisible, mousePointerActive }); }
 function centerCameraOnCursor() { if (shouldCenterCameraOnCursor({ zoom: viewport.zoom, pointerMode, synced: cursorReconciler.synced, locallyAuthoritative: locallyAuthoritativeCursor })) viewport.centerOnNormalized(remoteCursor.snapshot()); }
 function syncViewportAndFollow() { syncViewport(); centerCameraOnCursor(); renderViewport(); }
-function updateRemoteCursor(update) { update(remoteCursor); if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); sharpSession.schedule("cursor-follow"); }
+function updateRemoteCursor(update) { update(remoteCursor); { const p = viewport.clampPoint(remoteCursor.x, remoteCursor.y); remoteCursor.setNormalized(p.x, p.y); } if (pointerMode === "desktop") locallyAuthoritativeCursor=true; centerCameraOnCursor(); renderViewport(); sharpSession.schedule("cursor-follow"); }
 function showTouchCursor() { touchCursorVisible=shouldShowCursorOverlay({pointerMode, ...cursorReconciler}); renderTouchCursor(); }
 function resetTouchCursor() { clearCursorSyncTimer(); touchCursorVisible=false; gestures.reset(); cursorReconciler.reset(); renderTouchCursor(); }
 const sharpSession = createSharpSession({
-  enabled: sharpZoomEnabled,
+  get enabled() { return sharpZoomEnabled && !viewport.focus; },
   desktop: () => remoteDesktop,
   geometry: () => ({ snapshot: viewport.snapshot(), content: viewport.content, innerWidth, innerHeight }),
   streamMode: streamModeValue,
@@ -3517,7 +3508,7 @@ function layoutSharpCanvas(crop) {
   sharpScreen.classList.add("active");
   renderedSharpView = crop;
 }
-function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = `${-visual.offsetLeft}px ${-visual.offsetTop}px`; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); renderZoomChip(s.zoom); if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
+function renderViewport() { const s = viewport.snapshot(); visual.style.transformOrigin = `${-visual.offsetLeft}px ${-visual.offsetTop}px`; visual.style.transform = `translate(${s.x}px,${s.y}px) scale(${s.zoom})`; hudState.zoom = s.zoom.toFixed(2); renderZoomChip(viewport.focus ? 1 : s.zoom); appFocusUi.clipVisual(); if (renderedSharpView) layoutSharpCanvas(renderedSharpView); renderTouchCursor(); }
 function setZoom(next) { syncViewport(); const anchor=mobilePointerDevice && (pointerMode !== "desktop" || !cursorReconciler.synced) ? {x:innerWidth/2,y:innerHeight/2} : remoteCursor.screenPoint(viewport); viewport.setZoom(next, anchor); centerCameraOnCursor(); renderViewport(); sharpSession.schedule("zoom"); }
 function panBy(x,y) { syncViewport(); viewport.pan(x,y); renderViewport(); sharpSession.schedule("pan"); }
 addEventListener("resize", syncViewportAndFollow);
@@ -3558,6 +3549,7 @@ const popovers = createPopoverController({
   surface: inputSurface,
   layout: chromeLayout,
   onChange(opened, closed) {
+    appFocusUi.onPopover(opened, closed);
     if (opened === "pop-monitors") renderMonitorList();
     if (opened === "pop-shortcuts") renderShortcutList();
     if (opened === "pop-files") renderFilesSlot();
@@ -3566,6 +3558,11 @@ const popovers = createPopoverController({
   },
 });
 function openPanel(id, anchor, viaKeyboard) { popovers.open(id, document.getElementById(id), anchor, viaKeyboard); }
+// App focus mode (window-list-v1): the switcher, the crop and the follow-window hand-over.
+const appFocus = createAppFocus({ send: message => sendControl(message), onChange: () => appFocusUi.render(),
+  follow: { capable: () => hostFollowCapable, shown: followWindowShown, send: sendFollowWindow },
+  openSwitcher: () => { if (!popovers.isOpen("pop-apps")) openPanel("pop-apps", document.getElementById("strip-apps")); } });
+const appFocusUi = createAppFocusUi({ appFocus, viewport, visual, streamArea, openPanel, popovers, onViewChange: () => { syncViewportAndFollow(); sharpSession.schedule("app-focus"); } });
 
 document.getElementById("capture").onclick = () => {
   popovers.close();
