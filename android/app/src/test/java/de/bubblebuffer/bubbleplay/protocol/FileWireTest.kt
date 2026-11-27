@@ -40,7 +40,7 @@ class FileWireTest {
             FileWire.encode(FileWire.DONE, 7, 0, ByteArray(32) { it.toByte() }),
             FileWire.encode(FileWire.CANCEL, 7, 0, json),
             FileWire.encodeJson(FileWire.RESULT, 7, FileWire.resultJson(false, "hash-mismatch")),
-            FileWire.encodeJson(FileWire.REQUEST, 7, FileWire.requestJson(9, 2)),
+            FileWire.encodeJson(FileWire.REQUEST, 7, FileWire.requestJson(id(9), 2)),
         )
         for ((i, bytes) in packets.withIndex()) {
             val parsed = FileWire.parse(bytes)
@@ -51,7 +51,7 @@ class FileWireTest {
         assertEquals(262_144L, FileWire.ackTotal(FileWire.parse(packets[3]).packet!!))
         assertEquals(meta(), FileWire.parseMeta(FileWire.parse(packets[0]).packet!!.payload))
         assertEquals(false to "hash-mismatch", FileWire.parseResult(FileWire.parse(packets[6]).packet!!.payload))
-        assertEquals(9L to 2L, FileWire.parseRequest(FileWire.parse(packets[7]).packet!!.payload))
+        assertEquals(id(9) to 2L, FileWire.parseRequest(FileWire.parse(packets[7]).packet!!.payload))
     }
 
     @Test
@@ -77,12 +77,14 @@ class FileWireTest {
         reject(FileWire.encode(FileWire.CANCEL, 1, 0, ByteArray(FileWire.MAX_JSON + 1) { ' '.code.toByte() }), "payload")
         reject(FileWire.encode(FileWire.CANCEL, 1, 0, "{}".toByteArray()), "json")
         reject(FileWire.encode(FileWire.RESULT, 1, 0, """{"ok":1}""".toByteArray()), "json")
-        reject(FileWire.encode(FileWire.REQUEST, 1, 0, """{"offerId":-1,"id":1}""".toByteArray()), "json")
+        reject(FileWire.encode(FileWire.REQUEST, 1, 0, """{"offerId":1,"id":1}""".toByteArray()), "json")
         reject(FileWire.encodeJson(FileWire.OFFER, 1, meta().toJson().put("name", "a".repeat(1025))), "json")
         assertNull(FileWire.parse(FileWire.encodeJson(FileWire.OFFER, 1, meta().toJson().put("name", "é".repeat(512)))).error)
     }
 
-    private fun meta() = FileWire.Meta("photo.jpg", 1234, "image/jpeg", 1_700_000_000_000, "save", 42, 0, 2)
+    private fun meta() = FileWire.Meta("photo.jpg", 1234, "image/jpeg", 1_700_000_000_000, "save", id(42), 0, 2)
+
+    private fun id(n: Int) = "%032x".format(n)
 
     @Test
     fun offerMetaIsValidated() {
@@ -102,13 +104,13 @@ class FileWireTest {
 
     @Test
     fun fileOfferMessage() {
-        val msg = JSONObject("""{"type":"file-offer","protocol":1,"offerId":5,"source":"clipboard",
+        val msg = JSONObject("""{"type":"file-offer","protocol":1,"offerId":"${id(5)}","source":"clipboard",
             "items":[{"id":1,"name":"a.txt","size":3},{"id":2,"name":"b.png","size":2048}]}""")
         val offer = FileWire.parseOfferMessage(msg)!!
-        assertEquals(5L, offer.offerId)
+        assertEquals(id(5), offer.offerId)
         assertEquals(2, offer.items.size)
         assertEquals(2051L, offer.totalBytes)
-        val withdrawn = FileWire.parseOfferMessage(JSONObject("""{"type":"file-offer","protocol":1,"offerId":6,"source":"sendto","items":[]}"""))!!
+        val withdrawn = FileWire.parseOfferMessage(JSONObject("""{"type":"file-offer","protocol":1,"offerId":"${id(6)}","source":"sendto","items":[]}"""))!!
         assertEquals(0, withdrawn.items.size)
         assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("protocol", 2)))
         assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("source", "disk")))

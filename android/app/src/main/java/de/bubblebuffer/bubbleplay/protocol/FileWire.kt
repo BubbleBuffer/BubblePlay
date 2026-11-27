@@ -136,7 +136,7 @@ object FileWire {
         val mime: String,
         val mtimeMs: Long,
         val purpose: String,
-        val batchId: Long,
+        val batchId: String,
         val batchIndex: Int,
         val batchCount: Int,
     ) {
@@ -152,7 +152,7 @@ object FileWire {
         val mime = (o.opt("mime") as? String)?.takeIf { utf8Bytes(it) <= MAX_MIME_BYTES } ?: return null
         val mtime = integer(o, "mtimeMs")?.takeIf { it >= 0 } ?: return null
         val purpose = (o.opt("purpose") as? String)?.takeIf { it == PURPOSE_SAVE || it == PURPOSE_PASTE } ?: return null
-        val batchId = integer(o, "batchId")?.takeIf { it in 0..U32_MAX } ?: return null
+        val batchId = (o.opt("batchId") as? String)?.takeIf(::validId128) ?: return null
         val count = integer(o, "batchCount")?.takeIf { it in 1..MAX_BATCH.toLong() } ?: return null
         val index = integer(o, "batchIndex")?.takeIf { it in 0 until count } ?: return null
         return Meta(name, size, mime, mtime, purpose, batchId, index.toInt(), count.toInt())
@@ -160,11 +160,11 @@ object FileWire {
 
     // ---- REQUEST / CANCEL / RESULT ---------------------------------------------------
 
-    fun requestJson(offerId: Long, id: Long): JSONObject = JSONObject().put("offerId", offerId).put("id", id)
+    fun requestJson(offerId: String, id: Long): JSONObject = JSONObject().put("offerId", offerId).put("id", id)
 
-    fun parseRequest(payload: ByteArray): Pair<Long, Long>? {
+    fun parseRequest(payload: ByteArray): Pair<String, Long>? {
         val o = jsonObject(payload) ?: return null
-        val offerId = integer(o, "offerId")?.takeIf { it in 0..U32_MAX } ?: return null
+        val offerId = (o.opt("offerId") as? String)?.takeIf(::validId128) ?: return null
         val id = integer(o, "id")?.takeIf { it in 0..U32_MAX } ?: return null
         return offerId to id
     }
@@ -194,14 +194,14 @@ object FileWire {
     data class Item(val id: Long, val name: String, val size: Long)
 
     /** A host offer; empty [items] withdraws the previous one. */
-    data class Offer(val offerId: Long, val items: List<Item>, val source: String) {
+    data class Offer(val offerId: String, val items: List<Item>, val source: String) {
         val totalBytes: Long get() = items.sumOf { it.size }
     }
 
     fun parseOfferMessage(msg: JSONObject): Offer? {
         if (msg.optString("type") != "file-offer") return null
         if (integer(msg, "protocol") != PROTOCOL.toLong()) return null
-        val offerId = integer(msg, "offerId")?.takeIf { it in 0..U32_MAX } ?: return null
+        val offerId = (msg.opt("offerId") as? String)?.takeIf(::validId128) ?: return null
         val source = (msg.opt("source") as? String)?.takeIf { it == "clipboard" || it == "sendto" } ?: return null
         val array = msg.opt("items") as? JSONArray ?: return null
         if (array.length() > MAX_BATCH) return null
@@ -215,6 +215,38 @@ object FileWire {
             items += Item(id, name, size)
         }
         return Offer(offerId, items, source)
+    }
+
+    // ---- sealed control: file-batch / file-batch-ack / file-request ---------------------------
+
+    /** Batch and offer ids: 32 lowercase hex digits (128 random bits). */
+    fun validId128(id: String): Boolean = id.length == 32 && id.all { it in '0'..'9' || it in 'a'..'f' }
+
+    fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
+
+    fun randomId128(random: java.security.SecureRandom): String = hex(ByteArray(16).also { random.nextBytes(it) })
+
+    /** One file of a `file-batch` announcement: the PC accepts exactly these bytes for it. */
+    data class Announced(val name: String, val size: Long, val sha256: ByteArray)
+
+    /** The announcement the viewer sends over the sealed control channel before the batch's OFFER packets. */
+    fun batchMessage(batchId: String, purpose: String, files: List<Announced>): JSONObject = JSONObject()
+        .put("type", "file-batch").put("protocol", PROTOCOL).put("batchId", batchId).put("purpose", purpose)
+        .put("files", JSONArray(files.map { JSONObject().put("name", it.name).put("size", it.size).put("sha256", hex(it.sha256)) }))
+
+    /** Asks the PC, over the sealed control channel, for items of its offer before the REQUEST packets. */
+    fun requestMessage(offerId: String, ids: List<Long>): JSONObject =
+        JSONObject().put("type", "file-request").put("protocol", PROTOCOL).put("offerId", offerId).put("ids", JSONArray(ids))
+
+    /** The PC's `file-batch-ack`; [error] is set when the batch was refused. */
+    data class BatchAck(val batchId: String, val ok: Boolean, val error: String?)
+
+    fun parseBatchAck(msg: JSONObject): BatchAck? {
+        if (msg.optString("type") != "file-batch-ack" || integer(msg, "protocol") != PROTOCOL.toLong()) return null
+        val batchId = (msg.opt("batchId") as? String)?.takeIf(::validId128) ?: return null
+        val ok = msg.opt("ok") as? Boolean ?: return null
+        val error = (msg.opt("error") as? String)?.takeIf { utf8Bytes(it) <= MAX_REASON_BYTES }
+        return BatchAck(batchId, ok, error)
     }
 
     /** An integral JSON number (no fractions, no strings), or null. */

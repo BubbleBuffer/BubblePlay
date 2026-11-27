@@ -43,6 +43,8 @@ class FileTransfers(
     private val listener: Listener,
     /** The viewer grant of the current signaling session: its PC goes in the URL, its ticket in the hello. */
     private val grantProvider: () -> ViewerGrant = { ViewerGrant.NONE },
+    /** Sends a file-channel control message over the sealed signaling channel; false when it could not go out. */
+    private val sendControl: (org.json.JSONObject) -> Boolean = { false },
 ) {
     enum class Direction { UP, DOWN }
 
@@ -77,17 +79,22 @@ class FileTransfers(
     // ---- jobs ---------------------------------------------------------------------------
     private class Upload(
         val source: Uri, val staged: File?, val name: String, val size: Long, val mime: String, val mtimeMs: Long,
-        val purpose: String, val batch: Batch, val batchIndex: Int,
+        val purpose: String, val batch: Batch, val batchIndex: Int, val sha256: ByteArray,
     )
 
-    private class Batch(val id: Long, val purpose: String, var count: Int) {
+    /** Where a batch stands with the PC: announced over the sealed control channel, then admitted (ACKED), before any OFFER. */
+    private enum class Announce { NEW, SENT, ACKED, FAILED }
+
+    private class Batch(val id: String, val purpose: String, var count: Int) {
+        var announce = Announce.NEW
+        val jobs = ArrayList<Upload>()
         var finished = 0
         var saved = 0
         /** Cancelled by the user: no summary message. */
         var silent = false
     }
 
-    private class Download(val offerId: Long, val item: FileWire.Item)
+    private class Download(val offerId: String, val item: FileWire.Item)
 
     private class ActiveUp(val job: Upload, val tid: Long) {
         var accepted = false
@@ -156,7 +163,7 @@ class FileTransfers(
      */
     fun upload(uris: List<Uri>, purpose: String) = handler.post {
         if (closed || uris.isEmpty()) return@post
-        val batch = Batch(random.nextInt().toLong() and FileWire.U32_MAX, purpose, 0)
+        val batch = Batch(FileWire.randomId128(random), purpose, 0)
         val jobs = ArrayList<Upload>()
         for (uri in uris.take(FileWire.MAX_BATCH)) {
             val job = try { prepare(uri, purpose, batch, jobs.size) } catch (e: TooLarge) {
@@ -169,6 +176,7 @@ class FileTransfers(
         }
         if (jobs.isEmpty()) return@post
         batch.count = jobs.size
+        batch.jobs.addAll(jobs)
         ups.addAll(jobs)
         startNext()
         progress(force = true)
@@ -259,7 +267,26 @@ class FileTransfers(
         }
         if (size > FileWire.MAX_FILE) { staged?.delete(); throw TooLarge(display) }
         val mime = FileNames.mime(display, resolver.getType(uri)) { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it) }
-        return Upload(uri, staged, display, size, mime, mtime, purpose, batch, index)
+        val sha256 = try { sha256Of(uri, staged, size) } catch (e: Exception) { staged?.delete(); throw e }
+        return Upload(uri, staged, display, size, mime, mtime, purpose, batch, index, sha256)
+    }
+
+    /** SHA-256 of the file, announced to the PC before the upload; fails when the bytes read differ from [size]. */
+    private fun sha256Of(uri: Uri, staged: File?, size: Long): ByteArray {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val input = staged?.inputStream() ?: resolver.openInputStream(uri) ?: throw IOException("no stream")
+        var total = 0L
+        input.use { stream ->
+            val buf = ByteArray(FileWire.MAX_CHUNK)
+            while (true) {
+                val n = stream.read(buf)
+                if (n < 0) break
+                total += n
+                digest.update(buf, 0, n)
+            }
+        }
+        if (total != size) throw IOException("size changed while reading")
+        return digest.digest()
     }
 
     // ---- scheduling --------------------------------------------------------------------------
@@ -270,7 +297,7 @@ class FileTransfers(
         val socket = ws
         if (socket == null) { openSocket(); return }
         if (!wsOpen || !peerPresent) return
-        if (up == null) ups.pollFirst()?.let { startUpload(socket, it) }
+        if (up == null) ups.peekFirst()?.let { if (admitted(it.batch)) startUpload(socket, ups.pollFirst() ?: it) }
         if (down == null) downs.pollFirst()?.let { startDownload(socket, it) }
         armIdle()
     }
@@ -402,6 +429,37 @@ class FileTransfers(
         return tid
     }
 
+    // ---- announcing batches -----------------------------------------------------------------------
+
+    /** True once the PC admitted [batch]; announces it first (over the sealed control channel) and waits for the ack. */
+    private fun admitted(batch: Batch): Boolean {
+        if (batch.announce != Announce.NEW) return batch.announce == Announce.ACKED
+        val files = batch.jobs.map { FileWire.Announced(it.name, it.size, it.sha256) }
+        if (!sendControl(FileWire.batchMessage(batch.id, batch.purpose, files))) { failBatch(batch, ERR_UNAVAILABLE); return false }
+        batch.announce = Announce.SENT
+        handler.postDelayed({ if (batch.announce == Announce.SENT) failBatch(batch, ERR_TIMEOUT) }, ACK_WAIT_MS)
+        return false
+    }
+
+    /** The PC's `file-batch-ack` (any thread). */
+    fun onBatchAck(ack: FileWire.BatchAck) = handler.post {
+        val batch = ups.firstOrNull { it.batch.id == ack.batchId }?.batch ?: return@post
+        if (batch.announce != Announce.SENT) return@post
+        if (!ack.ok) return@post failBatch(batch, ack.error ?: ERR_REFUSED)
+        batch.announce = Announce.ACKED
+        startNext()
+    }
+
+    /** The batch was refused or never answered: none of its queued files goes out. */
+    private fun failBatch(batch: Batch, error: String) {
+        batch.announce = Announce.FAILED
+        val queued = ups.filter { it.batch === batch }
+        ups.removeAll(queued.toSet())
+        for (job in queued) { finishBatchItem(job, false); job.staged?.delete(); fail(Direction.UP, job.name, error) }
+        progress(force = true)
+        startNext()
+    }
+
     // ---- upload ---------------------------------------------------------------------------------
 
     private fun startUpload(socket: WebSocket, job: Upload) {
@@ -480,6 +538,10 @@ class FileTransfers(
     // ---- download ---------------------------------------------------------------------------------
 
     private fun startDownload(socket: WebSocket, job: Download) {
+        if (!sendControl(FileWire.requestMessage(job.offerId, listOf(job.item.id)))) {
+            fail(Direction.DOWN, job.item.name, ERR_UNAVAILABLE)
+            return startNext()
+        }
         val active = ActiveDown(job, allocTid())
         down = active
         send(socket, FileWire.encodeJson(FileWire.REQUEST, active.tid, FileWire.requestJson(job.offerId, job.item.id)))
@@ -572,7 +634,7 @@ class FileTransfers(
         when (packet.type) {
             FileWire.OFFER -> {
                 if (active.meta != null) return abortDownload(active, ERR_PROTOCOL)
-                val meta = FileWire.parseMeta(packet.payload) ?: return abortDownload(active, ERR_PROTOCOL)
+                val meta = FileWire.parseMeta(packet.payload)?.takeIf { it.batchId == active.job.offerId } ?: return abortDownload(active, ERR_PROTOCOL)
                 active.meta = meta
                 val name = FileNames.forDownload(meta.name)
                 val mime = FileNames.mime(name, meta.mime) { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it) }
@@ -671,6 +733,7 @@ class FileTransfers(
         private const val MAX_OPEN_FAILURES = 3
         private const val PING_MS = 15_000L
         private const val PEER_WAIT_MS = 10_000L
+        private const val ACK_WAIT_MS = 10_000L
         private const val PING = "{\"type\":\"ping\"}"
 
         const val ERR_CANCELLED = "cancelled"
@@ -682,5 +745,6 @@ class FileTransfers(
         const val ERR_STORAGE = "storage"
         const val ERR_PROTOCOL = "unexpected"
         const val ERR_REFUSED = "refused"
+        const val ERR_TIMEOUT = "timeout"
     }
 }

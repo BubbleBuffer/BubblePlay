@@ -73,7 +73,7 @@ class FileContractTest {
                     assertEquals(decoded.getString("mime"), meta.mime)
                     assertEquals(decoded.getLong("mtimeMs"), meta.mtimeMs)
                     assertEquals(decoded.getString("purpose"), meta.purpose)
-                    assertEquals(decoded.getLong("batchId"), meta.batchId)
+                    assertEquals(decoded.getString("batchId"), meta.batchId)
                     assertEquals(decoded.getInt("batchIndex"), meta.batchIndex)
                     assertEquals(decoded.getInt("batchCount"), meta.batchCount)
                     // What we send is what the other side decodes.
@@ -97,8 +97,8 @@ class FileContractTest {
                     assertEquals(ok to error, FileWire.parseResult(FileWire.parse(ours).packet!!.payload))
                 }
                 FileWire.REQUEST -> {
-                    assertEquals(decoded!!.getLong("offerId") to decoded.getLong("id"), FileWire.parseRequest(p.payload))
-                    val ours = FileWire.encodeJson(FileWire.REQUEST, p.transferId, FileWire.requestJson(decoded.getLong("offerId"), decoded.getLong("id")))
+                    assertEquals(decoded!!.getString("offerId") to decoded.getLong("id"), FileWire.parseRequest(p.payload))
+                    val ours = FileWire.encodeJson(FileWire.REQUEST, p.transferId, FileWire.requestJson(decoded.getString("offerId"), decoded.getLong("id")))
                     assertEquals(FileWire.parseRequest(p.payload), FileWire.parseRequest(FileWire.parse(ours).packet!!.payload))
                 }
             }
@@ -152,6 +152,35 @@ class FileContractTest {
         }
         val caps = JSONObject(fixture.getJSONObject("signaling").getJSONObject("hostCapabilities").getString("text"))
         assertTrue(caps.optInt("fileTransfer") >= 1)
+    }
+
+    @Test
+    fun sealedControlMessagesMatchTheContract() {
+        val signaling = fixture.getJSONObject("signaling")
+        val acks = signaling.getJSONObject("fileBatchAck").getJSONArray("cases")
+        for (i in 0 until acks.length()) {
+            val case = acks.getJSONObject(i)
+            val ack = FileWire.parseBatchAck(JSONObject(case.getString("text")))!!
+            assertEquals(case.getBoolean("ok"), ack.ok)
+            assertEquals(case.optString("error").ifEmpty { null }, ack.error)
+        }
+        val batch = JSONObject(signaling.getJSONObject("fileBatch").getJSONArray("cases").getJSONObject(0).getString("text"))
+        val file = batch.getJSONArray("files").getJSONObject(0)
+        val built = FileWire.batchMessage(batch.getString("batchId"), batch.getString("purpose"),
+            listOf(FileWire.Announced(file.getString("name"), file.getLong("size"), hex(file.getString("sha256")))))
+        assertEquals(batch.getString("type"), built.getString("type"))
+        assertEquals(batch.getString("batchId"), built.getString("batchId"))
+        assertEquals(batch.getString("purpose"), built.getString("purpose"))
+        val builtFile = built.getJSONArray("files").getJSONObject(0)
+        assertEquals(file.getString("name"), builtFile.getString("name"))
+        assertEquals(file.getLong("size"), builtFile.getLong("size"))
+        assertEquals(file.getString("sha256"), builtFile.getString("sha256"))
+        val request = JSONObject(signaling.getJSONObject("fileRequest").getJSONArray("cases").getJSONObject(0).getString("text"))
+        val ids = request.getJSONArray("ids")
+        val builtRequest = FileWire.requestMessage(request.getString("offerId"), (0 until ids.length()).map { ids.getLong(it) })
+        assertEquals(request.getString("offerId"), builtRequest.getString("offerId"))
+        assertEquals(ids.toString(), builtRequest.getJSONArray("ids").toString())
+        assertEquals("file-request", builtRequest.getString("type"))
     }
 
     @Test
