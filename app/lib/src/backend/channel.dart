@@ -10,8 +10,13 @@ abstract interface class AppChannel {
   /// Sends one `Action` as JSON. The result arrives as a later snapshot.
   Future<void> act(String actionJson);
 
-  /// The stored key as portable `.bpkey` text, for the user to save.
-  Future<String> exportKey();
+  /// The stored key as portable `.bpkey` text, for the user to save. A [passphrase] seals the
+  /// text under it; without one it is exactly as stored. Only a channel whose
+  /// [sealsExport] is true honours it.
+  Future<String> exportKey({String? passphrase});
+
+  /// Whether [exportKey] can seal the exported file under a passphrase asked for at export.
+  bool get sealsExport;
 
   /// One event whenever a new snapshot is ready.
   Stream<void> get changes;

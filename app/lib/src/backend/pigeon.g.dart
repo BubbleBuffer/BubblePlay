@@ -263,15 +263,16 @@ class AppHostApi {
     ;
   }
 
-  /// The stored key as portable `.bpkey` text, for the user to save. Never part of a snapshot.
-  Future<String> exportKey() async {
+  /// The stored key as portable `.bpkey` text, for the user to save. With a [passphrase] the
+  /// text is sealed under it; without, it is exactly as stored. Never part of a snapshot.
+  Future<String> exportKey(String? passphrase) async {
     final pigeonVar_channelName = 'dev.flutter.pigeon.bubbleplay_app.AppHostApi.exportKey$pigeonVar_messageChannelSuffix';
     final pigeonVar_channel = BasicMessageChannel<Object?>(
       pigeonVar_channelName,
       pigeonChannelCodec,
       binaryMessenger: pigeonVar_binaryMessenger,
     );
-    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(null);
+    final Future<Object?> pigeonVar_sendFuture = pigeonVar_channel.send(<Object?>[passphrase]);
     final pigeonVar_replyList = await pigeonVar_sendFuture as List<Object?>?;
 
     final Object? pigeonVar_replyValue = _extractReplyValueOrThrow(

@@ -15,6 +15,9 @@ class FakeChannel implements AppChannel {
   /// When set, [act] records the action and then throws this, like a core that failed it.
   Object? actError;
 
+  /// The passphrase of every [exportKey] call, null when none was given.
+  final List<String?> exportPassphrases = <String?>[];
+
   /// The key text [exportKey] returns.
   String keyText = '{"format":"bubbleplay-device-key"}';
 
@@ -34,7 +37,13 @@ class FakeChannel implements AppChannel {
   }
 
   @override
-  Future<String> exportKey() async => keyText;
+  Future<String> exportKey({String? passphrase}) async {
+    exportPassphrases.add(passphrase);
+    return passphrase == null ? keyText : '$keyText#sealed:$passphrase';
+  }
+
+  @override
+  bool get sealsExport => true;
 
   @override
   Stream<void> get changes => _changes.stream;

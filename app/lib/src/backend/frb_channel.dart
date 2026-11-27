@@ -20,7 +20,11 @@ class FrbChannel implements AppChannel {
   Future<void> act(String actionJson) async => api.appAct(action: actionJson);
 
   @override
-  Future<String> exportKey() => api.appExportKey();
+  Future<String> exportKey({String? passphrase}) => api.appExportKey();
+
+  /// The Windows core keeps the key file as stored, protection included.
+  @override
+  bool get sealsExport => false;
 
   @override
   Stream<void> get changes => api.appChanges();

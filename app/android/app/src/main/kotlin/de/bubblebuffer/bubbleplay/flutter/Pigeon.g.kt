@@ -295,8 +295,11 @@ interface AppHostApi {
    * the effect arrives as a later snapshot.
    */
   suspend fun act(actionJson: String)
-  /** The stored key as portable `.bpkey` text, for the user to save. Never part of a snapshot. */
-  fun exportKey(): String
+  /**
+   * The stored key as portable `.bpkey` text, for the user to save. With a [passphrase] the
+   * text is sealed under it; without, it is exactly as stored. Never part of a snapshot.
+   */
+  fun exportKey(passphrase: String?): String
 
   companion object {
     /** The codec used by AppHostApi. */
@@ -345,9 +348,11 @@ interface AppHostApi {
       run {
         val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.bubbleplay_app.AppHostApi.exportKey$separatedMessageChannelSuffix", codec)
         if (api != null) {
-          channel.setMessageHandler { _, reply ->
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val passphraseArg = args[0] as String?
             val wrapped: List<Any?> = try {
-              listOf(api.exportKey())
+              listOf(api.exportKey(passphraseArg))
             } catch (exception: Throwable) {
               PigeonPigeonUtils.wrapError(exception)
             }

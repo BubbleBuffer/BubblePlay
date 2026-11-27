@@ -14,14 +14,22 @@ const MAX_FORWARDED_HOPS: usize = 16;
 /// the right and the first address outside the trusted ranges wins, so a client cannot choose
 /// its own address by prefixing the header.
 pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted_proxy_cidrs: &[IpNet]) -> IpAddr {
-    let peer_ip = peer.ip();
+    let peer_ip = unmap(peer.ip());
     if !trusted_proxy_cidrs.iter().any(|net| net.contains(&peer_ip)) {
         return peer_ip;
     }
-    let raw = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+    // A proxy may append its own header line instead of extending the first one, so every
+    // line counts, in order. Reading only the first line would let the client's own win.
+    let mut raw = String::new();
+    for value in headers.get_all("x-forwarded-for") {
+        let Ok(text) = value.to_str() else {
+            return peer_ip;
+        };
+        if !raw.is_empty() {
+            raw.push(',');
+        }
+        raw.push_str(text);
+    }
     let hops: Vec<&str> = raw.split(',').collect();
     if hops.len() > MAX_FORWARDED_HOPS {
         return peer_ip;
@@ -30,6 +38,7 @@ pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted_proxy_cidrs: &[I
         let Ok(candidate) = hop.trim().parse::<IpAddr>() else {
             return peer_ip;
         };
+        let candidate = unmap(candidate);
         if !trusted_proxy_cidrs
             .iter()
             .any(|net| net.contains(&candidate))
@@ -38,6 +47,14 @@ pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted_proxy_cidrs: &[I
         }
     }
     peer_ip
+}
+
+/// `::ffff:a.b.c.d` is the IPv4 address a.b.c.d on a dual-stack socket; compare it as IPv4.
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
 }
 
 #[cfg(test)]
@@ -142,5 +159,45 @@ mod tests {
             &trusted,
         );
         assert_eq!(ip, "2001:db8::7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn forwarded_header_lines_are_joined_and_the_last_line_wins() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        let ip = client_ip(peer("10.1.2.3:4000"), &headers, &trusted);
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+
+        // Attacker line first, then a proxy line ending in a trusted hop.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        headers.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.7, 10.9.9.9"),
+        );
+        let ip = client_ip(peer("10.1.2.3:4000"), &headers, &trusted);
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn ipv4_mapped_peer_and_hops_are_checked_as_ipv4() {
+        let trusted = nets(&["10.0.0.0/8"]);
+        let ip = client_ip(
+            peer("[::ffff:10.1.2.3]:4000"),
+            &xff("198.51.100.7"),
+            &trusted,
+        );
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+        let ip = client_ip(
+            peer("10.1.2.3:4000"),
+            &xff("198.51.100.7, ::ffff:10.9.9.9"),
+            &trusted,
+        );
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+        // An untrusted mapped peer returns plain IPv4.
+        let ip = client_ip(peer("[::ffff:203.0.113.9]:4000"), &xff("1.1.1.1"), &trusted);
+        assert_eq!(ip, "203.0.113.9".parse::<IpAddr>().unwrap());
     }
 }

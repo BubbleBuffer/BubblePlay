@@ -131,7 +131,7 @@ internal class AppBackend(
 
     /** The portable key text for the user to save. Never part of a snapshot. */
     @Synchronized
-    fun exportKey(): String = keys.load() ?: throw IllegalStateException("no key to export")
+    fun exportKey(passphrase: String? = null) = exportedKeyText(keys.load() ?: error("no key to export"), unlocked.get(), passphrase)
 
     @Synchronized
     fun act(actionJson: String) {

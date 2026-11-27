@@ -172,7 +172,10 @@ class AppController extends ChangeNotifier {
   }
 
   /// The stored key as portable text, for saving to a file.
-  Future<String> exportKey() => _channel.exportKey();
+  Future<String> exportKey({String? passphrase}) => _channel.exportKey(passphrase: passphrase);
+
+  /// Whether an export asks for a passphrase to seal the file with.
+  bool get sealsKeyExport => _channel.sealsExport;
 
   @override
   void dispose() {
