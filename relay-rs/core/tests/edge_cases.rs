@@ -186,12 +186,27 @@ fn file_binary_rejects_invalid_utf8_and_non_objects() {
 
 #[test]
 fn file_binary_request_only_from_the_viewer() {
-    let request = packet(8, 9, 0, br#"{"offerId":4,"id":2}"#);
+    let request = packet(
+        8,
+        9,
+        0,
+        br#"{"offerId":"00000000000000000000000000000004","id":2}"#,
+    );
     assert!(validate_file_binary(Side::Viewer, &request).is_ok());
     assert!(validate_file_binary(Side::Host, &request).is_err());
-    let partial = packet(8, 9, 0, br#"{"offerId":4}"#);
+    let partial = packet(
+        8,
+        9,
+        0,
+        br#"{"offerId":"00000000000000000000000000000004"}"#,
+    );
     assert!(validate_file_binary(Side::Viewer, &partial).is_err());
-    let string_id = packet(8, 9, 0, br#"{"offerId":4,"id":"2"}"#);
+    let string_id = packet(
+        8,
+        9,
+        0,
+        br#"{"offerId":"00000000000000000000000000000004","id":"2"}"#,
+    );
     assert!(validate_file_binary(Side::Viewer, &string_id).is_err());
 }
 
@@ -234,8 +249,17 @@ fn file_binary_at_the_read_limit() {
 
 #[test]
 fn file_offer_metadata_fields() {
-    let base = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#;
+    let base = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#;
     assert!(validate_file_binary(Side::Viewer, &meta(base)).is_ok());
+    // batch ids are 32 lowercase hex digits, not integers.
+    let good_id = r#""batchId":"00000000000000000000000000000001""#;
+    for bad in [
+        r#""batchId":1"#,
+        r#""batchId":"0000000000000000000000000000000A""#,
+        r#""batchId":"0001""#,
+    ] {
+        assert!(validate_file_binary(Side::Viewer, &meta(&base.replace(good_id, bad))).is_err());
+    }
     // size at and over the 2 GiB ceiling.
     assert!(
         validate_file_binary(
@@ -290,7 +314,7 @@ fn file_offer_metadata_fields() {
 
 #[test]
 fn file_offer_drop_purpose_requires_a_valid_pointer() {
-    let drop = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"drop","batchId":1,"batchIndex":0,"batchCount":1,"drop":{"x":32767,"y":20000,"generation":1,"viewportRevision":0}}"#;
+    let drop = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"drop","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1,"drop":{"x":32767,"y":20000,"generation":1,"viewportRevision":0}}"#;
     assert!(validate_file_binary(Side::Viewer, &meta(drop)).is_ok());
     assert!(
         validate_file_binary(

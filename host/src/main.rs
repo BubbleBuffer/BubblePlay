@@ -3243,6 +3243,30 @@ fn run_serve(
                         file_drag_preview.control(control, Instant::now());
                     }
                 }
+                SignalEvent::FileControl(control) => {
+                    if !signaling.application_ready() {
+                        continue;
+                    }
+                    if let Some(files) = file_service.as_ref() {
+                        match control {
+                            bubbleplay_host::file_transfer::ClientControl::Batch(batch) => {
+                                let batch_id = batch.batch_id.clone();
+                                let refusal = files.announce_batch(batch).err();
+                                if let Some(reason) = refusal {
+                                    warn!(reason, "file batch announcement refused");
+                                }
+                                signaling.send_text(
+                                    &bubbleplay_host::file_transfer::file_batch_ack_message(
+                                        &batch_id, refusal,
+                                    ),
+                                );
+                            }
+                            bubbleplay_host::file_transfer::ClientControl::Request(request) => {
+                                files.grant_download(&request);
+                            }
+                        }
+                    }
+                }
                 // Applied at the beginning of this tick, before transport and file work.
                 SignalEvent::PeerLeft => {}
                 SignalEvent::WindowList(control) => {

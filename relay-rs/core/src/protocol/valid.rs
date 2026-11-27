@@ -202,7 +202,7 @@ pub(super) fn valid_file_meta(m: &Map<String, Value>) -> bool {
         || !integer(m, "size", 0.0, 2.0 * 1024.0 * 1024.0 * 1024.0)
         || !bounded_string(m, "mime", 0, 255)
         || !integer(m, "mtimeMs", 0.0, 9_007_199_254_740_991.0)
-        || !uint32_value(m, "batchId")
+        || !id128_value(m, "batchId")
         || !integer(m, "batchCount", 1.0, 64.0)
     {
         return false;

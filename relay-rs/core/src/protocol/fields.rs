@@ -40,6 +40,19 @@ pub(super) fn uint32_value(m: &Map<String, Value>, key: &str) -> bool {
     integer(m, key, 0.0, 4_294_967_295.0)
 }
 
+/// A batch or offer id: a string of exactly 32 lowercase hex digits (128 random bits).
+pub(super) fn id128_value(m: &Map<String, Value>, key: &str) -> bool {
+    match m.get(key).and_then(Value::as_str) {
+        Some(id) => {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
+
 /// Go's object helper: the value if it is a JSON object. null, arrays and
 /// scalars are None, just as Go's decoder leaves the map nil.
 pub(super) fn object<'a>(m: &'a Map<String, Value>, key: &str) -> Option<&'a Map<String, Value>> {

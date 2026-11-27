@@ -33,10 +33,12 @@ use tracing::{debug, info, warn};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+use crate::file_auth::Authorizations;
 use crate::file_hash::Sha256;
 use crate::file_transfer::{
-    self as ft, Body, CancelPayload, FileOfferItem, Incoming, OfferMeta, Packet, Purpose,
-    RateLimiter, RequestPayload, ResultPayload, SendWindow, TransferError,
+    self as ft, BatchAnnouncement, Body, CancelPayload, DownloadRequest, FileOfferItem, Incoming,
+    OfferMeta, Packet, Purpose, RateLimiter, RequestPayload, ResultPayload, SendWindow,
+    TransferError,
 };
 use crate::native_file_drop::{DropBatch, NativeDropRequest};
 use crate::wss_media::{data_hello, host_socket_request_routed, HostSocket, RelayRoute};
@@ -50,6 +52,9 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(300);
 const SPOOL_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 /// Queued download requests per socket.
 const MAX_QUEUED_REQUESTS: usize = 64;
+/// A REQUEST on the file socket may arrive before the viewer's sealed `file-request` has been
+/// read; it waits this long for it, and is refused after that.
+const REQUEST_GRACE: Duration = Duration::from_secs(5);
 /// No ACK progress for this long while bytes are in flight: give up.
 const ACK_STALL_LIMIT: Duration = Duration::from_secs(30);
 const PARTIAL_SUFFIX: &str = ".bppartial";
@@ -138,7 +143,8 @@ struct OfferedFile {
 
 #[derive(Clone, Debug)]
 struct CurrentOffer {
-    id: u32,
+    /// Random 128 bits as 32 hex digits: the relay cannot guess it.
+    id: String,
     source: &'static str,
     items: Vec<OfferedFile>,
 }
@@ -154,7 +160,7 @@ impl CurrentOffer {
                 size: item.size,
             })
             .collect();
-        ft::file_offer_message(self.id, &items, self.source)
+        ft::file_offer_message(&self.id, &items, self.source)
     }
 }
 
@@ -186,7 +192,8 @@ struct Shared {
     generation: u64,
     rate_cap_bps: u64,
     offer: Option<CurrentOffer>,
-    next_offer_id: u32,
+    /// What the viewer announced and asked for over the sealed control channel.
+    auth: Authorizations,
     outbox: FileOutbox,
     /// Clipboard sequence after our own CF_HDROP write (never offered back).
     own_clipboard_seq: Option<u32>,
@@ -213,7 +220,7 @@ impl FileService {
             generation: 0,
             rate_cap_bps: 0,
             offer: None,
-            next_offer_id: 1,
+            auth: Authorizations::default(),
             outbox: FileOutbox::default(),
             own_clipboard_seq: None,
             stats: FileStats::default(),
@@ -265,6 +272,27 @@ impl FileService {
     /// File bytes per second allowed now (0 = no cap).
     pub fn set_rate_cap_bps(&self, bps: u64) {
         self.lock().rate_cap_bps = bps;
+    }
+
+    /// The viewer announced an upload batch over the sealed control channel. Only announced
+    /// batches are accepted on the file socket. `Err` is the `file-batch-ack` error code.
+    pub fn announce_batch(&self, announcement: BatchAnnouncement) -> Result<(), &'static str> {
+        let mut state = self.lock();
+        if state.epoch.is_none() {
+            return Err("not-ready");
+        }
+        state.auth.announce(announcement, Instant::now())
+    }
+
+    /// The viewer asked for items of a host offer over the sealed control channel. Only those
+    /// are served on the file socket.
+    pub fn grant_download(&self, request: &DownloadRequest) {
+        let mut state = self.lock();
+        if state.epoch.is_some() {
+            state
+                .auth
+                .grant(&request.offer_id, &request.ids, Instant::now());
+        }
     }
 
     pub fn take_outbox(&self) -> FileOutbox {
@@ -324,6 +352,7 @@ fn rebind(state: &mut Shared, epoch: Option<&str>) -> Vec<NativeDropRequest> {
     }
     state.epoch = epoch.map(str::to_owned);
     state.generation = state.generation.wrapping_add(1);
+    state.auth.clear();
     let stale = std::mem::take(&mut state.outbox);
     if epoch.is_some() {
         if let Some(message) = state.offer.as_ref().map(CurrentOffer::message) {
@@ -397,9 +426,12 @@ fn publish_offer(shared: &Mutex<Shared>, source: &'static str, items: Vec<Offere
     if items.is_empty() && state.offer.is_none() {
         return;
     }
-    let id = state.next_offer_id;
-    state.next_offer_id = state.next_offer_id.wrapping_add(1).max(1);
-    let offer = CurrentOffer { id, source, items };
+    let id = ft::random_id128();
+    let offer = CurrentOffer {
+        id: id.clone(),
+        source,
+        items,
+    };
     info!(
         offer_id = id,
         source,
@@ -572,12 +604,14 @@ struct Receiving {
     partial: PathBuf,
     hasher: Option<Sha256>,
     started: Instant,
+    /// The SHA-256 the viewer announced for this file; the bytes must match it.
+    announced: [u8; ft::SHA256_BYTES],
 }
 
 /// Saved files of the batch being uploaded, placed on the clipboard together.
 #[derive(Default)]
 struct Batch {
-    id: Option<u32>,
+    id: Option<String>,
     saved: Vec<PathBuf>,
     purpose: Option<Purpose>,
 }
@@ -609,7 +643,8 @@ struct Session {
     receiving: Option<Receiving>,
     batch: Batch,
     sending: Option<Sending>,
-    requests: VecDeque<(u32, RequestPayload)>,
+    requests: VecDeque<(u32, RequestPayload, Instant)>,
+    request_grace: Duration,
     limiter: RateLimiter,
     clock: Instant,
     send_wait_until: Option<Instant>,
@@ -617,9 +652,11 @@ struct Session {
 }
 
 struct DropUpload {
-    id: u32,
+    id: String,
     point: ft::DropPoint,
     offers: Vec<Option<(u32, OfferMeta)>>,
+    /// Announced SHA-256 per file, set as each offer is admitted.
+    hashes: Vec<[u8; ft::SHA256_BYTES]>,
     receiving: HashMap<u32, Receiving>,
     batch: Option<DropBatch>,
     started: Instant,
@@ -634,6 +671,7 @@ impl Session {
             batch: Batch::default(),
             sending: None,
             requests: VecDeque::new(),
+            request_grace: REQUEST_GRACE,
             limiter: RateLimiter::new(),
             clock: Instant::now(),
             send_wait_until: None,
@@ -788,7 +826,7 @@ impl Session {
                     self.sending = None;
                     lock(shared).stats.downloads_failed += 1;
                 }
-                self.requests.retain(|(request_id, _)| *request_id != id);
+                self.requests.retain(|(request_id, _, _)| *request_id != id);
                 Ok(())
             }
             Body::Accept => {
@@ -845,7 +883,7 @@ impl Session {
                 if self.requests.len() >= MAX_QUEUED_REQUESTS {
                     return send_cancel(ws, id, "busy");
                 }
-                self.requests.push_back((id, request));
+                self.requests.push_back((id, request, Instant::now()));
                 Ok(())
             }
         }
@@ -871,11 +909,16 @@ impl Session {
             return send_cancel(ws, id, "busy");
         }
         let point = meta.drop.expect("validated drop point");
+        let announced = match lock(shared).auth.begin_file(&meta, Instant::now()) {
+            Ok(hash) => hash,
+            Err(reason) => return refuse_offer(ws, id, reason),
+        };
         if self.drop_upload.is_none() {
             self.drop_upload = Some(DropUpload {
-                id: meta.batch_id,
+                id: meta.batch_id.clone(),
                 point,
                 offers: vec![None; meta.batch_count as usize],
+                hashes: vec![[0; ft::SHA256_BYTES]; meta.batch_count as usize],
                 receiving: HashMap::new(),
                 batch: None,
                 started: Instant::now(),
@@ -892,6 +935,7 @@ impl Session {
             return send_cancel(ws, id, "invalid-drop");
         }
         let index = meta.batch_index as usize;
+        drop.hashes[index] = announced;
         drop.offers[index] = Some((id, meta));
         let total: u64 = drop.offers.iter().flatten().map(|(_, m)| m.size).sum();
         if total > ft::MAX_FILE_BYTES {
@@ -927,6 +971,7 @@ impl Session {
                         partial: path,
                         hasher: Some(Sha256::new()?),
                         started: Instant::now(),
+                        announced: drop.hashes[index],
                     })
                 })();
                 match prepare {
@@ -1017,7 +1062,12 @@ impl Session {
             return self.cancel_drop(ws, "write-failed", shared);
         }
         std::mem::drop(file);
-        if let Err(error) = receiving.state.on_done(expected, &actual) {
+        let verdict = if *expected != receiving.announced {
+            Err(TransferError::HashMismatch)
+        } else {
+            receiving.state.on_done(expected, &actual)
+        };
+        if let Err(error) = verdict {
             return self.cancel_drop(ws, error.code(), shared);
         }
         drop.batch
@@ -1061,7 +1111,11 @@ impl Session {
             return self.cancel_drop(ws, &reason, shared);
         }
         let drop = self.drop_upload.take().unwrap();
-        lock(shared).stats.uploads_ok += drop.offers.len() as u64;
+        {
+            let mut state = lock(shared);
+            state.stats.uploads_ok += drop.offers.len() as u64;
+            state.auth.forget_batch(&drop.id);
+        }
         for (id, _) in drop.offers.into_iter().flatten() {
             send(
                 ws,
@@ -1088,7 +1142,11 @@ impl Session {
         }
         drop.receiving.clear(); // close writes before last cache owner removes it
         let count = drop.offers.iter().flatten().count();
-        lock(shared).stats.uploads_failed += count as u64;
+        {
+            let mut state = lock(shared);
+            state.stats.uploads_failed += count as u64;
+            state.auth.forget_batch(&drop.id);
+        }
         for (id, _) in drop.offers.into_iter().flatten() {
             send_cancel(ws, id, reason)?;
         }
@@ -1112,21 +1170,30 @@ impl Session {
         if self.receiving.is_some() {
             return send_cancel(ws, id, "busy");
         }
-        if self.batch.id != Some(meta.batch_id) {
-            self.batch = Batch {
-                id: Some(meta.batch_id),
-                saved: Vec::new(),
-                purpose: Some(meta.purpose),
-            };
-        }
         let state = match Incoming::new(id, &meta) {
             Ok(state) => state,
             Err(error) => return send_cancel(ws, id, error.code()),
         };
+        let announced = match lock(shared).auth.begin_file(&meta, Instant::now()) {
+            Ok(hash) => hash,
+            Err(reason) => return refuse_offer(ws, id, reason),
+        };
+        if self.batch.id.as_deref() != Some(meta.batch_id.as_str()) {
+            self.batch = Batch {
+                id: Some(meta.batch_id.clone()),
+                saved: Vec::new(),
+                purpose: Some(meta.purpose),
+            };
+        }
         let (file, partial) = match create_partial(&self.config.downloads_dir, id, &meta.name) {
             Ok(created) => created,
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "cannot create upload file");
+                lock(shared).auth.end_file(
+                    &meta.batch_id,
+                    meta.batch_index as usize,
+                    Instant::now(),
+                );
                 return send_cancel(ws, id, "write-failed");
             }
         };
@@ -1138,6 +1205,7 @@ impl Session {
             partial,
             hasher: Some(Sha256::new()?),
             started: Instant::now(),
+            announced,
         });
         send(
             ws,
@@ -1218,7 +1286,17 @@ impl Session {
             .expect("file until done")
             .sync_all()
             .is_ok();
-        let verdict = receiving.state.on_done(expected, &actual);
+        // The sender's DONE hash and the bytes received must both be what the viewer announced.
+        let verdict = if *expected != receiving.announced {
+            Err(TransferError::HashMismatch)
+        } else {
+            receiving.state.on_done(expected, &actual)
+        };
+        lock(shared).auth.end_file(
+            &receiving.meta.batch_id,
+            receiving.meta.batch_index as usize,
+            Instant::now(),
+        );
         let result = match (verdict, flushed) {
             (Err(error), _) => Err(error.code()),
             (Ok(()), false) => Err("write-failed"),
@@ -1296,7 +1374,15 @@ impl Session {
         if let Err(error) = fs::remove_file(&receiving.partial) {
             warn!(?error, path = %receiving.partial.display(), "cannot remove partial upload");
         }
-        lock(shared).stats.uploads_failed += 1;
+        {
+            let mut state = lock(shared);
+            state.stats.uploads_failed += 1;
+            state.auth.end_file(
+                &receiving.meta.batch_id,
+                receiving.meta.batch_index as usize,
+                Instant::now(),
+            );
+        }
         info!(
             transfer = id,
             error = code,
@@ -1373,10 +1459,10 @@ impl Session {
     // --- downloads (host -> client) ---------------------------------------
 
     fn start_next_request(&mut self, ws: &mut Socket, shared: &Mutex<Shared>) -> Result<()> {
-        while let Some((id, request)) = self.requests.pop_front() {
+        while let Some((id, request, asked_at)) = self.requests.pop_front() {
             let offered = {
-                let state = lock(shared);
-                state.offer.as_ref().and_then(|offer| {
+                let mut state = lock(shared);
+                let found = state.offer.as_ref().and_then(|offer| {
                     (offer.id == request.offer_id)
                         .then(|| {
                             let index =
@@ -1388,7 +1474,31 @@ impl Session {
                             ))
                         })
                         .flatten()
-                })
+                });
+                match found {
+                    Some(found) => {
+                        // The viewer must have asked for this item over the sealed control
+                        // channel; its message may trail the REQUEST by a moment.
+                        if state
+                            .auth
+                            .take_grant(&request.offer_id, request.id, Instant::now())
+                        {
+                            Some(found)
+                        } else if asked_at.elapsed() < self.request_grace {
+                            self.requests.push_front((id, request, asked_at));
+                            return Ok(());
+                        } else {
+                            warn!(
+                                transfer = id,
+                                "file request refused: not asked for over the control channel"
+                            );
+                            drop(state);
+                            send_cancel(ws, id, "unauthorized")?;
+                            continue;
+                        }
+                    }
+                    None => None,
+                }
             };
             let Some((item, index, count)) = offered else {
                 send_cancel(ws, id, "unknown-offer")?;
@@ -1421,7 +1531,7 @@ impl Session {
                 mime: mime_for(&item.name).to_string(),
                 mtime_ms,
                 purpose: Purpose::Save,
-                batch_id: request.offer_id,
+                batch_id: request.offer_id.clone(),
                 batch_index: index,
                 batch_count: count,
                 drop: None,
@@ -1604,6 +1714,12 @@ impl Session {
         self.requests.clear();
         self.batch = Batch::default();
     }
+}
+
+/// An OFFER that does not match an announced batch: refused, logged without names or bytes.
+fn refuse_offer(ws: &mut Socket, id: u32, reason: &'static str) -> Result<()> {
+    warn!(transfer = id, reason, "file offer refused");
+    send_cancel(ws, id, "unannounced")
 }
 
 fn read_exact_or_eof(file: &mut File, buffer: &mut [u8]) -> std::io::Result<usize> {
@@ -1860,6 +1976,7 @@ mod tests {
     #[test]
     fn stale_viewer_packets_are_not_processed_while_the_bound_viewer_gets_them() {
         let (mut session, mut ws, _client, shared, dir) = native_test_session();
+        announce(&shared, &[meta("a.bin", 3)], digest(b"abc"));
         let offer = ft::encode(&Packet {
             transfer_id: 41,
             seq: 0,
@@ -1875,6 +1992,163 @@ mod tests {
         session.on_packet(&mut ws, &offer, &shared).unwrap();
         assert!(session.receiving.is_none());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unannounced_offer_is_refused_and_leaves_nothing_behind() {
+        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+        session
+            .on_packet(&mut ws, &offer_packet(41, &meta("planted.bin", 3)), &shared)
+            .unwrap();
+        assert_eq!(cancel_reason(&mut client), "unannounced");
+        assert!(session.receiving.is_none());
+        let mut drop_offer = drop_meta(0, 1);
+        drop_offer.batch_id = format!("{:032x}", 9);
+        session
+            .on_packet(&mut ws, &offer_packet(42, &drop_offer), &shared)
+            .unwrap();
+        assert_eq!(cancel_reason(&mut client), "unannounced");
+        assert!(session.drop_upload.is_none());
+        assert!(lock(&shared).outbox.drops.is_empty());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_offer_that_differs_from_its_announcement_is_refused() {
+        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+        announce(&shared, &[meta("a.bin", 3)], digest(b"abc"));
+        for wrong in [meta("a.bin", 4), meta("b.bin", 3), {
+            let mut paste = meta("a.bin", 3);
+            paste.purpose = Purpose::Paste;
+            paste
+        }] {
+            session
+                .on_packet(&mut ws, &offer_packet(41, &wrong), &shared)
+                .unwrap();
+            assert_eq!(cancel_reason(&mut client), "unannounced");
+            assert!(session.receiving.is_none());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bytes_that_do_not_match_the_announced_hash_never_reach_the_clipboard_or_paste() {
+        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+        let mut paste = meta("a.bin", 3);
+        paste.purpose = Purpose::Paste;
+        announce(&shared, std::slice::from_ref(&paste), digest(b"abc"));
+        session
+            .on_packet(&mut ws, &offer_packet(41, &paste), &shared)
+            .unwrap();
+        assert!(matches!(
+            ft::decode(&read_packet(&mut client)).unwrap().body,
+            Body::Accept
+        ));
+        // Right size, other bytes, and a DONE hash that matches those bytes (not the announcement).
+        session.on_data(&mut ws, 41, 0, b"abd", &shared).unwrap();
+        session
+            .on_done(&mut ws, 41, &digest(b"abd"), &shared)
+            .unwrap();
+        match ft::decode(&read_non_ack(&mut client)).unwrap().body {
+            Body::Result(result) => {
+                assert!(!result.ok);
+                assert_eq!(result.error.as_deref(), Some("hash-mismatch"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(session.batch.saved.is_empty());
+        let state = lock(&shared);
+        assert_eq!(state.stats.uploads_ok, 0);
+        assert_eq!(state.outbox.pastes, 0);
+        assert!(state.own_clipboard_seq.is_none());
+        drop(state);
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no partial or final file"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_announced_file_is_saved_once_and_a_replay_of_its_batch_is_refused() {
+        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+        let upload = meta("a.bin", 3);
+        announce(&shared, std::slice::from_ref(&upload), digest(b"abc"));
+        session
+            .on_packet(&mut ws, &offer_packet(41, &upload), &shared)
+            .unwrap();
+        read_packet(&mut client);
+        session.on_data(&mut ws, 41, 0, b"abc", &shared).unwrap();
+        session
+            .on_done(&mut ws, 41, &digest(b"abc"), &shared)
+            .unwrap();
+        match ft::decode(&read_non_ack(&mut client)).unwrap().body {
+            Body::Result(result) => assert!(result.ok),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(fs::read(dir.join("a.bin")).unwrap(), b"abc");
+        session
+            .on_packet(&mut ws, &offer_packet(42, &upload), &shared)
+            .unwrap();
+        assert_eq!(cancel_reason(&mut client), "unannounced");
+        assert!(session.receiving.is_none());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_request_is_served_only_for_an_item_the_viewer_asked_for_over_control() {
+        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+        session.request_grace = Duration::ZERO;
+        let file = dir.join("offered.bin");
+        fs::write(&file, b"secret").unwrap();
+        publish_offer(
+            &shared,
+            "clipboard",
+            vec![OfferedFile {
+                id: 1,
+                path: file,
+                name: "offered.bin".into(),
+                size: 6,
+            }],
+        );
+        let offer_id = lock(&shared).offer.as_ref().unwrap().id.clone();
+        let request = |offer_id: &str| RequestPayload {
+            offer_id: offer_id.into(),
+            id: 1,
+        };
+        // Guessing an id, and the right id nobody asked for.
+        for guess in [format!("{:032x}", 1), offer_id.clone()] {
+            session
+                .requests
+                .push_back((9, request(&guess), Instant::now()));
+            session.start_next_request(&mut ws, &shared).unwrap();
+            let reason = cancel_reason(&mut client);
+            assert!(
+                reason == "unknown-offer" || reason == "unauthorized",
+                "{reason}"
+            );
+            assert!(session.sending.is_none());
+        }
+        // Control: asked for over the sealed channel, served once.
+        lock(&shared).auth.grant(&offer_id, &[1], Instant::now());
+        session
+            .requests
+            .push_back((10, request(&offer_id), Instant::now()));
+        session.start_next_request(&mut ws, &shared).unwrap();
+        assert!(matches!(
+            ft::decode(&read_packet(&mut client)).unwrap().body,
+            Body::Offer(_)
+        ));
+        session.sending = None;
+        session
+            .requests
+            .push_back((11, request(&offer_id), Instant::now()));
+        session.start_next_request(&mut ws, &shared).unwrap();
+        assert_eq!(cancel_reason(&mut client), "unauthorized");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1895,10 +2169,55 @@ mod tests {
             mime: String::new(),
             mtime_ms: 0,
             purpose: Purpose::Save,
-            batch_id: 1,
+            batch_id: format!("{:032x}", 1),
             batch_index: 0,
             batch_count: 1,
             drop: None,
+        }
+    }
+
+    fn digest(bytes: &[u8]) -> [u8; 32] {
+        let mut hash = Sha256::new().unwrap();
+        hash.update(bytes);
+        hash.finish()
+    }
+
+    /// What the viewer sends over the sealed control channel before the offers.
+    fn announce(shared: &Mutex<Shared>, metas: &[OfferMeta], sha256: [u8; 32]) {
+        let first = &metas[0];
+        lock(shared)
+            .auth
+            .announce(
+                BatchAnnouncement {
+                    batch_id: first.batch_id.clone(),
+                    purpose: first.purpose,
+                    drop: first.drop,
+                    files: metas
+                        .iter()
+                        .map(|m| ft::AnnouncedFile {
+                            name: m.name.clone(),
+                            size: m.size,
+                            sha256,
+                        })
+                        .collect(),
+                },
+                Instant::now(),
+            )
+            .unwrap();
+    }
+
+    fn offer_packet(id: u32, meta: &OfferMeta) -> Vec<u8> {
+        ft::encode(&Packet {
+            transfer_id: id,
+            seq: 0,
+            body: Body::Offer(meta.clone()),
+        })
+    }
+
+    fn cancel_reason(client: &mut WebSocket<TcpStream>) -> String {
+        match ft::decode(&read_packet(client)).unwrap().body {
+            Body::Cancel(payload) => payload.reason,
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -1912,6 +2231,7 @@ mod tests {
             partial,
             hasher: Some(Sha256::new().unwrap()),
             started: Instant::now(),
+            announced: [0; 32],
         }
     }
 
@@ -1956,7 +2276,7 @@ mod tests {
             generation: 1,
             rate_cap_bps: 0,
             offer: None,
-            next_offer_id: 1,
+            auth: Authorizations::default(),
             outbox: FileOutbox::default(),
             own_clipboard_seq: None,
             stats: FileStats::default(),
@@ -1997,6 +2317,7 @@ mod tests {
         let (mut session, mut ws, mut client, shared, dir) = native_test_session();
         let mut large = drop_meta(0, 1);
         large.size = crate::native_file_drop::PREPARE_NATIVE_DROP_BYTES;
+        announce(&shared, std::slice::from_ref(&large), [7; 32]);
         session
             .on_offer(&mut ws, 41, large.clone(), &shared)
             .unwrap();
@@ -2013,7 +2334,7 @@ mod tests {
         assert!(request.preparation_required());
         assert_eq!(request.preparation_status(), Ok(false));
         let mut next = drop_meta(0, 1);
-        next.batch_id += 1;
+        next.batch_id = format!("{:032x}", 2);
         session.on_offer(&mut ws, 42, next, &shared).unwrap();
         match ft::decode(&read_packet(&mut client)).unwrap().body {
             Body::Cancel(payload) => assert_eq!(payload.reason, "busy"),
@@ -2045,6 +2366,7 @@ mod tests {
     #[test]
     fn native_batch_starts_at_metadata_and_results_wait_for_every_hash() {
         let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+        announce(&shared, &[drop_meta(0, 2), drop_meta(1, 2)], digest(b"abc"));
         session
             .on_offer(&mut ws, 1, drop_meta(0, 2), &shared)
             .unwrap();
@@ -2099,6 +2421,7 @@ mod tests {
     fn native_target_reject_and_hash_failure_cancel_and_remove_private_cache() {
         for reject_target in [true, false] {
             let (mut session, mut ws, mut client, shared, dir) = native_test_session();
+            announce(&shared, &[drop_meta(0, 1)], digest(b"abc"));
             session
                 .on_offer(&mut ws, 7, drop_meta(0, 1), &shared)
                 .unwrap();
@@ -2176,7 +2499,7 @@ mod tests {
             generation: 0,
             rate_cap_bps: 0,
             offer: None,
-            next_offer_id: 1,
+            auth: Authorizations::default(),
             outbox: FileOutbox::default(),
             own_clipboard_seq: None,
             stats: FileStats::default(),
@@ -2223,7 +2546,7 @@ mod tests {
             generation: 1,
             rate_cap_bps: 0,
             offer: None,
-            next_offer_id: 1,
+            auth: Authorizations::default(),
             outbox: FileOutbox::default(),
             own_clipboard_seq: None,
             stats: FileStats::default(),
@@ -2239,7 +2562,8 @@ mod tests {
         let first: serde_json::Value =
             serde_json::from_str(&lock(&shared).outbox.signals[0]).unwrap();
         assert_eq!(first["source"], "sendto");
-        assert_eq!(first["offerId"], 1);
+        let first_id = first["offerId"].as_str().unwrap().to_owned();
+        assert!(ft::valid_id128(&first_id));
         assert_eq!(
             first["items"].as_array().unwrap().len(),
             2,
@@ -2259,7 +2583,9 @@ mod tests {
             .map(|text| serde_json::from_str(text).unwrap())
             .collect();
         assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1]["offerId"], 2);
+        let second_id = messages[1]["offerId"].as_str().unwrap();
+        assert!(ft::valid_id128(second_id));
+        assert_ne!(second_id, first_id, "every offer gets a fresh random id");
         assert_eq!(messages[1]["items"].as_array().unwrap().len(), 1);
         assert_eq!(messages[2]["items"].as_array().unwrap().len(), 0);
         assert!(state.offer.is_none());

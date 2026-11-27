@@ -944,6 +944,8 @@ pub enum SignalEvent {
     /// Browser trickled an ICE candidate (SDP string form).
     RemoteCandidate(String),
     FileDragPreview(FileDragPreviewControl),
+    /// A viewer's `file-batch` announcement or `file-request`, from the sealed control channel.
+    FileControl(crate::file_transfer::ClientControl),
     /// Authenticated browser profiling snapshot (enabled with ?profile=1).
     ClientDiagnostics {
         seq: u64,
@@ -1616,6 +1618,11 @@ impl Signaling {
                         };
                         if let Some(control) = crate::window_list::parse_client(&text) {
                             events.push(SignalEvent::WindowList(control));
+                            continue;
+                        }
+                        if let Some(control) = crate::file_transfer::parse_client_control(&text) {
+                            // Sealed control only: this text came out of the device-key AEAD.
+                            events.push(SignalEvent::FileControl(control));
                             continue;
                         }
                         let parsed: SignalMsg = match serde_json::from_str(&text) {

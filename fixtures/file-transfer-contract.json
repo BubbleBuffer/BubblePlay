@@ -70,14 +70,14 @@
   "packets": [
     {
       "name": "offer",
-      "hex": "425046310100000007000000000000007b226e616d65223a2253637265656e73686f7420323032362d31302d30312e706e67222c2273697a65223a352c226d696d65223a22696d6167652f706e67222c226d74696d654d73223a313739303030303030303030302c22707572706f7365223a227061737465222c2262617463684964223a332c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "hex": "425046310100000007000000000000007b226e616d65223a2253637265656e73686f7420323032362d31302d30312e706e67222c2273697a65223a352c226d696d65223a22696d6167652f706e67222c226d74696d654d73223a313739303030303030303030302c22707572706f7365223a227061737465222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303033222c226261746368496e646578223a302c226261746368436f756e74223a317d",
       "type": "OFFER",
       "transferId": 7,
       "seq": 0,
-      "payloadHex": "7b226e616d65223a2253637265656e73686f7420323032362d31302d30312e706e67222c2273697a65223a352c226d696d65223a22696d6167652f706e67222c226d74696d654d73223a313739303030303030303030302c22707572706f7365223a227061737465222c2262617463684964223a332c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "payloadHex": "7b226e616d65223a2253637265656e73686f7420323032362d31302d30312e706e67222c2273697a65223a352c226d696d65223a22696d6167652f706e67222c226d74696d654d73223a313739303030303030303030302c22707572706f7365223a227061737465222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303033222c226261746368496e646578223a302c226261746368436f756e74223a317d",
       "decoded": {
         "batchCount": 1,
-        "batchId": 3,
+        "batchId": "00000000000000000000000000000003",
         "batchIndex": 0,
         "mime": "image/png",
         "mtimeMs": 1790000000000,
@@ -186,14 +186,14 @@
     },
     {
       "name": "request",
-      "hex": "425046310800000009000000000000007b226f666665724964223a342c226964223a327d",
+      "hex": "425046310800000009000000000000007b226f666665724964223a223030303030303030303030303030303030303030303030303030303030303034222c226964223a327d",
       "type": "REQUEST",
       "transferId": 9,
       "seq": 0,
-      "payloadHex": "7b226f666665724964223a342c226964223a327d",
+      "payloadHex": "7b226f666665724964223a223030303030303030303030303030303030303030303030303030303030303034222c226964223a327d",
       "decoded": {
         "id": 2,
-        "offerId": 4
+        "offerId": "00000000000000000000000000000004"
       }
     }
   ],
@@ -260,17 +260,17 @@
     },
     {
       "name": "offer-missing-size",
-      "hex": "425046310100000007000000000000007b226e616d65223a2261222c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "hex": "425046310100000007000000000000007b226e616d65223a2261222c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
       "reason": "json"
     },
     {
       "name": "offer-too-big-file",
-      "hex": "425046310100000007000000000000007b226e616d65223a2261222c2273697a65223a323134373438333634392c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "hex": "425046310100000007000000000000007b226e616d65223a2261222c2273697a65223a323134373438333634392c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
       "reason": "json"
     },
     {
       "name": "offer-bad-purpose",
-      "hex": "425046310100000007000000000000007b226e616d65223a2261222c2273697a65223a312c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a226f70656e222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "hex": "425046310100000007000000000000007b226e616d65223a2261222c2273697a65223a312c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a226f70656e222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
       "reason": "json"
     },
     {
@@ -289,6 +289,16 @@
       "totalBytes": 65553,
       "reason": "too-large",
       "note": "header followed by 65537 bytes of 0xab"
+    },
+    {
+      "name": "offer-integer-batch-id",
+      "hex": "425046310100000007000000000000007b226e616d65223a2261222c2273697a65223a312c226d696d65223a22222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+      "reason": "json"
+    },
+    {
+      "name": "request-short-offer-id",
+      "hex": "425046310800000009000000000000007b226f666665724964223a22616263222c226964223a327d",
+      "reason": "json"
     }
   ],
   "receiverSessions": [
@@ -296,7 +306,7 @@
       "name": "ok",
       "outcome": "ok",
       "packets": [
-        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
         "42504631030000000b0000000000000068656c",
         "42504631030000000b000000010000006c6f",
         "42504631050000000b000000000000002cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -306,7 +316,7 @@
       "name": "data-seq-gap",
       "outcome": "seq-gap",
       "packets": [
-        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
         "42504631030000000b0000000000000068656c",
         "42504631030000000b000000020000006c6f"
       ]
@@ -315,7 +325,7 @@
       "name": "data-past-size",
       "outcome": "size-mismatch",
       "packets": [
-        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a342c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a342c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
         "42504631030000000b0000000000000068656c",
         "42504631030000000b000000010000006c6f"
       ]
@@ -324,7 +334,7 @@
       "name": "done-before-all-bytes",
       "outcome": "size-mismatch",
       "packets": [
-        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
         "42504631030000000b0000000000000068656c",
         "42504631050000000b000000000000002cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
       ]
@@ -333,7 +343,7 @@
       "name": "hash-mismatch",
       "outcome": "hash-mismatch",
       "packets": [
-        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a312c226261746368496e646578223a302c226261746368436f756e74223a317d",
+        "42504631010000000b000000000000007b226e616d65223a226e6f7465732e747874222c2273697a65223a352c226d696d65223a22746578742f706c61696e222c226d74696d654d73223a302c22707572706f7365223a2273617665222c2262617463684964223a223030303030303030303030303030303030303030303030303030303030303031222c226261746368496e646578223a302c226261746368436f756e74223a317d",
         "42504631030000000b0000000000000068656c",
         "42504631030000000b000000010000006c70",
         "42504631050000000b000000000000002cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -343,32 +353,32 @@
   "signaling": {
     "fileOffer": [
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":7,\"items\":[{\"id\":1,\"name\":\"report.pdf\",\"size\":1234}],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000007\",\"items\":[{\"id\":1,\"name\":\"report.pdf\",\"size\":1234}],\"source\":\"clipboard\"}",
         "accepted": true
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":8,\"items\":[],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000008\",\"items\":[],\"source\":\"clipboard\"}",
         "accepted": true,
         "note": "items [] withdraws the previous offer"
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":1,\"name\":\"a.txt\",\"size\":1},{\"id\":2,\"name\":\"b.bin\",\"size\":2147483648}],\"source\":\"sendto\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"a.txt\",\"size\":1},{\"id\":2,\"name\":\"b.bin\",\"size\":2147483648}],\"source\":\"sendto\"}",
         "accepted": true
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":1,\"name\":\"\",\"size\":1}],\"source\":\"sendto\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"\",\"size\":1}],\"source\":\"sendto\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":1,\"name\":\"a\",\"size\":2147483649}],\"source\":\"sendto\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":1,\"name\":\"a\",\"size\":2147483649}],\"source\":\"sendto\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[],\"source\":\"disk\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[],\"source\":\"disk\"}",
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":9,\"items\":[],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":2,\"offerId\":\"00000000000000000000000000000009\",\"items\":[],\"source\":\"clipboard\"}",
         "accepted": false
       },
       {
@@ -376,13 +386,92 @@
         "accepted": false
       },
       {
-        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":9,\"items\":[{\"id\":0,\"name\":\"f\",\"size\":1},{\"id\":1,\"name\":\"f\",\"size\":1},{\"id\":2,\"name\":\"f\",\"size\":1},{\"id\":3,\"name\":\"f\",\"size\":1},{\"id\":4,\"name\":\"f\",\"size\":1},{\"id\":5,\"name\":\"f\",\"size\":1},{\"id\":6,\"name\":\"f\",\"size\":1},{\"id\":7,\"name\":\"f\",\"size\":1},{\"id\":8,\"name\":\"f\",\"size\":1},{\"id\":9,\"name\":\"f\",\"size\":1},{\"id\":10,\"name\":\"f\",\"size\":1},{\"id\":11,\"name\":\"f\",\"size\":1},{\"id\":12,\"name\":\"f\",\"size\":1},{\"id\":13,\"name\":\"f\",\"size\":1},{\"id\":14,\"name\":\"f\",\"size\":1},{\"id\":15,\"name\":\"f\",\"size\":1},{\"id\":16,\"name\":\"f\",\"size\":1},{\"id\":17,\"name\":\"f\",\"size\":1},{\"id\":18,\"name\":\"f\",\"size\":1},{\"id\":19,\"name\":\"f\",\"size\":1},{\"id\":20,\"name\":\"f\",\"size\":1},{\"id\":21,\"name\":\"f\",\"size\":1},{\"id\":22,\"name\":\"f\",\"size\":1},{\"id\":23,\"name\":\"f\",\"size\":1},{\"id\":24,\"name\":\"f\",\"size\":1},{\"id\":25,\"name\":\"f\",\"size\":1},{\"id\":26,\"name\":\"f\",\"size\":1},{\"id\":27,\"name\":\"f\",\"size\":1},{\"id\":28,\"name\":\"f\",\"size\":1},{\"id\":29,\"name\":\"f\",\"size\":1},{\"id\":30,\"name\":\"f\",\"size\":1},{\"id\":31,\"name\":\"f\",\"size\":1},{\"id\":32,\"name\":\"f\",\"size\":1},{\"id\":33,\"name\":\"f\",\"size\":1},{\"id\":34,\"name\":\"f\",\"size\":1},{\"id\":35,\"name\":\"f\",\"size\":1},{\"id\":36,\"name\":\"f\",\"size\":1},{\"id\":37,\"name\":\"f\",\"size\":1},{\"id\":38,\"name\":\"f\",\"size\":1},{\"id\":39,\"name\":\"f\",\"size\":1},{\"id\":40,\"name\":\"f\",\"size\":1},{\"id\":41,\"name\":\"f\",\"size\":1},{\"id\":42,\"name\":\"f\",\"size\":1},{\"id\":43,\"name\":\"f\",\"size\":1},{\"id\":44,\"name\":\"f\",\"size\":1},{\"id\":45,\"name\":\"f\",\"size\":1},{\"id\":46,\"name\":\"f\",\"size\":1},{\"id\":47,\"name\":\"f\",\"size\":1},{\"id\":48,\"name\":\"f\",\"size\":1},{\"id\":49,\"name\":\"f\",\"size\":1},{\"id\":50,\"name\":\"f\",\"size\":1},{\"id\":51,\"name\":\"f\",\"size\":1},{\"id\":52,\"name\":\"f\",\"size\":1},{\"id\":53,\"name\":\"f\",\"size\":1},{\"id\":54,\"name\":\"f\",\"size\":1},{\"id\":55,\"name\":\"f\",\"size\":1},{\"id\":56,\"name\":\"f\",\"size\":1},{\"id\":57,\"name\":\"f\",\"size\":1},{\"id\":58,\"name\":\"f\",\"size\":1},{\"id\":59,\"name\":\"f\",\"size\":1},{\"id\":60,\"name\":\"f\",\"size\":1},{\"id\":61,\"name\":\"f\",\"size\":1},{\"id\":62,\"name\":\"f\",\"size\":1},{\"id\":63,\"name\":\"f\",\"size\":1},{\"id\":64,\"name\":\"f\",\"size\":1}],\"source\":\"clipboard\"}",
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":\"00000000000000000000000000000009\",\"items\":[{\"id\":0,\"name\":\"f\",\"size\":1},{\"id\":1,\"name\":\"f\",\"size\":1},{\"id\":2,\"name\":\"f\",\"size\":1},{\"id\":3,\"name\":\"f\",\"size\":1},{\"id\":4,\"name\":\"f\",\"size\":1},{\"id\":5,\"name\":\"f\",\"size\":1},{\"id\":6,\"name\":\"f\",\"size\":1},{\"id\":7,\"name\":\"f\",\"size\":1},{\"id\":8,\"name\":\"f\",\"size\":1},{\"id\":9,\"name\":\"f\",\"size\":1},{\"id\":10,\"name\":\"f\",\"size\":1},{\"id\":11,\"name\":\"f\",\"size\":1},{\"id\":12,\"name\":\"f\",\"size\":1},{\"id\":13,\"name\":\"f\",\"size\":1},{\"id\":14,\"name\":\"f\",\"size\":1},{\"id\":15,\"name\":\"f\",\"size\":1},{\"id\":16,\"name\":\"f\",\"size\":1},{\"id\":17,\"name\":\"f\",\"size\":1},{\"id\":18,\"name\":\"f\",\"size\":1},{\"id\":19,\"name\":\"f\",\"size\":1},{\"id\":20,\"name\":\"f\",\"size\":1},{\"id\":21,\"name\":\"f\",\"size\":1},{\"id\":22,\"name\":\"f\",\"size\":1},{\"id\":23,\"name\":\"f\",\"size\":1},{\"id\":24,\"name\":\"f\",\"size\":1},{\"id\":25,\"name\":\"f\",\"size\":1},{\"id\":26,\"name\":\"f\",\"size\":1},{\"id\":27,\"name\":\"f\",\"size\":1},{\"id\":28,\"name\":\"f\",\"size\":1},{\"id\":29,\"name\":\"f\",\"size\":1},{\"id\":30,\"name\":\"f\",\"size\":1},{\"id\":31,\"name\":\"f\",\"size\":1},{\"id\":32,\"name\":\"f\",\"size\":1},{\"id\":33,\"name\":\"f\",\"size\":1},{\"id\":34,\"name\":\"f\",\"size\":1},{\"id\":35,\"name\":\"f\",\"size\":1},{\"id\":36,\"name\":\"f\",\"size\":1},{\"id\":37,\"name\":\"f\",\"size\":1},{\"id\":38,\"name\":\"f\",\"size\":1},{\"id\":39,\"name\":\"f\",\"size\":1},{\"id\":40,\"name\":\"f\",\"size\":1},{\"id\":41,\"name\":\"f\",\"size\":1},{\"id\":42,\"name\":\"f\",\"size\":1},{\"id\":43,\"name\":\"f\",\"size\":1},{\"id\":44,\"name\":\"f\",\"size\":1},{\"id\":45,\"name\":\"f\",\"size\":1},{\"id\":46,\"name\":\"f\",\"size\":1},{\"id\":47,\"name\":\"f\",\"size\":1},{\"id\":48,\"name\":\"f\",\"size\":1},{\"id\":49,\"name\":\"f\",\"size\":1},{\"id\":50,\"name\":\"f\",\"size\":1},{\"id\":51,\"name\":\"f\",\"size\":1},{\"id\":52,\"name\":\"f\",\"size\":1},{\"id\":53,\"name\":\"f\",\"size\":1},{\"id\":54,\"name\":\"f\",\"size\":1},{\"id\":55,\"name\":\"f\",\"size\":1},{\"id\":56,\"name\":\"f\",\"size\":1},{\"id\":57,\"name\":\"f\",\"size\":1},{\"id\":58,\"name\":\"f\",\"size\":1},{\"id\":59,\"name\":\"f\",\"size\":1},{\"id\":60,\"name\":\"f\",\"size\":1},{\"id\":61,\"name\":\"f\",\"size\":1},{\"id\":62,\"name\":\"f\",\"size\":1},{\"id\":63,\"name\":\"f\",\"size\":1},{\"id\":64,\"name\":\"f\",\"size\":1}],\"source\":\"clipboard\"}",
         "accepted": false
+      },
+      {
+        "text": "{\"type\":\"file-offer\",\"protocol\":1,\"offerId\":7,\"items\":[],\"source\":\"clipboard\"}",
+        "accepted": false,
+        "note": "offer ids are 32 lowercase hex digits"
       }
     ],
     "hostCapabilities": {
       "text": "{\"type\":\"host-capabilities\",\"serviceMode\":false,\"coldBoot\":false,\"secureDesktop\":false,\"secureText\":false,\"fileTransfer\":1}",
       "note": "clients show file UI only when fileTransfer >= 1"
+    },
+    "fileBatch": {
+      "note": "client -> host over the sealed control channel, before the batch OFFER packets; the host admits only offers matching it (name, size, purpose, drop point, count, SHA-256)",
+      "cases": [
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"paste\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "accepted": true
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"drop\",\"drop\":{\"x\":1,\"y\":2,\"generation\":1,\"viewportRevision\":0},\"files\":[{\"name\":\"a.txt\",\"size\":0,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "accepted": true
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"drop\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "accepted": false,
+          "note": "drop needs a drop point"
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"drop\":{\"x\":1,\"y\":2,\"generation\":1,\"viewportRevision\":0},\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "accepted": false,
+          "note": "only drop carries a drop point"
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[]}",
+          "accepted": false,
+          "note": "at least one file"
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"abc\"}]}",
+          "accepted": false,
+          "note": "sha256 is 64 lowercase hex digits"
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":7,\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":5,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "accepted": false,
+          "note": "batch ids are 32 hex digits"
+        },
+        {
+          "text": "{\"type\":\"file-batch\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"purpose\":\"save\",\"files\":[{\"name\":\"a.txt\",\"size\":2147483649,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+          "accepted": false,
+          "note": "over 2 GiB"
+        }
+      ]
+    },
+    "fileBatchAck": {
+      "note": "host -> client; error is one of not-ready, duplicate-batch, busy",
+      "cases": [
+        {
+          "text": "{\"type\":\"file-batch-ack\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"ok\":true}",
+          "ok": true
+        },
+        {
+          "text": "{\"type\":\"file-batch-ack\",\"protocol\":1,\"batchId\":\"00000000000000000000000000abcdef\",\"ok\":false,\"error\":\"busy\"}",
+          "ok": false,
+          "error": "busy"
+        }
+      ]
+    },
+    "fileRequest": {
+      "note": "client -> host over the sealed control channel; the host serves a REQUEST packet only for an offerId/id pair asked for here, once",
+      "cases": [
+        {
+          "text": "{\"type\":\"file-request\",\"protocol\":1,\"offerId\":\"00000000000000000000000000abcdef\",\"ids\":[1,2]}",
+          "accepted": true
+        },
+        {
+          "text": "{\"type\":\"file-request\",\"protocol\":1,\"offerId\":\"00000000000000000000000000abcdef\",\"ids\":[]}",
+          "accepted": false
+        },
+        {
+          "text": "{\"type\":\"file-request\",\"protocol\":1,\"offerId\":4,\"ids\":[1]}",
+          "accepted": false
+        }
+      ]
     }
   }
 }
