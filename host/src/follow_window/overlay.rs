@@ -42,12 +42,22 @@ pub fn spans_multiple_monitors(window: Rect, monitors: &[Rect]) -> bool {
     monitors.iter().filter(|m| covers_monitor(window, **m)).count() >= 2
 }
 
+/// Whether `window` contains the whole monitor rectangle. A maximised window stops at the
+/// taskbar, so it never does on a monitor with a visible taskbar; a capture overlay does.
+fn fills_monitor(window: Rect, monitor: Rect) -> bool {
+    window.left <= monitor.left
+        && window.top <= monitor.top
+        && window.right >= monitor.right
+        && window.bottom >= monitor.bottom
+}
+
 /// Whether following ignores a window of the executable `exe` at `window`. The Snipping Tool's
-/// windows are ignored only when overlay-shaped (covering the full rectangle of a monitor, as its
-/// capture layer does on each display); its normal and maximised app window is followed like any
+/// windows are ignored only when overlay-shaped (containing the full rectangle of a monitor, as its
+/// capture layer does on each display; a 90% cover would also catch a maximised window, which
+/// lacks only the taskbar); its normal and maximised app window is followed like any
 /// other. Other executables are never ignored here.
 pub fn is_ignored_snipping_overlay(exe: &str, window: Rect, monitors: &[Rect]) -> bool {
-    is_ignored_exe(exe) && monitors.iter().any(|m| covers_monitor(window, *m))
+    is_ignored_exe(exe) && monitors.iter().any(|m| fills_monitor(window, *m))
 }
 
 #[cfg(test)]
