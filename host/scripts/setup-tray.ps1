@@ -41,7 +41,9 @@
 
     -AgentOnly runs just the agent install + old elevated cleanup (used by
     the tray's "Admin agent needs update" item and update-tray.ps1
-    -IncludeAgent). Both install the admin agent AND secure-desktop helper
+    -IncludeAgent, which runs it before stopping the host). Without -SourceDir
+    and without build output it uses the staged copies in -InstallDir. A
+    missing source fails before the UAC prompt. Both install the admin agent AND secure-desktop helper
     in one elevation. -SkipAgent installs neither helper
     and removes an installed one. -WhatIf previews everything (no
     elevation, nothing written). A receipt JSON is written per run to
@@ -120,6 +122,9 @@ $SendToShortcut = Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay
 if (-not $SourceDir) { $SourceDir = Join-Path $PSScriptRoot '..\target\release' }
 $SourceDir = [IO.Path]::GetFullPath($SourceDir)
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
+# -AgentOnly by hand without -SourceDir and no build output: use the staged copies in the install folder.
+if (-not $PSBoundParameters.ContainsKey('SourceDir') -and $AgentOnly -and @($PrivilegedBinaries | Where-Object { -not (Test-Path -LiteralPath (Join-Path $SourceDir $_) -PathType Leaf) }).Count -and
+    -not @($PrivilegedBinaries | Where-Object { -not (Test-Path -LiteralPath (Join-Path $InstallDir $_) -PathType Leaf) })) { $SourceDir = $InstallDir }
 $DataDir = Join-Path $env:LOCALAPPDATA 'BubblePlay'
 $HostConfigPath = Join-Path $DataDir 'host.json'
 $TraySettingsPath = Join-Path $DataDir 'tray.json'
@@ -181,8 +186,7 @@ function Test-SamePath([string]$A, [string]$B) {
 
 function Get-RunValue {
     $props = Get-ItemProperty -Path $RunKey -ErrorAction SilentlyContinue
-    if ($props -and $props.PSObject.Properties[$RunValue]) { return [string]$props.$RunValue }
-    return $null
+    if ($props -and $props.PSObject.Properties[$RunValue]) { [string]$props.$RunValue } else { $null }
 }
 
 function ConvertTo-Hex([byte[]]$Bytes) { ($Bytes | ForEach-Object { $_.ToString('X2') }) -join '' }
@@ -227,9 +231,7 @@ function Invoke-Schtasks([string[]]$Arguments) {
     return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($output | Out-String).Trim() }
 }
 
-function Test-Task([string]$Name) {
-    [bool](Get-ScheduledTask -TaskPath $TaskPath -TaskName $Name -ErrorAction SilentlyContinue)
-}
+function Test-Task([string]$Name) { [bool](Get-ScheduledTask -TaskPath $TaskPath -TaskName $Name -ErrorAction SilentlyContinue) }
 
 function Assert-InteractiveUserMatches {
     $owners = @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
@@ -363,10 +365,7 @@ function Update-HostConfig {
 function Stop-RunningTray {
     $running = @(Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
     if ($running.Count -eq 0) { Add-Step 'stop-tray' 'skipped' 'Tray is not running.'; return }
-    if (-not $PSCmdlet.ShouldProcess('bubbleplay_tray', 'Quit running tray (its host and admin agent exit with it)')) {
-        Add-Step 'stop-tray' 'planned' "Quit $($running.Count) running tray process(es); the host and admin agent exit with the tray."
-        return
-    }
+    if (-not $PSCmdlet.ShouldProcess('bubbleplay_tray', 'Quit running tray (its host and admin agent exit with it)')) { Add-Step 'stop-tray' 'planned' "Quit $($running.Count) running tray process(es); the host and admin agent exit with the tray."; return }
     $quitter = if (Test-Path -LiteralPath $TrayExe) { $TrayExe } else { $running[0].Path }
     if ($quitter) { Start-Process -FilePath $quitter -ArgumentList '--quit' -Wait -WindowStyle Hidden }
     Start-Sleep -Milliseconds 500
@@ -616,8 +615,7 @@ function Set-ProtectedDirAcl([string]$Path) {
     $acl = New-Object Security.AccessControl.DirectorySecurity
     $acl.SetOwner([Security.Principal.SecurityIdentifier]'S-1-5-32-544')
     $acl.SetAccessRuleProtection($true, $false)
-    $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-    $none = [Security.AccessControl.PropagationFlags]::None
+    $inherit = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'; $none = [Security.AccessControl.PropagationFlags]::None
     foreach ($entry in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'))) {
         $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
                 [Security.Principal.SecurityIdentifier]$entry[0], [Security.AccessControl.FileSystemRights]$entry[1],
@@ -1063,6 +1061,7 @@ try {
     }
     elseif ($AgentOnly) {
         Assert-InteractiveUserMatches
+        if (-not $SkipAgent) { foreach ($name in $PrivilegedBinaries) { if (-not (Test-Path -LiteralPath (Join-Path $SourceDir $name) -PathType Leaf)) { throw "Missing $(Join-Path $SourceDir $name): build first or pass -SourceDir." } } }
         $work = Get-MachineWork $false
         if ($work.Count -eq 0) { Add-Step 'agent' 'unchanged' 'Admin agent, secure helper, their tasks and the old elevated cleanup are already current.' }
         elseif ($IsElevated) { Invoke-MachineSteps $false }

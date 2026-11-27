@@ -54,7 +54,7 @@ Extract a newer ZIP and run from that extracted folder:
 .\update-tray.ps1 -SourceDir $PWD.Path
 ```
 
-The tray keeps the previous host for rollback. Admin input is a separate optional component; update only installs it when `-IncludeAgent` is supplied. A candidate ZIP is not an automatic updater service.
+The tray keeps the previous host for rollback. Admin input is a separate optional component; update only installs it when `-IncludeAgent` is supplied. That one UAC prompt appears first, while the old host still runs, so you can confirm it from a remote session; if it is declined or times out, nothing is changed. A candidate ZIP is not an automatic updater service.
 
 ## Remove or diagnose
 
