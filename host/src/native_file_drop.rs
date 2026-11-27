@@ -533,7 +533,7 @@ pub fn diagnostic_drop(paths: &[PathBuf], point: POINT) -> Result<NativeDropProb
                 .and_then(|v| v.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |v| v.as_millis() as u64),
             purpose: ft::Purpose::Drop,
-            batch_id: 1,
+            batch_id: format!("{:032x}", 1),
             batch_index: index as u32,
             batch_count: count,
             drop: Some(DropPoint {
@@ -1693,7 +1693,7 @@ mod tests {
             mime: "text/plain".into(),
             mtime_ms: 0,
             purpose: ft::Purpose::Drop,
-            batch_id: 1,
+            batch_id: format!("{:032x}", 1),
             batch_index: 0,
             batch_count: 1,
             drop: Some(DropPoint {

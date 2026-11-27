@@ -18,10 +18,11 @@
 //! The per-transfer state machines (`Incoming`, `SendWindow`) are shared by
 //! the host socket thread and the tests; they never touch the file system.
 
+use crate::file_control::valid_id128;
 use serde::{Deserialize, Serialize};
 
-/// `fileTransfer` capability and `protocol` value of `file-offer`.
-pub const PROTOCOL_VERSION: u8 = 1;
+/// `fileTransfer` capability and `protocol` of the sealed file messages (2: hex ids, announced batches).
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const MAGIC: [u8; 4] = *b"BPF1";
 pub const HEADER_BYTES: usize = 16;
 pub const MAX_DATA_BYTES: usize = 64 * 1024;
@@ -142,7 +143,7 @@ pub struct OfferMeta {
     pub mtime_ms: u64,
     pub purpose: Purpose,
     #[serde(rename = "batchId")]
-    pub batch_id: u32,
+    pub batch_id: String,
     #[serde(rename = "batchIndex")]
     pub batch_index: u32,
     #[serde(rename = "batchCount")]
@@ -163,10 +164,10 @@ pub struct ResultPayload {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestPayload {
     #[serde(rename = "offerId")]
-    pub offer_id: u32,
+    pub offer_id: String,
     pub id: u32,
 }
 
@@ -335,6 +336,9 @@ fn decode_control(kind: PacketType, payload: &[u8]) -> Result<Body<'static>, Rej
         PacketType::Request => {
             let request: RequestPayload =
                 serde_json::from_value(value).map_err(|_| Reject::Json)?;
+            valid_id128(&request.offer_id)
+                .then_some(())
+                .ok_or(Reject::Json)?;
             Ok(Body::Request(request))
         }
         _ => unreachable!("only control packets carry JSON"),
@@ -342,7 +346,8 @@ fn decode_control(kind: PacketType, payload: &[u8]) -> Result<Body<'static>, Rej
 }
 
 pub fn valid_offer_meta(meta: &OfferMeta) -> bool {
-    !meta.name.is_empty()
+    valid_id128(&meta.batch_id)
+        && !meta.name.is_empty()
         && meta.name.len() <= MAX_NAME_BYTES
         && meta.size <= MAX_FILE_BYTES
         && meta.mime.len() <= MAX_MIME_BYTES
@@ -628,28 +633,10 @@ pub fn collision_name(name: &str, n: u32) -> String {
     }
 }
 
-/// Signaling `file-offer` (host -> client on `/ws`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct FileOfferItem {
-    pub id: u32,
-    pub name: String,
-    pub size: u64,
-}
-
-pub fn file_offer_message(offer_id: u32, items: &[FileOfferItem], source: &str) -> String {
-    serde_json::json!({
-        "type": "file-offer",
-        "protocol": PROTOCOL_VERSION,
-        "offerId": offer_id,
-        "items": items,
-        "source": source,
-    })
-    .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_control::test_id as id;
     use serde_json::Value;
 
     fn fixture() -> Value {
@@ -791,61 +778,6 @@ mod tests {
     }
 
     #[test]
-    fn fixture_signaling_offers_parse() {
-        let contract = fixture();
-        for case in contract["signaling"]["fileOffer"].as_array().unwrap() {
-            let text = case["text"].as_str().unwrap();
-            assert_eq!(
-                valid_file_offer_text(text),
-                case["accepted"].as_bool().unwrap(),
-                "{text}"
-            );
-        }
-        let items = [FileOfferItem {
-            id: 1,
-            name: "report.pdf".into(),
-            size: 1234,
-        }];
-        let built = file_offer_message(7, &items, "clipboard");
-        assert!(valid_file_offer_text(&built));
-        assert_eq!(
-            serde_json::from_str::<Value>(&built).unwrap(),
-            serde_json::from_str::<Value>(
-                contract["signaling"]["fileOffer"][0]["text"]
-                    .as_str()
-                    .unwrap()
-            )
-            .unwrap()
-        );
-    }
-
-    /// Mirrors `valid_file_meta` in relay-rs/core/src/protocol.rs.
-    fn valid_file_offer_text(text: &str) -> bool {
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            return false;
-        };
-        let Some(items) = value["items"].as_array() else {
-            return false;
-        };
-        value["type"] == "file-offer"
-            && value["protocol"] == 1
-            && value["offerId"]
-                .as_u64()
-                .is_some_and(|id| id <= u32::MAX as u64)
-            && matches!(value["source"].as_str(), Some("clipboard" | "sendto"))
-            && items.len() <= MAX_BATCH_FILES as usize
-            && items.iter().all(|item| {
-                item["id"].as_u64().is_some_and(|id| id <= u32::MAX as u64)
-                    && item["name"]
-                        .as_str()
-                        .is_some_and(|name| !name.is_empty() && name.len() <= MAX_NAME_BYTES)
-                    && item["size"]
-                        .as_u64()
-                        .is_some_and(|size| size <= MAX_FILE_BYTES)
-            })
-    }
-
-    #[test]
     fn window_and_ack_flow_control() {
         let mut window = SendWindow::default();
         let mut sent_chunks = 0;
@@ -874,7 +806,7 @@ mod tests {
             mime: String::new(),
             mtime_ms: 0,
             purpose: Purpose::Save,
-            batch_id: 1,
+            batch_id: id(1),
             batch_index: 0,
             batch_count: 1,
             drop: None,
@@ -957,15 +889,15 @@ mod tests {
     #[test]
     fn decoder_rejects_inconsistent_control_payloads() {
         let offer = |json: &str| encode_raw(PacketType::Offer, 1, 0, json.as_bytes());
-        let ok = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#;
+        let ok = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#;
         assert!(decode(&offer(ok)).is_ok());
         for bad in [
-            r#"{"name":"","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#,
-            r#"{"name":"a","size":2147483649,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#,
-            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"open","batchId":1,"batchIndex":0,"batchCount":1}"#,
-            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":1,"batchCount":1}"#,
-            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":65}"#,
-            r#"{"name":"a","size":1.5,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"a","size":2147483649,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"open","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":1,"batchCount":1}"#,
+            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":65}"#,
+            r#"{"name":"a","size":1.5,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
             r#"[1]"#,
         ] {
             assert_eq!(decode(&offer(bad)), Err(Reject::Json), "{bad}");
@@ -1004,7 +936,7 @@ mod tests {
             mime: "image/png".into(),
             mtime_ms: 1_790_000_000_000,
             purpose: Purpose::Paste,
-            batch_id: 3,
+            batch_id: id(3),
             batch_index: 0,
             batch_count: 1,
             drop: None,
@@ -1118,9 +1050,12 @@ mod tests {
                 Packet {
                     transfer_id: 9,
                     seq: 0,
-                    body: Body::Request(RequestPayload { offer_id: 4, id: 2 }),
+                    body: Body::Request(RequestPayload {
+                        offer_id: id(4),
+                        id: 2,
+                    }),
                 },
-                serde_json::json!({"offerId": 4, "id": 2}),
+                serde_json::json!({"offerId": id(4), "id": 2}),
             ),
         ];
         for (name, packet, decoded) in cases {
@@ -1226,7 +1161,7 @@ mod tests {
                     mime: "text/plain".into(),
                     mtime_ms: 0,
                     purpose: Purpose::Save,
-                    batch_id: 1,
+                    batch_id: id(1),
                     batch_index: 0,
                     batch_count: 1,
                     drop: None,

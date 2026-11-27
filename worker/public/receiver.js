@@ -39,7 +39,7 @@ import { createSessionState } from "/session-state.js";
 import { createWssMediaSocket } from "/wss-media-socket.js";
 import { createRecoveryTracker } from "/recovery-tracker.js";
 import { createWssAudioSession } from "/wss-audio.js";
-import { FileTransferClient } from "/file-client.js";
+import { FileTransferClient, FT_PROTOCOL } from "/file-client.js";
 import { touchPc } from "/devicekey-store.js";
 import { pcListUrl, registerProof, relayOrigin, viewerHello } from "/dk-relay.js";
 import { b64u } from "/dk-crypto.js";
@@ -1092,7 +1092,7 @@ async function handleEndpointSignal(socket, generation, msg) {
       };
       sessionState.hostCapabilitiesGeneration = generation;
       // File transfer hook (3/5): all file UI stays hidden without the capability.
-      setFileTransferAvailable(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= 1);
+      setFileTransferAvailable(Number.isInteger(msg.fileTransfer) && msg.fileTransfer >= FT_PROTOCOL);
       nativeFileDropAvailable = Number.isInteger(msg.fileDrop) && msg.fileDrop >= 1;
       nativeFileDropPreviewAvailable = msg.fileDropPreview === 1 && nativeFileDropAvailable && fileUi.enabled;
       if (!nativeFileDropPreviewAvailable) fileDragPreview.cancel();
@@ -1104,9 +1104,8 @@ async function handleEndpointSignal(socket, generation, msg) {
       renderSoundSlot();
       if (sessionState.wssSelected && !sessionState.usingWssMedia) requestWssMediaStart();
       break;
-    case "file-offer":
-      fileClient.setOffer(msg);
-      break;
+    case "file-offer": fileClient.setOffer(msg); break;
+    case "file-batch-ack": fileClient.onBatchAck(msg); break;
     case "first-frame":
       handleFirstFrameMessage(msg);
       break;
@@ -3128,7 +3127,7 @@ document.addEventListener("paste", e => {
 }, true);
 // ---- file transfer (hook 5/5) ----------------------------------------------
 // Protocol and state: file-transfer.js / file-client.js; rendering: file-ui.js.
-const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl, socketTicket: () => sessionState.signalingTicket });
+const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl, socketTicket: () => sessionState.signalingTicket, sendControl: message => sendControl(message) });
 let nativeFileDropAvailable = false;
 let nativeFileDropPreviewAvailable = false;
 const fileDragPreview = createFileDragPreviewController({

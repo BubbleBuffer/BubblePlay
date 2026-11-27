@@ -130,7 +130,7 @@ pub fn validate_file_binary(side: Side, bytes: &[u8]) -> Result<FilePacket<'_>, 
                     || bounded_string(m, "error", 0, 256))
         }),
         FileKind::Request => payload_check(payload, |m| {
-            side == Side::Viewer && uint32_value(m, "offerId") && uint32_value(m, "id")
+            side == Side::Viewer && id128_value(m, "offerId") && uint32_value(m, "id")
         }),
     };
     if valid {

@@ -210,7 +210,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         buildViews()
         KeepAlive.owner = this
         clipboardManager.addPrimaryClipChangedListener(clipboardChanged)
-        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, fileListener, { viewerGrant })
+        files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, fileListener, { viewerGrant }, { session?.sendFileControl(it) ?: false })
         enterImmersive() // also sets up edge-to-edge and the cutout mode
         if (!immersive) exitImmersive()
         startSession()
@@ -1441,6 +1441,10 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         if (epoch == fileEpoch) return
         fileEpoch = epoch
         files?.epochChanged()
+    }
+
+    override fun onFileBatchAck(ack: FileWire.BatchAck) {
+        files?.onBatchAck(ack)
     }
 
     override fun onFileOffer(offer: FileWire.Offer) {

@@ -79,6 +79,8 @@ class Session(
         fun onSoundCapability(enabled: Boolean)
         /** A host `file-offer`; an empty item list withdraws it. */
         fun onFileOffer(offer: FileWire.Offer)
+        /** The host's answer to a `file-batch` announcement. */
+        fun onFileBatchAck(ack: FileWire.BatchAck) {}
         /** Follow active window: whether the host can follow (false while no capable host is known). */
         fun onFollowCapability(enabled: Boolean)
         /** The host's follow state from `monitor-list.follow`. */
@@ -385,6 +387,9 @@ class Session(
         if (followCapable) sendSig(FollowWindow.control(enabled, mediaEpoch))
     }
 
+    /** A sealed file-channel control message (`file-batch`, `file-request`); false when no session is connected. */
+    fun sendFileControl(message: JSONObject): Boolean = sendSig(message)
+
     fun requestMonitorList() = handler.post {
         sendSig(JSONObject().put("type", "media-control").put("action", "monitors").put("protocol", V4.VERSION)
             .put("epoch", mediaEpoch).put("reason", "user-refresh"))
@@ -679,7 +684,7 @@ class Session(
             // takes the PC's caps (its "opened" event) and the upload acknowledgements.
             "caps", "logs-state", "logs-ack", "feedback-ack" -> ctl.onEndpoint(msg)
             "host-capabilities" -> {
-                val files = msg.optInt("fileTransfer") >= 1
+                val files = msg.optInt("fileTransfer") >= FileWire.PROTOCOL
                 val sound = msg.optInt("audio") >= 1
                 main.post { listener.onFileCapability(files); listener.onSoundCapability(sound) }
                 followCapable = FollowWindow.capable(msg)
@@ -692,6 +697,10 @@ class Session(
             "file-offer" -> {
                 val offer = FileWire.parseOfferMessage(msg) ?: return
                 main.post { listener.onFileOffer(offer) }
+            }
+            "file-batch-ack" -> {
+                val ack = FileWire.parseBatchAck(msg) ?: return
+                main.post { listener.onFileBatchAck(ack) }
             }
             "input-capabilities" -> {
                 scancode = msg.optInt("protocol") == 1 && msg.optBoolean("scancode")
