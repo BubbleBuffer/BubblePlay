@@ -34,7 +34,7 @@ import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyN
 import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
 import { SoundController, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
-import { formatHud } from "/hud-text.js";
+import { formatHud, renderHud } from "/hud-text.js";
 import { createSessionState } from "/session-state.js";
 import { createWssMediaSocket } from "/wss-media-socket.js";
 import { createRecoveryTracker } from "/recovery-tracker.js";
@@ -686,9 +686,9 @@ function renderConnectionStatus() {
 let connectionStatusDetail = "Connecting…";
 setInterval(() => {
   if (cursorReconciler?.feedbackAt !== null && cursorReconciler?.feedbackAt !== undefined) hudState.cursorAge = Math.round(performance.now()-cursorReconciler.feedbackAt);
-  hud.innerHTML = formatHud(hudState, {
+  renderHud(hud, formatHud(hudState, {
     clientBuild, fullFrame: fullFrameDiagnostic, sharp: sharpSession.telemetry, hostQuality,
-  });
+  }));
   if (diagnosticsOutput && diagnosticsVisible) diagnosticsOutput.textContent = diagnosticsReport();
   renderConnectionStatus();
 }, 250);

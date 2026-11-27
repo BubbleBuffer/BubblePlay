@@ -13,6 +13,7 @@
 
 pub mod directory;
 pub mod gate;
+pub mod headers;
 pub mod holds;
 pub mod limits;
 pub mod log;

@@ -270,8 +270,9 @@ export function createQosPayload({ sessionId, seq, atMs, rx = {}, presentation =
 // snapshot.
 export function parseHostQuality(message) {
   const boundedInteger = (value, max) => Number.isInteger(value) && value >= 0 && value <= max ? value : null;
+  // Labels such as "720p30" or "bwe-down": letters, digits, dot, underscore and hyphen only.
   const boundedText = (value, max) => typeof value === "string" && value.length > 0 && value.length <= max &&
-    [...value].every((char) => char >= " " && char <= "~") ? value : null;
+    /^[A-Za-z0-9._-]+$/.test(value) ? value : null;
   if (!message || message.type !== "quality") return null;
   const profile = boundedText(message.profile, 32);
   const width = boundedInteger(message.width, 16_384);

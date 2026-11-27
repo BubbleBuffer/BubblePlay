@@ -22,10 +22,12 @@ When the page opens, it asks for a device key. You can:
 - unlock a protected key with its passphrase.
 
 The key file is kept in the IndexedDB database `bubbleplay-device`, exactly as created or imported; it stays the export and backup format.
-The passphrase is asked once per browser. After unlocking, the page keeps the private key in the same database as a non-extractable WebCrypto `CryptoKey`: page script can sign with it but cannot read or export it.
+The passphrase is asked once per browser. After unlocking, the page keeps the private key in the same database as a non-extractable WebCrypto `CryptoKey`, so script cannot read that copy.
 A refresh or a new tab uses that key directly, with no passphrase.
 **Lock this browser** (PC list footer, or Settings > Browser access) deletes the kept key. The next visit asks for the passphrase again.
 Importing or creating a key, or changing its passphrase, also deletes it.
+
+The key file text in IndexedDB is a different matter: without a passphrase it contains the plain private seed, and any script running on the page origin can read it from there. Set a passphrase on every key; a passphrase-protected file holds the seed only encrypted.
 
 The browser profile holds the kept key on disk. Anyone who can copy that profile can use the key in that browser until it is locked or revoked on the PC.
 

@@ -214,50 +214,7 @@
   <button id="first-frame-retry" type="button">Retry stream</button>
   <button id="secure-deny" type="button" hidden>Deny prompt</button>
 </div>
-<script>
-(() => {
-  "use strict";
-  const search = new URLSearchParams(location.search);
-  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  const suppliedAttemptId = search.get("debugAttempt") || "";
-  const attemptId = uuid.test(suppliedAttemptId)
-    ? suppliedAttemptId.toLowerCase()
-    : crypto.randomUUID();
-  const state = {
-    attemptId,
-    seq: 0,
-  };
-  const normalizeDetail = detail => Object.fromEntries(Object.entries(detail || {}).slice(0, 16).map(([key, value]) => {
-    if (Array.isArray(value)) return [key, value.slice(0, 16).map(item => typeof item === "string" ? item.slice(0, 512) : item)];
-    if (typeof value === "string") return [key, value.slice(0, 512)];
-    return [key, value ?? null];
-  }));
-  // Page-start events go to the local browser log (dk-log.js, loaded first). Errors and
-  // rejections are captured by that script itself.
-  const trace = (stage, detail = {}) => {
-    try {
-      window.BPLog?.info("trace", stage, { attempt: state.attemptId, seq: ++state.seq, ...normalizeDetail(detail) });
-    } catch { /* tracing never breaks the page */ }
-  };
-  window.__bubbleplayDebugTrace = {
-    attemptId: state.attemptId,
-    trace,
-  };
-  // navigate | reload | back_forward | prerender: tells a manual reload from a recovery restart.
-  const navigationType = () => {
-    try {
-      const type = window.performance?.getEntriesByType?.("navigation")?.[0]?.type;
-      return typeof type === "string" ? type : null;
-    } catch { return null; }
-  };
-  trace("bootstrap-inline", {
-    pathname: location.pathname,
-    navigation: navigationType(),
-    transport: search.get("transport") || "auto",
-    decoderPath: search.get("decoderPath") || "native",
-  });
-})();
-</script>
+<script src="/dk-bootstrap.js"></script>
 <script type="module" src="/dk-app.js"></script>
 </body>
 </html>

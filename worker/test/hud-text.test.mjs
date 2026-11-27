@@ -15,3 +15,19 @@ test("HUD has one line per group and the quality line reflects the host report",
   assert.equal(formatQuality(quality), "quality balanced 1280x720@60 8000k/… bwe");
   assert.equal(formatQuality({ ...quality, bweBps: 6_500_000 }), "quality balanced 1280x720@60 8000k/6500k bwe");
 });
+
+test("host-supplied quality strings never become markup in the HUD", async () => {
+  const { parseHostQuality } = await import("../public/latency.js");
+  const { renderHud } = await import("../public/hud-text.js");
+  const { readFileSync } = await import("node:fs");
+  const evil = "<img src=x onerror=alert(1)>";
+  const base = { type: "quality", profile: "720p30", width: 1280, height: 720, fps: 30, targetBitrateBps: 3_000_000, bweBps: null, reason: "bwe" };
+  assert.equal(parseHostQuality({ ...base, profile: evil }), null);
+  assert.equal(parseHostQuality({ ...base, reason: evil }), null);
+  assert.ok(parseHostQuality({ ...base, profile: "480p24", reason: "bwe-down" }));
+  // Even a value that got past the parser is only assigned as text.
+  const element = { textContent: "", set innerHTML(_) { throw new Error("HUD must not parse markup"); } };
+  renderHud(element, formatHud(counters, { ...extra, hostQuality: { ...base, profile: evil, reason: evil } }));
+  assert.ok(element.textContent.includes(evil));
+  assert.doesNotMatch(readFileSync(new URL("../public/receiver.js", import.meta.url), "utf8"), /hud\.innerHTML/);
+});

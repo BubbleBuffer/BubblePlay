@@ -48,8 +48,9 @@ impl crate::PcRelay {
     /// Every request the Worker forwards here: a WebSocket upgrade on one of the seven routes, and
     /// the front object's internal delete. The gate ran in the front object or the Worker.
     pub(crate) async fn on_fetch(&self, req: Request) -> Result<Response> {
+        let https = req.url().is_ok_and(|url| url.scheme() == "https");
         let response = self.route(req).await?;
-        http::finish(response)
+        http::finish(response, https)
     }
 
     async fn route(&self, req: Request) -> Result<Response> {

@@ -22,3 +22,8 @@ export function formatHud(h, extra) {
     formatQuality(extra.hostQuality),
   ].join("\n");
 }
+
+// The HUD is host-influenced text: it is only ever assigned as text, never parsed as markup.
+export function renderHud(element, text) {
+  if (element.textContent !== text) element.textContent = text;
+}
