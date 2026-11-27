@@ -131,6 +131,9 @@ fn a_request_is_served_only_for_an_item_the_viewer_asked_for_over_control() {
             path: file,
             name: "offered.bin".into(),
             size: 6,
+            mime: "application/octet-stream".into(),
+            mtime_ms: 0,
+            sha256: [0; 32],
         }],
     );
     let offer_id = lock(&shared).offer.as_ref().unwrap().id.clone();
