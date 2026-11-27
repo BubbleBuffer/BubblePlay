@@ -55,7 +55,9 @@ void main() {
       await tester.enterText(find.byType(EditableText), 'pw');
       await tester.pump();
       await tester.tap(find.text('Export').last);
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
       expect(app.channel.exportPassphrases, ['pw']);
       expect(
         app.keyFiles.saved['bubbleplay-device-key.bpkey'],
