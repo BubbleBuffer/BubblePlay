@@ -1107,6 +1107,7 @@ async function handleEndpointSignal(socket, generation, msg) {
     case "file-offer":
       fileClient.setOffer(msg);
       break;
+    case "file-batch-ack": fileClient.onBatchAck(msg); break;
     case "first-frame":
       handleFirstFrameMessage(msg);
       break;
@@ -3128,7 +3129,7 @@ document.addEventListener("paste", e => {
 }, true);
 // ---- file transfer (hook 5/5) ----------------------------------------------
 // Protocol and state: file-transfer.js / file-client.js; rendering: file-ui.js.
-const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl, socketTicket: () => sessionState.signalingTicket });
+const fileClient = new FileTransferClient({ socketUrl: fileSocketUrl, socketTicket: () => sessionState.signalingTicket, sendControl: message => sendControl(message) });
 let nativeFileDropAvailable = false;
 let nativeFileDropPreviewAvailable = false;
 const fileDragPreview = createFileDragPreviewController({

@@ -33,6 +33,12 @@ const encoder = new TextEncoder();
 const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 
 function uint32(value) { return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff; }
+/** Batch and offer ids: 32 lowercase hex digits (128 random bits). */
+export function validId128(value) { return typeof value === "string" && /^[0-9a-f]{32}$/.test(value); }
+export function randomId128() {
+  return bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+}
+export function bytesToHex(bytes) { return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join(""); }
 function utf8Bytes(text) { return encoder.encode(text).byteLength; }
 
 function bytesOf(value) {
@@ -103,7 +109,7 @@ export function validOfferMeta(meta) {
     Number.isSafeInteger(meta.mtimeMs) && meta.mtimeMs >= 0 &&
     (meta.purpose === "save" || meta.purpose === "paste" || meta.purpose === "drop") &&
     (meta.purpose === "drop" ? validDropPoint(meta.drop) : meta.drop === undefined) &&
-    uint32(meta.batchId) &&
+    validId128(meta.batchId) &&
     Number.isInteger(meta.batchCount) && meta.batchCount >= 1 && meta.batchCount <= FT_MAX_BATCH_FILES &&
     Number.isInteger(meta.batchIndex) && meta.batchIndex >= 0 && meta.batchIndex < meta.batchCount;
 }
@@ -117,7 +123,7 @@ function validControlPayload(type, json) {
       return typeof json.ok === "boolean" &&
         (json.error === undefined || json.error === null ||
          (typeof json.error === "string" && utf8Bytes(json.error) <= FT_MAX_REASON_BYTES));
-    case FT.REQUEST: return uint32(json.offerId) && uint32(json.id);
+    case FT.REQUEST: return validId128(json.offerId) && uint32(json.id);
     default: return false;
   }
 }
@@ -163,10 +169,33 @@ export function encodeResult(transferId, ok, error) {
 }
 export function encodeRequest(transferId, offerId, id) { return jsonPacket(FT.REQUEST, transferId, { offerId, id }); }
 
+/**
+ * Sealed control message announcing an upload batch before its OFFER packets. `files` is
+ * `[{ name, size, sha256 (hex) }]`; `drop` only for purpose "drop". The host accepts the batch's
+ * OFFER packets only when they match this announcement.
+ */
+export function fileBatchMessage(batchId, purpose, files, drop) {
+  return {
+    type: "file-batch", protocol: 1, batchId, purpose,
+    ...(drop !== undefined ? { drop: { x: drop.x, y: drop.y, generation: drop.generation, viewportRevision: drop.viewportRevision } } : {}),
+    files: files.map(file => ({ name: file.name, size: file.size, sha256: file.sha256 })),
+  };
+}
+
+/** Sealed control message asking the PC for items of its current offer (before the REQUEST packet). */
+export function fileRequestMessage(offerId, ids) { return { type: "file-request", protocol: 1, offerId, ids }; }
+
+/** Validates the host's `file-batch-ack` control message. */
+export function validBatchAck(message) {
+  return plainObject(message) && message.type === "file-batch-ack" && message.protocol === 1 &&
+    validId128(message.batchId) && typeof message.ok === "boolean" &&
+    (message.error === undefined || (typeof message.error === "string" && message.error.length <= 64));
+}
+
 /** Validates host -> client `file-offer` signaling text. */
 export function validFileOffer(message) {
   return plainObject(message) && message.type === "file-offer" && message.protocol === 1 &&
-    uint32(message.offerId) && (message.source === "clipboard" || message.source === "sendto") &&
+    validId128(message.offerId) && (message.source === "clipboard" || message.source === "sendto") &&
     Array.isArray(message.items) && message.items.length <= FT_MAX_BATCH_FILES &&
     message.items.every(item => plainObject(item) && uint32(item.id) &&
       typeof item.name === "string" && item.name.length > 0 && utf8Bytes(item.name) <= FT_MAX_NAME_BYTES &&

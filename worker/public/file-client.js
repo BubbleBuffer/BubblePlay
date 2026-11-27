@@ -4,7 +4,10 @@
 // Intent: docs/architecture/file-transfer.md; wire: fixtures/file-transfer-contract.json.
 //
 // API (FileTransferClient extends EventTarget, fires "change"):
-//   new FileTransferClient({ socketUrl, socketTicket })   callbacks -> URL / optional session ticket
+//   new FileTransferClient({ socketUrl, socketTicket, sendControl })   callbacks -> URL / optional session ticket / sealed control send
+//   client.onBatchAck(message)              control `file-batch-ack` from the PC
+//   Every upload batch is hashed and announced over the sealed control channel (`file-batch`) before its
+//   OFFER packets; every download is asked for there (`file-request`) before its REQUEST packet.
 //   client.transfers                        snapshot rows (see snapshot())
 //   client.offer                            { offerId, items, source } | null
 //   client.setOffer(fileOfferMessage)       signaling `file-offer` (items [] withdraws)
@@ -17,10 +20,13 @@ import {
   FT_ACK_EVERY_BYTES, FT_ACK_EVERY_MS, FT_BLOB_DOWNLOAD_MAX_BYTES, FT_WINDOW_BYTES,
   FileIncoming, FileSendWindow, Sha256, decodeFilePacket, encodeAccept, encodeAck, encodeCancel, encodeData,
   encodeDone, encodeOffer, encodeRequest, encodeResult, validDropPoint, validFileOffer, validOfferMeta,
+  bytesToHex, fileBatchMessage, fileRequestMessage, randomId128, validBatchAck,
 } from "./file-transfer.js";
 
 const PING_MS = 15_000;
 const PEER_WAIT_MS = 10_000;
+/** How long the PC may take to admit an announced batch. */
+const BATCH_ACK_WAIT_MS = 10_000;
 const READ_BLOCK_BYTES = 1024 * 1024;
 /** Keep at most this much queued in the browser's socket buffer. */
 const SOCKET_BUFFER_BYTES = 2 * 1024 * 1024;
@@ -40,10 +46,12 @@ export function describeFileError(code) {
     case "write-failed": return "The PC could not save the file.";
     case "unreadable": return "The PC could not read the file.";
     case "unknown-offer": return "The PC no longer offers this file.";
+    case "unannounced": case "duplicate-batch": return "The PC did not accept this transfer. Try again.";
+    case "unauthorized": return "The PC did not authorize this download. Try again.";
     case "offer-replaced": return "The PC replaced these files. Try again.";
     case "window-exceeded": return "The PC sent more file data than the browser could save; the transfer was stopped.";
     case "timeout": return "The transfer stalled.";
-    case "no-peer": return "The PC is not ready for files. Try again in a moment.";
+    case "no-peer": case "not-ready": return "The PC is not ready for files. Try again in a moment.";
     case "disconnected": return "The connection dropped; the transfer was stopped.";
     case "too-many": return "More than 64 files in one go.";
     case "blob-too-large": return "Over 256 MB: this browser can only save it with Chrome or Edge on a computer.";
@@ -66,8 +74,11 @@ export function describeFileError(code) {
 }
 
 export class FileTransferClient extends EventTarget {
-  constructor({ socketUrl, socketTicket = () => null, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() } = {}) {
+  constructor({ socketUrl, socketTicket = () => null, sendControl = () => false, WebSocketImpl = globalThis.WebSocket, now = () => Date.now() } = {}) {
     super();
+    this.sendControl = sendControl;
+    this.batchAcks = new Map();
+    this.announcing = new Map();
     this.socketUrl = socketUrl;
     this.socketTicket = socketTicket;
     this.WebSocketImpl = WebSocketImpl;
@@ -119,7 +130,7 @@ export class FileTransferClient extends EventTarget {
       else if (!(file?.size <= FT_MAX_FILE_BYTES)) this.fail(row, "too-large");
       else { row.file = file; accepted.push(row); }
     }
-    const batchId = (crypto.getRandomValues(new Uint32Array(1))[0] || 1) >>> 0;
+    const batchId = randomId128();
     accepted.forEach((row, index) => {
       row.meta = {
         name: safeName(row.name), size: row.size, mime: (row.file.type || "").slice(0, 255),
@@ -184,6 +195,8 @@ export class FileTransferClient extends EventTarget {
 
   reset(reason = "disconnected") {
     this.currentOffer = null;
+    this.announcing.clear();
+    this.batchAcks.clear();
     for (const row of this.rows) if (!TERMINAL.has(row.state)) this.finish(row, "failed", reason);
     this.closeSocket();
     this.changed();
@@ -371,6 +384,7 @@ export class FileTransferClient extends EventTarget {
   }
 
   async runUpload(row) {
+    await this.ensureAnnounced(row);
     await this.offerUpload(row);
     await this.until(row, () => row.accepted);
     await this.sendUpload(row);
@@ -378,6 +392,7 @@ export class FileTransferClient extends EventTarget {
   }
 
   async runDropBatch(batch) {
+    await this.ensureAnnounced(batch[0]);
     // Publish the complete descriptor set before any file contents, so Windows
     // can start the virtual drag while the bounded upload is still in progress.
     for (const row of batch) await this.offerUpload(row);
@@ -387,6 +402,60 @@ export class FileTransferClient extends EventTarget {
       await this.sendUpload(row);
     }
     for (const row of batch) await this.completeUpload(row);
+  }
+
+  /** The PC's `file-batch-ack` control message. */
+  onBatchAck(message) {
+    if (!validBatchAck(message)) return false;
+    this.batchAcks.set(message.batchId, { ok: message.ok, error: message.error ?? null });
+    this.wake();
+    return true;
+  }
+
+  /**
+   * Announce the batch of `row` over the sealed control channel (names, sizes, SHA-256) and wait
+   * until the PC admits it; the PC accepts nothing on the file socket that this does not describe.
+   * A batch that cannot be announced fails as a whole.
+   */
+  async ensureAnnounced(row) {
+    const batchId = row.meta.batchId;
+    if (!this.announcing.has(batchId)) {
+      const rows = this.rows.filter(candidate => candidate.direction === "upload" && candidate.meta?.batchId === batchId && !TERMINAL.has(candidate.state));
+      rows.forEach((member, index) => { member.meta.batchIndex = index; member.meta.batchCount = rows.length; });
+      this.announcing.set(batchId, this.announceBatch(rows).catch(error => {
+        for (const member of rows) if (!TERMINAL.has(member.state)) this.fail(member, error instanceof TransferAborted ? "cancelled" : (error?.code || "disconnected"));
+        throw error;
+      }));
+    }
+    try { await this.announcing.get(batchId); } catch { throw new TransferAborted(); }
+  }
+
+  async announceBatch(rows) {
+    const [first] = rows;
+    const files = [];
+    for (const member of rows) files.push({ name: member.meta.name, size: member.size, sha256: bytesToHex(await this.hashFile(member)) });
+    if (rows.some(member => TERMINAL.has(member.state))) throw new TransferAborted();
+    if (!this.sendControl(fileBatchMessage(first.meta.batchId, first.purpose, files, first.meta.drop))) {
+      throw Object.assign(new Error("no-peer"), { code: "no-peer" });
+    }
+    let timer;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error("timeout"), { code: "timeout" })), BATCH_ACK_WAIT_MS); });
+    const ack = await Promise.race([this.until(first, () => this.batchAcks.get(first.meta.batchId)), timeout]).finally(() => clearTimeout(timer));
+    this.batchAcks.delete(first.meta.batchId);
+    if (!ack.ok) throw Object.assign(new Error(ack.error || "failed"), { code: ack.error || "failed" });
+  }
+
+  async hashFile(row) {
+    const hash = new Sha256();
+    let read = 0;
+    for (let offset = 0; offset < row.size; offset += READ_BLOCK_BYTES) {
+      const block = new Uint8Array(await row.file.slice(offset, Math.min(row.size, offset + READ_BLOCK_BYTES)).arrayBuffer());
+      if (TERMINAL.has(row.state)) throw new TransferAborted();
+      hash.update(block);
+      read += block.byteLength;
+    }
+    if (read !== row.size) throw Object.assign(new Error("size-mismatch"), { code: "size-mismatch" });
+    return hash.finish();
   }
 
   async offerUpload(row) {
@@ -487,6 +556,8 @@ export class FileTransferClient extends EventTarget {
     row.lastAckAt = this.now();
     row.doneHash = null;
     row.writeError = null;
+    // Asked for over the sealed control channel first: the PC serves only what the viewer requested.
+    if (!this.sendControl(fileRequestMessage(row.offerId, [row.itemId]))) throw Object.assign(new Error("disconnected"), { code: "disconnected" });
     this.sendBinary(encodeRequest(row.transferId, row.offerId, row.itemId));
     await this.until(row, () => row.incoming);
     row.state = "active";
@@ -520,7 +591,7 @@ export class FileTransferClient extends EventTarget {
     switch (packet.type) {
       case FT.OFFER: {
         const meta = packet.json;
-        if (row.incoming || !validOfferMeta(meta) || meta.size !== row.size) {
+        if (row.incoming || !validOfferMeta(meta) || meta.size !== row.size || meta.batchId !== row.offerId) {
           this.sendBinary(encodeCancel(row.transferId, "unexpected"));
           this.fail(row, "unexpected");
           return;

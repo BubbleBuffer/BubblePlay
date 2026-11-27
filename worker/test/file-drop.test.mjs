@@ -9,7 +9,7 @@ import { createFileDragPreviewController, installFileTransferUi, largeDropStatus
 // receiver.js now reports to monitor-previews.js; these vm contexts do not exercise it.
 const noMonitorPreviews = { reset() {}, onFirstFrame() {}, onMonitorList() {}, onMessage() {} };
 
-const meta = { name: "a.txt", size: 3, mime: "text/plain", mtimeMs: 0, purpose: "drop", batchId: 1, batchIndex: 0, batchCount: 1, drop: { x: 65535, y: 0, generation: 7, viewportRevision: 3 } };
+const meta = { name: "a.txt", size: 3, mime: "text/plain", mtimeMs: 0, purpose: "drop", batchId: "00000000000000000000000000000001", batchIndex: 0, batchCount: 1, drop: { x: 65535, y: 0, generation: 7, viewportRevision: 3 } };
 test("drop metadata requires bounded q16 coordinates; legacy purposes remain unchanged", () => {
   assert.deepEqual(decodeFilePacket(encodeOffer(1, meta)).json, meta);
   for (const drop of [null, undefined, { x: 65536, y: 0 }, { x: 0, y: -1 }, { x: 0.5, y: 0 }, { x: 0 }]) assert.equal(validOfferMeta({ ...meta, drop }), false);

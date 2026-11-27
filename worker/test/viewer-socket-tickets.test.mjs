@@ -316,7 +316,7 @@ test("file hello reads the current ticket callback without exposing it in snapsh
     }
   } finally { client.reset(); }
   assert.equal(sent.length, 2);
-  assert.match(source, /new FileTransferClient\(\{ socketUrl: fileSocketUrl, socketTicket: \(\) => sessionState\.signalingTicket \}\)/);
+  assert.match(source, /new FileTransferClient\(\{ socketUrl: fileSocketUrl, socketTicket: \(\) => sessionState\.signalingTicket, sendControl: message => sendControl\(message\) \}\)/);
 });
 
 test("diagnostic snapshots, reports, telemetry and HUD do not read or spread credentials", () => {

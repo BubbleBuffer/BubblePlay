@@ -28,7 +28,7 @@ test("a picker-open offer replacement or withdrawal shows an error and downloads
         return new Promise(resolve => { finishPicker = resolve; });
       };
       const client = new FileTransferClient({ socketUrl: () => "wss://x", WebSocketImpl: class { constructor() { socketCalls++; } } });
-      const offer = { type: "file-offer", protocol: 1, offerId: 1, source: "clipboard", items: [{ id: 1, name: "original.txt", size: 1 }] };
+      const offer = { type: "file-offer", protocol: 1, offerId: "00000000000000000000000000000001", source: "clipboard", items: [{ id: 1, name: "original.txt", size: 1 }] };
       client.setOffer(offer);
       const parts = new Map();
       const root = { hidden: true, querySelector(selector) { if (!parts.has(selector)) parts.set(selector, element()); return parts.get(selector); } };
@@ -38,7 +38,7 @@ test("a picker-open offer replacement or withdrawal shows an error and downloads
       ui.setEnabled(true);
       const click = parts.get("[data-file-offer-download]").onclick({ stopPropagation() {} });
       assert.deepEqual(pickerCalls, [{ suggestedName: "original.txt" }]);
-      client.setOffer({ ...offer, offerId: 2, items: replacementItems });
+      client.setOffer({ ...offer, offerId: "00000000000000000000000000000002", items: replacementItems });
       finishPicker({ createWritable() { writableCalls++; throw new Error("stale offer must not open a sink"); } });
       await click;
       assert.equal(errors.length, 1);
@@ -72,7 +72,7 @@ test("an unchanged picker offer downloads its captured id and hides its chip", a
   globalThis.showSaveFilePicker = async () => ({ createWritable() { throw new Error("only sink selection is tested"); } });
   try {
     const client = new EventTarget();
-    client.offer = { offerId: 7, items: [{ id: 3, name: "a.txt", size: 1 }] };
+    client.offer = { offerId: "00000000000000000000000000000007", items: [{ id: 3, name: "a.txt", size: 1 }] };
     client.transfers = [];
     const downloads = [];
     client.download = (...args) => { downloads.push(args); client.dispatchEvent(new Event("change")); };
@@ -85,7 +85,7 @@ test("an unchanged picker offer downloads its captured id and hides its chip", a
     assert.equal(downloads.length, 1);
     assert.deepEqual(downloads[0][0], client.offer.items);
     assert.equal(typeof downloads[0][1], "function");
-    assert.equal(downloads[0][2], 7);
+    assert.equal(downloads[0][2], "00000000000000000000000000000007");
     assert.equal(parts.get("[data-file-offer]").hidden, true);
     ui.setEnabled(false);
   } finally {

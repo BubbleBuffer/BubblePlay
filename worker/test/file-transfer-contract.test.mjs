@@ -49,3 +49,20 @@ test("every rejected contract packet fails with the contract's reason", () => {
     assert.deepEqual(ft.decodeFilePacket(message), { ok: false, reason: bad.reason }, bad.name);
   }
 });
+
+test("sealed file control messages the browser builds and accepts match the contract", () => {
+  const { fileOffer, fileBatch, fileBatchAck, fileRequest } = contract.signaling;
+  for (const { text, accepted } of fileOffer) assert.equal(ft.validFileOffer(JSON.parse(text)), accepted, text);
+  for (const { text, ok, error } of fileBatchAck.cases) {
+    const message = JSON.parse(text);
+    assert.equal(ft.validBatchAck(message), true, text);
+    assert.deepEqual([message.ok, message.error], [ok, error]);
+  }
+  const batch = JSON.parse(fileBatch.cases[1].text);
+  assert.deepEqual(ft.fileBatchMessage(batch.batchId, batch.purpose, batch.files, batch.drop), batch);
+  const paste = JSON.parse(fileBatch.cases[0].text);
+  assert.deepEqual(ft.fileBatchMessage(paste.batchId, paste.purpose, paste.files), paste);
+  const request = JSON.parse(fileRequest.cases[0].text);
+  assert.deepEqual(ft.fileRequestMessage(request.offerId, request.ids), request);
+  assert.ok(ft.validId128(ft.randomId128()));
+});
