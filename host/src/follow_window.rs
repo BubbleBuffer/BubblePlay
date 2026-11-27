@@ -384,38 +384,8 @@ pub fn is_ignored_class(class: &str) -> bool {
     is_shell_class(class) || class == GHOST_CLASS
 }
 
-/// Executables whose windows the rules ignore: the Snipping Tool's capture and editor windows
-/// (not shell classes, and not always wide enough to count as a screen-wide overlay), compared
-/// case-insensitively.
-const IGNORED_EXES: [&str; 2] = ["SnippingTool.exe", "ScreenClippingHost.exe"];
-
-/// Whether a window of the executable `exe` is ignored by following.
-pub fn is_ignored_exe(exe: &str) -> bool {
-    IGNORED_EXES.iter().any(|e| e.eq_ignore_ascii_case(exe))
-}
-
-/// A window that covers (nearly) all of at least two monitors is a screen-wide overlay, such as
-/// the Snipping Tool's capture layer, not a window living on one monitor. Following it would jump
-/// monitors, so it is ignored like a shell window.
-pub fn spans_multiple_monitors(window: Rect, monitors: &[Rect]) -> bool {
-    fn area(r: Rect) -> i64 {
-        i64::from((r.right - r.left).max(0)) * i64::from((r.bottom - r.top).max(0))
-    }
-    monitors
-        .iter()
-        .filter(|m| {
-            let overlap = Rect {
-                left: window.left.max(m.left),
-                top: window.top.max(m.top),
-                right: window.right.min(m.right),
-                bottom: window.bottom.min(m.bottom),
-            };
-            let monitor_area = area(**m);
-            monitor_area > 0 && area(overlap) * 10 >= monitor_area * 9
-        })
-        .count()
-        >= 2
-}
+mod overlay;
+pub use overlay::{is_ignored_exe, is_ignored_snipping_overlay, spans_multiple_monitors};
 
 /// The desktop rectangle of every attached monitor.
 fn monitor_rects() -> Vec<Rect> {
@@ -506,24 +476,22 @@ pub fn sample_foreground() -> Sample {
             return Sample::Ignored;
         }
         let details = details_of(hwnd, class);
-        if is_ignored_exe(&details.exe) {
-            return Sample::Ignored;
-        }
         let mut window_rect = windows::Win32::Foundation::RECT::default();
-        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window_rect).is_ok()
-            && spans_multiple_monitors(
-                Rect {
-                    left: window_rect.left,
-                    top: window_rect.top,
-                    right: window_rect.right,
-                    bottom: window_rect.bottom,
-                },
-                &monitor_rects(),
-            )
-        {
-            // Ignored, so the current pair stays handled: coming back to the previous window
-            // does not switch either.
-            return Sample::Ignored;
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window_rect).is_ok() {
+            let rect = Rect {
+                left: window_rect.left,
+                top: window_rect.top,
+                right: window_rect.right,
+                bottom: window_rect.bottom,
+            };
+            let monitors = monitor_rects();
+            if spans_multiple_monitors(rect, &monitors)
+                || is_ignored_snipping_overlay(&details.exe, rect, &monitors)
+            {
+                // Ignored, so the current pair stays handled: coming back to the previous
+                // window does not switch either.
+                return Sample::Ignored;
+            }
         }
         let Some(monitor) = monitor_of(hwnd) else {
             return Sample::Ignored;
@@ -712,35 +680,6 @@ mod tests {
     }
 
     #[test]
-    fn spanning_overlay_is_not_a_window_on_one_monitor() {
-        let left = Rect::new(0, 0, 1920, 1080);
-        let right = Rect::new(1920, 0, 2560, 1440);
-        let monitors = [left, right];
-        // A full virtual-screen overlay.
-        assert!(spans_multiple_monitors(
-            Rect::new(0, 0, 4480, 1440),
-            &monitors
-        ));
-        // Normal windows, maximised or straddling an edge, are not.
-        assert!(!spans_multiple_monitors(
-            Rect::new(1920, 0, 2560, 1440),
-            &monitors
-        ));
-        assert!(!spans_multiple_monitors(
-            Rect::new(1500, 100, 1000, 800),
-            &monitors
-        ));
-        assert!(!spans_multiple_monitors(
-            Rect::new(100, 100, 800, 600),
-            &monitors
-        ));
-        assert!(!spans_multiple_monitors(
-            Rect::new(0, 0, 4480, 1440),
-            &[left]
-        ));
-    }
-
-    #[test]
     fn overlay_does_not_switch_and_returning_to_the_previous_window_does_not_either() {
         let t = Instant::now();
         let mut f = FollowWindow::default();
@@ -919,20 +858,6 @@ mod tests {
         }
         for class in ["ghost", "GhostWindow", "Notepad", "Chrome_WidgetWin_1", ""] {
             assert!(!is_ignored_class(class), "{class}");
-        }
-    }
-
-    #[test]
-    fn snipping_tool_windows_are_ignored() {
-        for exe in [
-            "SnippingTool.exe",
-            "snippingtool.EXE",
-            "ScreenClippingHost.exe",
-        ] {
-            assert!(is_ignored_exe(exe), "{exe}");
-        }
-        for exe in ["", "Notepad.exe", "SnippingTool.exe.bak", "explorer.exe"] {
-            assert!(!is_ignored_exe(exe), "{exe}");
         }
     }
 

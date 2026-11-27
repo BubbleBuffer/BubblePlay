@@ -76,7 +76,7 @@
   "host/src/feedback_store.rs": 588,
   "host/src/file_service.rs": 2283,
   "host/src/file_transfer.rs": 1269,
-  "host/src/follow_window.rs": 1224,
+  "host/src/follow_window.rs": 1149,
   "host/src/host_benchmark.rs": 570,
   "host/src/host_capture.rs": 1175,
   "host/src/host_encode.rs": 915,
