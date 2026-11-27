@@ -3,6 +3,7 @@
 .SYNOPSIS
 Build and verify a public Windows tray release ZIP from an explicit allowlist.
 .DESCRIPTION
+Writes the ZIP and a SHA256SUMS file beside it.
 Does not build, download, install, elevate, sign, or restart anything. Extra
 source files are ignored. Existing output is preserved unless -Overwrite is
 explicit. Supply public quickstart/notices; licensing is a separate decision.
@@ -205,7 +206,15 @@ try {
         [IO.File]::Replace($temporary, $destination, $backup)
         Remove-Item -LiteralPath $backup -Force
     } else { [IO.File]::Move($temporary, $destination) }
-    [pscustomobject]@{ path = $destination; sha256 = Get-FileHashValue $destination; entries = $entries.Count; version = $Version }
+    # SHA256SUMS next to the ZIP, in `sha256sum` format, for every release ZIP in the folder, so a
+    # download can be checked against the published list: sha256sum -c SHA256SUMS (Linux, macOS,
+    # Git Bash) or Get-FileHash on Windows. Rewritten on every run; it lists the ZIPs present.
+    $sumsPath = Join-Path $OutputDir 'SHA256SUMS'
+    $zipNames = [string[]]@(Get-ChildItem -LiteralPath $OutputDir -File -Filter 'BubblePlay-*-windows-x64.zip' | ForEach-Object { $_.Name })
+    [Array]::Sort($zipNames, [StringComparer]::Ordinal)
+    $sumLines = @($zipNames | ForEach-Object { '{0} *{1}' -f (Get-FileHashValue (Join-Path $OutputDir $_)), $_ })
+    [IO.File]::WriteAllText($sumsPath, (($sumLines -join "`n") + "`n"), $utf8)
+    [pscustomobject]@{ path = $destination; sha256 = Get-FileHashValue $destination; entries = $entries.Count; version = $Version; sumsPath = $sumsPath }
 }
 finally {
     if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }

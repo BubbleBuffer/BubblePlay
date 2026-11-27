@@ -214,6 +214,26 @@ fn delete_persists_first_and_closes_only_that_pcs_hosts() {
 }
 
 #[test]
+fn delete_also_closes_the_viewer_sockets_of_that_pc_only() {
+    let mut h = Harness::new();
+    let a = identity(1);
+    let b = identity(2);
+    let (host_a, _) = h.register_host(&a, Some(TOKEN));
+    let (host_b, _) = h.register_host(&b, Some(TOKEN));
+    let viewer_a = h.open_viewer(&host_a.pc).id;
+    let viewer_b = h.open_viewer(&host_b.pc).id;
+
+    let out = h.relay.delete_pc(&host_a.pc).expect("deleted");
+    assert_eq!(
+        closed(&out, viewer_a),
+        Some((1008, "peer removed".to_owned())),
+        "the removed PC's viewer must not keep its socket"
+    );
+    assert_eq!(closed(&out, viewer_b), None);
+    assert_eq!(closed(&out, host_b.id), None);
+}
+
+#[test]
 fn delete_rejects_a_non_device_id() {
     let mut h = Harness::new();
     assert!(matches!(

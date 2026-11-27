@@ -110,14 +110,6 @@ impl Route {
     pub(crate) fn needs_viewer(self) -> bool {
         matches!(self, Route::Ws | Route::MediaWs | Route::FileWs)
     }
-
-    /// True for the routes a PC's host sockets use (deleted with the PC).
-    pub(crate) fn is_host_socket(self) -> bool {
-        matches!(
-            self,
-            Route::HostWs | Route::HostVersionWs | Route::HostMediaWs | Route::HostFileWs
-        )
-    }
 }
 
 /// Key of the socket that is the current peer for one role. Signal keys have an

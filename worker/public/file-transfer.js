@@ -1,4 +1,4 @@
-// File transfer protocol v2 (hex ids, announced batches), used by the web receiver; the Rust relay
+// File transfer protocol v3 (hex ids, announced batches, sealed download hashes), used by the web receiver; the Rust relay
 // (relay-rs/core/src/protocol.rs) validates the same messages. Intent and wire contract: docs/architecture/file-transfer.md. Shared
 // vectors: fixtures/file-transfer-contract.json (also tested from Rust in
 // host/src/file_transfer.rs and from Kotlin).
@@ -8,7 +8,7 @@
 //   transferId u32 LE | seq u32 LE (DATA chunk index, otherwise 0)
 
 /** `protocol` of the sealed file messages and the `fileTransfer` capability a host must advertise. */
-export const FT_PROTOCOL = 2;
+export const FT_PROTOCOL = 3;
 export const FT_MAGIC = [0x42, 0x50, 0x46, 0x31];
 export const FT_HEADER_BYTES = 16;
 export const FT_MAX_DATA_BYTES = 64 * 1024;
@@ -209,8 +209,13 @@ export function validFileOffer(message) {
     Array.isArray(message.items) && message.items.length <= FT_MAX_BATCH_FILES &&
     message.items.every(item => plainObject(item) && uint32(item.id) &&
       typeof item.name === "string" && item.name.length > 0 && utf8Bytes(item.name) <= FT_MAX_NAME_BYTES &&
-      Number.isSafeInteger(item.size) && item.size >= 0 && item.size <= FT_MAX_FILE_BYTES);
+      Number.isSafeInteger(item.size) && item.size >= 0 && item.size <= FT_MAX_FILE_BYTES &&
+      typeof item.mime === "string" && utf8Bytes(item.mime) <= FT_MAX_MIME_BYTES &&
+      Number.isSafeInteger(item.mtimeMs) && item.mtimeMs >= 0 && validSha256Hex(item.sha256));
 }
+
+/** A SHA-256 as 64 lowercase hex digits. */
+export function validSha256Hex(value) { return typeof value === "string" && /^[0-9a-f]{64}$/.test(value); }
 
 /** Receiver-side state for one incoming file (mirrors `Incoming` in Rust). */
 export class FileIncoming {
@@ -239,8 +244,10 @@ export class FileIncoming {
     this.lastAckMs = nowMs;
     return this.received;
   }
-  onDone(expected, actual) {
+  /** `sealed` is the SHA-256 (hex) from the PC's sealed offer; the DONE hash `expected` is only a cross-check. */
+  onDone(expected, actual, sealed) {
     if (this.received !== this.size) return "size-mismatch";
+    if (bytesToHex(actual) !== sealed) return "hash-mismatch";
     if (expected.length !== actual.length || expected.some((byte, i) => byte !== actual[i])) return "hash-mismatch";
     return null;
   }

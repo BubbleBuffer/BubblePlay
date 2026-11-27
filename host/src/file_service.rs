@@ -33,13 +33,14 @@ use tracing::{debug, info, warn};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+mod offers;
 mod requests;
 mod upload_batch;
 
 use crate::file_auth::Authorizations;
 use crate::file_control::{
-    file_batch_ack_message, file_offer_message, random_id128, BatchAnnouncement, ClientControl,
-    DownloadRequest, FileOfferItem,
+    file_batch_ack_message, file_offer_message, random_id128, to_hex, BatchAnnouncement,
+    ClientControl, DownloadRequest, FileOfferItem,
 };
 use crate::file_hash::Sha256;
 use crate::file_transfer::{
@@ -48,6 +49,7 @@ use crate::file_transfer::{
 };
 use crate::native_file_drop::{DropBatch, NativeDropRequest};
 use crate::wss_media::{data_hello, host_socket_request_routed, HostSocket, RelayRoute};
+use offers::offer_items;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const INBOUND_SILENCE_LIMIT: Duration = Duration::from_secs(40);
@@ -145,6 +147,11 @@ struct OfferedFile {
     path: PathBuf,
     name: String,
     size: u64,
+    mime: String,
+    mtime_ms: u64,
+    /// SHA-256 of the bytes at offer time. It goes to the viewer in the sealed `file-offer`, so a
+    /// relay that alters a download cannot also change the hash the viewer verifies against.
+    sha256: [u8; ft::SHA256_BYTES],
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +171,9 @@ impl CurrentOffer {
                 id: item.id,
                 name: item.name.clone(),
                 size: item.size,
+                mime: item.mime.clone(),
+                mtime_ms: item.mtime_ms,
+                sha256: to_hex(&item.sha256),
             })
             .collect();
         file_offer_message(&self.id, &items, self.source)
@@ -413,49 +423,6 @@ fn sleep_unless_stopped(stop: &AtomicBool, delay: Duration) {
 
 // ---------------------------------------------------------------------------
 // Offers: clipboard file copies and Send To.
-
-/// Build offer items from paths: regular files only (directories are skipped
-/// in v1), at most 64, each at most 2 GiB.
-fn offer_items(paths: &[PathBuf]) -> Vec<OfferedFile> {
-    let mut items = Vec::new();
-    for path in paths {
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                debug!(path = %path.display(), ?error, "offer: unreadable path skipped");
-                continue;
-            }
-        };
-        if !metadata.is_file() {
-            info!(path = %path.display(), "offer: directory skipped (files only in v1)");
-            continue;
-        }
-        if metadata.len() > ft::MAX_FILE_BYTES {
-            info!(path = %path.display(), size = metadata.len(), "offer: file above 2 GiB skipped");
-            continue;
-        }
-        let Some(name) = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-        else {
-            continue;
-        };
-        if name.is_empty() || name.len() > ft::MAX_NAME_BYTES {
-            continue;
-        }
-        if items.len() == ft::MAX_BATCH_FILES as usize {
-            info!("offer: more than 64 files; the rest are skipped");
-            break;
-        }
-        items.push(OfferedFile {
-            id: items.len() as u32 + 1,
-            path: path.clone(),
-            name,
-            size: metadata.len(),
-        });
-    }
-    items
-}
 
 /// Replace the current offer (`items` empty withdraws it) and queue the
 /// signaling message.
@@ -1460,16 +1427,18 @@ impl Session {
                 send_cancel(ws, id, "too-large")?;
                 continue;
             }
-            let mtime_ms = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_millis() as u64);
+            if metadata.len() != item.size {
+                // Changed since it was hashed for the offer: the viewer would reject it anyway.
+                warn!(path = %item.path.display(), "offered file changed since it was offered");
+                send_cancel(ws, id, "size-mismatch")?;
+                continue;
+            }
+            // Name, size, type and time are the ones sealed in the offer.
             let meta = OfferMeta {
                 name: item.name.clone(),
-                size: metadata.len(),
-                mime: mime_for(&item.name).to_string(),
-                mtime_ms,
+                size: item.size,
+                mime: item.mime.clone(),
+                mtime_ms: item.mtime_ms,
                 purpose: Purpose::Save,
                 batch_id: request.offer_id.clone(),
                 batch_index: index,
@@ -2097,6 +2066,13 @@ mod tests {
         );
         assert_eq!(first["items"][0]["name"], "a.txt");
         assert_eq!(first["items"][0]["size"], 3);
+        // The sealed offer carries the hash, type and time the viewer verifies a download against.
+        assert_eq!(
+            first["items"][0]["sha256"],
+            "9834876dcfb05cb167a5c24953eba58c4ac89b1adf57f28f2f9d09af107ee8f0"
+        );
+        assert_eq!(first["items"][0]["mime"], "text/plain");
+        assert!(first["items"][0]["mtimeMs"].as_u64().unwrap() > 0);
         // A new request replaces the offer; an empty one withdraws it.
         write_spool_request(&dir, std::slice::from_ref(&b)).unwrap();
         poll_spool(&shared, &dir);

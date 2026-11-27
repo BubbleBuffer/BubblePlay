@@ -3,6 +3,34 @@ package de.bubblebuffer.bubbleplay.files
 import de.bubblebuffer.bubbleplay.protocol.FileWire
 import java.security.MessageDigest
 
+/** Where an upload batch stands with the PC: announced over the sealed control channel, then admitted (ACKED), before any OFFER. */
+enum class Announce { NEW, SENT, RETRY, ACKED, FAILED }
+
+/** The announcement bookkeeping of one upload batch, kept apart from threads and timers so the JVM can test it. */
+class AnnounceTracker {
+    var state = Announce.NEW
+    /** Counts announcements, so a timer of an earlier one (before an epoch change) does not fail the new one. */
+    var seq = 0
+    /** The PC answered `not-ready` once and the announcement was repeated. */
+    var retried = false
+    /** The PC was told (`file-batch-cancel`) to drop this batch. */
+    var cancelSent = false
+
+    /** A new signaling epoch: the host forgot every announced batch when it rebound, so this one is announced again. */
+    fun reannounce() {
+        state = Announce.NEW
+        retried = false
+        cancelSent = false
+    }
+
+    /** True once per announcement when the PC knows the batch and must be told to drop it; marks it told. */
+    fun takeCancel(): Boolean {
+        if (cancelSent || (state != Announce.SENT && state != Announce.ACKED)) return false
+        cancelSent = true
+        return true
+    }
+}
+
 /**
  * Sender-side flow control: at most [limit] bytes un-ACKed. ACKs carry the
  * receiver's running total, so they must never go backwards or past what was
@@ -71,7 +99,8 @@ class AckSchedule(private val everyBytes: Long = FileWire.ACK_BYTES, private val
  * What a receiver checks before RESULT ok: chunks arrive in order, never past
  * the announced size, and DONE's SHA-256 matches what was written.
  */
-class ReceiveCheck(val size: Long) {
+/** Verifies one download: size, order and the SHA-256 the PC sealed in its offer ([sealedSha256], lowercase hex). */
+class ReceiveCheck(val size: Long, private val sealedSha256: String) {
     private val digest = MessageDigest.getInstance("SHA-256")
     var received = 0L
         private set
@@ -90,7 +119,10 @@ class ReceiveCheck(val size: Long) {
     /** Null when the file is complete and intact, else the error code for RESULT. */
     fun onDone(sha256: ByteArray): String? {
         if (received != size) return ERR_SIZE
-        if (!MessageDigest.isEqual(digest.digest(), sha256)) return ERR_HASH
+        val actual = digest.digest()
+        // The bytes must match the sealed hash; the DONE hash on the unsealed socket is only a cross-check.
+        if (FileWire.hex(actual) != sealedSha256) return ERR_HASH
+        if (!MessageDigest.isEqual(actual, sha256)) return ERR_HASH
         return null
     }
 

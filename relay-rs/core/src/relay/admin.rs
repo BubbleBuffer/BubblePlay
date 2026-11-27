@@ -29,7 +29,7 @@ impl Relay {
     }
 
     /// Forgets a PC. Persists the table first (the first action), then closes
-    /// its host sockets 1008 "peer removed" and sends peer-left to its viewer.
+    /// every socket of it (host and viewer) 1008 "peer removed".
     /// An id that is not a device id, or a valid id with no registered PC, is
     /// `AdminError::NotFound` and nothing is persisted.
     pub fn delete_pc(&mut self, id: &str) -> Result<Vec<Action>, AdminError> {
@@ -41,21 +41,25 @@ impl Relay {
             return Err(AdminError::NotFound);
         }
         let mut out = vec![Action::PersistPcs(self.pcs.clone())];
-        let hosts: Vec<ConnId> = self
+        // Every socket of the PC, host and viewer alike: a viewer that stayed would keep a session
+        // (and its media and file sockets) with a PC the admin has just removed.
+        let sockets: Vec<ConnId> = self
             .conns
             .iter()
-            .filter(|(_, c)| c.pc == pc && c.route.is_host_socket())
+            .filter(|(_, c)| c.pc == pc)
             .map(|(id, _)| *id)
             .collect();
-        for host in hosts {
+        for id in &sockets {
             self.close(
-                host,
+                *id,
                 1008,
                 reasons::PEER_REMOVED,
                 "admin.pc-removed",
                 &mut out,
             );
-            self.forget(host, &mut out);
+        }
+        for id in sockets {
+            self.forget(id, &mut out);
         }
         Ok(out)
     }

@@ -122,11 +122,11 @@ export class FileTransferClient extends EventTarget {
     }
     if (!offer) return [];
     const ids = [];
-    for (const item of items) {
+    for (const asked of items) {
+      const item = offer.items.find(candidate => candidate.id === asked.id); // sealed name, size and hash
+      if (!item) continue;
       const row = this.addRow("download", item.name, item.size, "save");
-      row.offerId = offer.offerId;
-      row.itemId = item.id;
-      row.sinkFor = sinkFor;
+      Object.assign(row, { offerId: offer.offerId, itemId: item.id, sealedSha256: item.sha256, sinkFor });
       ids.push(row.id);
     }
     this.changed();
@@ -170,7 +170,7 @@ export class FileTransferClient extends EventTarget {
     const row = {
       id: this.nextRowId++, direction, name, size, purpose, state: "queued", error: null,
       bytes: 0, startedAt: null, finishedAt: null, transferId: null,
-      file: null, meta: null, offerId: null, itemId: null, sinkFor: null, sink: null,
+      file: null, meta: null, offerId: null, itemId: null, sealedSha256: null, sinkFor: null, sink: null,
     };
     this.rows.push(row);
     return row;
@@ -485,7 +485,7 @@ export class FileTransferClient extends EventTarget {
     if (row.writeError) throw Object.assign(new Error(), { code: "save-failed" });
     row.state = "verifying";
     this.changed();
-    const verdict = row.incoming.onDone(Array.from(row.doneHash), Array.from(row.hash.finish()));
+    const verdict = row.incoming.onDone(Array.from(row.doneHash), Array.from(row.hash.finish()), row.sealedSha256);
     if (verdict) {
       this.sendBinary(encodeResult(row.transferId, false, verdict));
       this.fail(row, verdict);

@@ -18,8 +18,8 @@ import java.nio.charset.StandardCharsets
  * transferId u32 LE, seq u32 LE (DATA: chunk index from 0, otherwise 0).
  */
 object FileWire {
-    /** `protocol` of the sealed file messages and the `fileTransfer` capability a host must advertise (2: hex ids, announced batches). */
-    const val PROTOCOL = 2
+    /** `protocol` of the sealed file messages and the `fileTransfer` capability a host must advertise (3: hex ids, announced batches, sealed download hashes). */
+    const val PROTOCOL = 3
     const val HEADER = 16
     val MAGIC = byteArrayOf('B'.code.toByte(), 'P'.code.toByte(), 'F'.code.toByte(), '1'.code.toByte())
 
@@ -192,7 +192,8 @@ object FileWire {
 
     // ---- signaling: file-offer ----------------------------------------------------------
 
-    data class Item(val id: Long, val name: String, val size: Long)
+    /** One offered file. [sha256] (64 lowercase hex digits) is sealed with the offer: a download is verified against it, never against the file socket. */
+    data class Item(val id: Long, val name: String, val size: Long, val mime: String, val mtimeMs: Long, val sha256: String)
 
     /** A host offer; empty [items] withdraws the previous one. */
     data class Offer(val offerId: String, val items: List<Item>, val source: String) {
@@ -213,7 +214,10 @@ object FileWire {
             val id = integer(item, "id")?.takeIf { it in 0..U32_MAX && ids.add(it) } ?: return null
             val name = validName(item.opt("name")) ?: return null
             val size = integer(item, "size")?.takeIf { it in 0..MAX_FILE } ?: return null
-            items += Item(id, name, size)
+            val mime = (item.opt("mime") as? String)?.takeIf { utf8Bytes(it) <= MAX_MIME_BYTES } ?: return null
+            val mtime = integer(item, "mtimeMs")?.takeIf { it >= 0 } ?: return null
+            val sha256 = (item.opt("sha256") as? String)?.takeIf { it.length == 64 && it.all { c -> c in '0'..'9' || c in 'a'..'f' } } ?: return null
+            items += Item(id, name, size, mime, mtime, sha256)
         }
         return Offer(offerId, items, source)
     }

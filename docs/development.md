@@ -38,7 +38,7 @@ node --test tools/tests/*.test.mjs
 ./host/scripts/test-setup-credentials.ps1
 ```
 
-`tools/package-release.ps1` packages only explicit public files and verifies every ZIP entry. Supply `docs/windows-quickstart.md`, `docs/THIRD-PARTY-NOTICES.md` and the root LICENSE. `-PublicRelease` requires that license; source provenance must reflect uncommitted changes. Review the exact binaries and manifest before publishing.
+`tools/package-release.ps1` packages only explicit public files and verifies every ZIP entry. Supply `docs/windows-quickstart.md`, `docs/THIRD-PARTY-NOTICES.md` and the root LICENSE. `-PublicRelease` requires that license; source provenance must reflect uncommitted changes. Review the exact binaries and manifest before publishing. The script also writes `SHA256SUMS` (`sha256sum` format, one line per release ZIP in the output folder) beside the ZIP: publish it with the ZIP, and check a download with `sha256sum -c SHA256SUMS` (Git Bash, Linux, macOS) or by comparing `(Get-FileHash BubblePlay-<version>-windows-x64.zip).Hash` with its line, in lowercase. The ZIP's `release-manifest.json` carries the hash of every file inside. Binaries are not code-signed yet, so the hashes only prove the download matches what was published; get them from the release page, not from the same place as the ZIP.
 
 `tools/generate-notices.mjs` reads an existing locked Windows Cargo metadata snapshot and cached dependency licenses offline. It retains full license/notice texts and fails if provenance/texts are missing. The exact upstream exceptions live in `tools/third-party/notice-overrides.json`.
 
