@@ -159,4 +159,19 @@ class PrefsTest {
         assertTrue(bad.keyboardLock)
         assertTrue(bad.stayConnected)
     }
+
+    @Test
+    fun touchAndMouseModesAreRememberedPerPcAndFallBackToTheDefaults() {
+        val prefs = Prefs(MapStore())
+        prefs.directTouch = true
+        assertTrue("no value yet: the global default", prefs.directTouchFor("PC-A"))
+        assertFalse(prefs.gameModeFor("PC-A"))
+        prefs.setDirectTouchFor("PC-A", false)
+        prefs.setGameModeFor("PC-A", true)
+        assertFalse(prefs.directTouchFor("PC-A"))
+        assertTrue(prefs.gameModeFor("PC-A"))
+        assertTrue("another PC keeps the default", prefs.directTouchFor("PC-B"))
+        assertFalse(prefs.gameModeFor("PC-B"))
+        assertTrue("the global default is untouched", prefs.directTouch)
+    }
 }

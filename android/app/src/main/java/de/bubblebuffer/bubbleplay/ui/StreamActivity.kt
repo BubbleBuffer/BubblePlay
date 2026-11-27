@@ -30,6 +30,7 @@ import android.view.Choreographer
 import android.view.PixelCopy
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
+import android.hardware.input.InputManager
 import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
@@ -139,9 +140,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var cursorVisible = false
     private val cursorReconciler = CursorReconciler()
 
-    private val latchSet = LinkedHashSet<String>()
-    private val activeLatched = HashMap<String, Set<String>>()
-    private val latchedKeySender = LatchedKeySender(latchSet, activeLatched,
+    private val modifiers = ModifierKeys { code, up -> input?.key(code, up) == true }
+    private val latchedKeySender = LatchedKeySender(modifiers.latched, modifiers.active,
         { code, up -> input?.key(code, up) == true }, { latchesChanged() })
     private var lastStatus: Session.Status? = null
     private val remoteClipboard = RemoteClipboard()
@@ -152,7 +152,16 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     private var mouseActive = false
     private var motionFramePosted = false
     /** Physical mouse pointer mode: game captures it for relative motion, work points absolutely. */
-    private var gameMode = false
+    override var gameMode = false
+        private set
+    /** Ctrl+Alt+Shift+M went down and was kept local; its key-up stays local too. */
+    private var modeChordSwallowed = false
+    private val inputManager by lazy { getSystemService(Context.INPUT_SERVICE) as InputManager }
+    private val inputDeviceListener = object : InputManager.InputDeviceListener {
+        override fun onInputDeviceAdded(deviceId: Int) = pointerDevicesChanged()
+        override fun onInputDeviceRemoved(deviceId: Int) = pointerDevicesChanged()
+        override fun onInputDeviceChanged(deviceId: Int) = pointerDevicesChanged()
+    }
     private val captureClick = CaptureClick()
     /** Keyboard lock on: holding Esc for [ESC_HOLD_MS] releases a captured mouse (the Esc itself goes to the PC). */
     private val escapeRelease = Runnable { releaseMouseCapture() }
@@ -173,7 +182,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         private set
     override val touchMode: TouchMode get() = gestures.mode
     override val zoomed: Boolean get() = viewport.zoomed
-    override val latched: Set<String> get() = latchSet
+    override val latched: Set<String> get() = modifiers.latched
+    override val locked: Set<String> get() = modifiers.locked
+    override val pointerPresent: Boolean get() = InputDevice.getDeviceIds().any { id ->
+        InputDevice.getDevice(id)?.let { !it.isVirtual && it.supportsSource(InputDevice.SOURCE_MOUSE) } == true
+    }
     override val fileTransfer: Boolean get() = fileCapability == true
     override val soundAvailable: Boolean get() = soundCapability
     override val soundOn: Boolean get() = session?.soundMuted != true
@@ -202,14 +215,15 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val relay = ServerConfig.parseServer(pc.relay) ?: run { finish(); return }
         if (UnlockedKey.get() == null) { finish(); return }
         config = ServerConfig(relay, pc.id)
-        gestures.mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
+        gestures.mode = if (prefs.directTouchFor(pc.id)) TouchMode.DIRECT else TouchMode.TRACKPAD
         gestures.tapToClick = prefs.tapToClick
         pointerGain = PointerSpeed.gain(prefs.pointerSpeed)
-        gameMode = prefs.gameMode
+        gameMode = prefs.gameModeFor(pc.id)
         immersive = prefs.startFullscreen
         buildViews()
         KeepAlive.owner = this
         clipboardManager.addPrimaryClipChangedListener(clipboardChanged)
+        inputManager.registerInputDeviceListener(inputDeviceListener, main)
         files = FileTransfers(this, { fileEpoch?.let { config.fileUrl(it) } }, fileListener, { viewerGrant }, { session?.sendFileControl(it) ?: false })
         enterImmersive() // also sets up edge-to-edge and the cutout mode
         if (!immersive) exitImmersive()
@@ -442,6 +456,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         files?.cancelAll()
         currentOffer = null
         transferDock.clear()
+        releaseModifiers()
         input?.releaseAll()
         metaSync.reset()
         session?.stop()
@@ -476,11 +491,11 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         captureFrozenFrame() // the surface still holds the last frame here
         super.onPause()
         quickBar.release()
+        releaseModifiers()
         input?.releaseAll()
         metaSync.reset()
         cursorReconciler.reset()
         keyboardView.resetContext()
-        latchSet.clear(); activeLatched.clear(); latchesChanged()
     }
 
     override fun onResume() {
@@ -493,6 +508,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun onStop() {
         super.onStop()
         stopped = true
+        releaseModifiers()
         // The foreground service keeps the session, its transfers and reconnects alive.
         if (session != null && KeepAlive.active) return
         // Without it: keep the session for a short background trip (app switch), then let go.
@@ -557,6 +573,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override fun onDestroy() {
         clipboardManager.removePrimaryClipChangedListener(clipboardChanged)
+        inputManager.unregisterInputDeviceListener(inputDeviceListener)
         main.removeCallbacksAndMessages(null)
         if (::quickBar.isInitialized) {
             quickBar.onDestroy()
@@ -747,7 +764,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         main.removeCallbacks(longPress)
         mouseButtons = 0
         onCursorType(CursorKind.Arrow)
-        latchSet.clear(); activeLatched.clear(); latchesChanged()
+        modifiers.releaseAll(release = false); latchesChanged()
     }
 
     override fun onSecureDesktop(state: SecureDesktop?) {
@@ -980,11 +997,22 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     /** Work or game pointer mode for a physical mouse; also tells the host (game streams at up to 60 fps). */
     private fun applyPointerMode() {
-        val game = prefs.gameMode
+        val game = prefs.gameModeFor(pc.id)
         if (game == gameMode) return
         gameMode = game
         session?.setStreamMode(game)
         if (!game) releaseMouseCapture()
+        if (::quickBar.isInitialized) quickBar.render()
+    }
+
+    /** The bar's Work/Game item and Ctrl+Alt+Shift+M: switches this PC's mouse mode. */
+    override fun toggleGameMode() {
+        prefs.setGameModeFor(pc.id, !gameMode)
+        applyPointerMode()
+    }
+
+    private fun pointerDevicesChanged() {
+        if (::quickBar.isInitialized) quickBar.render()
     }
 
     private fun onCapturedPointer(event: MotionEvent): Boolean {
@@ -1026,6 +1054,18 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val device = event.device
         val hardware = device != null && !device.isVirtual && event.deviceId != KeyCharacterMap.VIRTUAL_KEYBOARD
         // While settings are open, keys belong to the settings view (text field, focus, Back).
+        if (hardware && settingsView == null && event.keyCode == KeyEvent.KEYCODE_M) {
+            // Ctrl+Alt+Shift+M switches Work/Game here and is never sent to the PC.
+            if (event.action == KeyEvent.ACTION_DOWN && event.isCtrlPressed && event.isAltPressed && event.isShiftPressed) {
+                modeChordSwallowed = true
+                if (event.repeatCount == 0) toggleGameMode()
+                return true
+            }
+            if (modeChordSwallowed) {
+                if (event.action == KeyEvent.ACTION_UP) modeChordSwallowed = false
+                return true
+            }
+        }
         if (hardware && settingsView == null && event.isFromSource(InputDevice.SOURCE_KEYBOARD) && KeyMap.ANDROID_TO_CODE.containsKey(event.keyCode)) {
             if (event.keyCode == KeyEvent.KEYCODE_ESCAPE && escapeForCapture(event)) return true
             sendHardwareKey(event)
@@ -1071,7 +1111,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         val code = KeyMap.ANDROID_TO_CODE[event.keyCode]
         val unicode = event.getUnicodeChar(event.metaState)
         val printable = unicode > 0 && !Character.isISOControl(unicode) && code != "Space"
-        if (printable && latchSet.isEmpty() && !event.isCtrlPressed && !event.isAltPressed) {
+        if (printable && !modifiers.any && !event.isCtrlPressed && !event.isAltPressed) {
             // A character from the IME: send the character, not a US-layout key.
             return event.action != KeyEvent.ACTION_DOWN || input?.text(String(Character.toChars(unicode))) == true
         }
@@ -1116,7 +1156,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
             text = remote::text,
             rawTap = { code -> remote.key(code, false) && remote.key(code, true) },
             keyTap = { code -> keyDownChecked(code, resetImeContext = false) && keyUpChecked(code) },
-            hasLatch = { latchSet.isNotEmpty() },
+            hasLatch = { modifiers.any },
             requestReset = { keyboardView.requestDeferredResetContext() },
         ).send(deleteCount, insert)
     }
@@ -1169,19 +1209,34 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         return latchedKeySender.up(code)
     }
 
-    /** Sticky Ctrl/Alt/Shift/Win: held for the next key; tapping it again lets go (sends nothing). */
-    override fun toggleLatch(code: String) {
-        if (!latchSet.remove(code)) latchSet.add(code)
+    /** Ctrl/Alt/Shift/Win: tap latches for the next key, a second tap locks, a tap on a lock releases it. */
+    override fun tapModifier(code: String) {
+        if (input == null) return
+        modifiers.tap(code)
         latchesChanged()
     }
 
-    /** Shortcut chords are exact: they ignore (and keep) any sticky modifiers. */
+    override fun longPressModifier(code: String) {
+        if (input == null) return
+        modifiers.longPress(code)
+        latchesChanged()
+    }
+
+    override fun clearModifiers() {
+        releaseModifiers()
+    }
+
+    /** Lets go of every latch and lock (a lock is held on the PC, so its release is sent). */
+    private fun releaseModifiers() {
+        modifiers.releaseAll(release = true)
+        latchesChanged()
+    }
+
+    /** Shortcut chords are exact: they ignore (and keep) one-shot latches and leave locks held. */
     override fun sendChord(chord: Chord) {
         keyboardView.resetContext()
-        val remote = input ?: return
-        chord.mods.forEach { remote.key(it, false) }
-        remote.tap(chord.key)
-        chord.mods.asReversed().forEach { remote.key(it, true) }
+        if (input == null) return
+        modifiers.chord(chord.mods, chord.key)
     }
 
     private fun latchesChanged() {
@@ -1206,8 +1261,8 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     // ---- QuickBar.Host: everything else --------------------------------------------------------
     override fun toggleTouchMode() {
         gestures.cancel().let { apply(it) }
-        // For this session only; the default is in Settings.
         gestures.mode = if (gestures.mode == TouchMode.TRACKPAD) TouchMode.DIRECT else TouchMode.TRACKPAD
+        prefs.setDirectTouchFor(pc.id, gestures.mode == TouchMode.DIRECT)
         renderCursor()
     }
 
@@ -1287,6 +1342,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     }
 
     override fun disconnect() {
+        releaseModifiers()
         clearFrozen()
         finish()
     }
@@ -1298,6 +1354,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
         quickBar.dismiss()
         if (keyboardShown) toggleKeyboard()
         quickBar.release()
+        releaseModifiers()
         input?.releaseAll()
         gestures.cancel().let { apply(it) }
         if (stage.hasPointerCapture()) stage.releasePointerCapture()
@@ -1331,6 +1388,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
 
     override val settingsConfig: ServerConfig get() = config
     override val inSession: Boolean get() = session != null
+    override val settingsPcId: String get() = pc.id
     override val settingsMonitors: List<Session.Monitor> get() = if (session != null) monitors else emptyList()
     override fun diagnostics(): Session.Diagnostics? = session?.diagnostics
     override fun probeRoundTrip() { session?.probeRoundTrip() }
@@ -1338,7 +1396,7 @@ class StreamActivity : Activity(), Session.Listener, SurfaceHolder.Callback, Key
     override fun onSettingChanged(setting: SettingsView.Setting) {
         when (setting) {
             SettingsView.Setting.TOUCH_MODE -> {
-                val mode = if (prefs.directTouch) TouchMode.DIRECT else TouchMode.TRACKPAD
+                val mode = if (prefs.directTouchFor(pc.id)) TouchMode.DIRECT else TouchMode.TRACKPAD
                 if (gestures.mode != mode) { gestures.cancel().let { apply(it) }; gestures.mode = mode; renderCursor(); quickBar.render() }
             }
             SettingsView.Setting.POINTER_SPEED -> pointerGain = PointerSpeed.gain(prefs.pointerSpeed)

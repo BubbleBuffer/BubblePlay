@@ -61,6 +61,8 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         val settingsConfig: ServerConfig?
         /** True while a stream session runs behind the view. */
         val inSession: Boolean
+        /** The PC whose touch and mouse modes the view edits (null outside a session: the defaults). */
+        val settingsPcId: String?
         /** The host's monitors (empty outside a session or before the list arrives). */
         val settingsMonitors: List<Session.Monitor>
         fun diagnostics(): Session.Diagnostics?
@@ -143,8 +145,8 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         column.addView(fieldLabel(R.string.settings_touch_mode))
         column.addView(segmented(
             listOf(false to R.string.settings_trackpad, true to R.string.settings_direct),
-            prefs.directTouch, R.string.settings_touch_mode,
-        ) { prefs.directTouch = it; host.onSettingChanged(Setting.TOUCH_MODE) })
+            host.settingsPcId?.let(prefs::directTouchFor) ?: prefs.directTouch, R.string.settings_touch_mode,
+        ) { host.settingsPcId?.let { id -> prefs.setDirectTouchFor(id, it) } ?: run { prefs.directTouch = it }; host.onSettingChanged(Setting.TOUCH_MODE) })
         column.addView(slider())
         column.addView(switchRow(R.string.settings_tap_to_click, R.string.settings_tap_to_click_detail, prefs.tapToClick) {
             prefs.tapToClick = it; host.onSettingChanged(Setting.TAP_TO_CLICK)
@@ -154,8 +156,8 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         column.addView(fieldLabel(R.string.settings_pointer_mode))
         column.addView(segmented(
             listOf(false to R.string.settings_pointer_work, true to R.string.settings_pointer_game),
-            prefs.gameMode, R.string.settings_pointer_mode,
-        ) { prefs.gameMode = it; host.onSettingChanged(Setting.POINTER_MODE) })
+            host.settingsPcId?.let(prefs::gameModeFor) ?: prefs.gameMode, R.string.settings_pointer_mode,
+        ) { host.settingsPcId?.let { id -> prefs.setGameModeFor(id, it) } ?: run { prefs.gameMode = it }; host.onSettingChanged(Setting.POINTER_MODE) })
         column.addView(detailText(activity.getString(R.string.settings_pointer_mode_detail)).apply { setPadding(0, dp(6), 0, 0) })
         column.addView(switchRow(R.string.settings_keyboard_lock, R.string.settings_keyboard_lock_detail, prefs.keyboardLock) {
             prefs.keyboardLock = it; host.onSettingChanged(Setting.KEYBOARD_LOCK)
@@ -301,7 +303,7 @@ class SettingsView(private val activity: Activity, private val prefs: Prefs, pri
         lines += "Server: ${config?.base?.host ?: "invalid"}"
         lines += "Session: ${if (host.inSession) "running" else "none"}"
         lines += "Codec setting: ${prefs.codec}"
-        lines += "Touch: ${if (prefs.directTouch) "direct" else "trackpad"}, pointer speed ${prefs.pointerSpeed}, tap to click ${if (prefs.tapToClick) "on" else "off"}"
+        lines += "Touch: ${if (host.settingsPcId?.let(prefs::directTouchFor) ?: prefs.directTouch) "direct" else "trackpad"}, pointer speed ${prefs.pointerSpeed}, tap to click ${if (prefs.tapToClick) "on" else "off"}"
         for (label in DIAG_LABELS) lines += "${activity.getString(label)}: ${diagValues[label]?.text}"
         val manager = activity.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         manager.setPrimaryClip(ClipData.newPlainText(activity.getString(R.string.settings_report_label), lines.joinToString("\n")))

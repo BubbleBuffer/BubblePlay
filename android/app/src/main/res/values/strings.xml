@@ -39,6 +39,11 @@
     <string name="pop_keys">Keys</string>
     <string name="pop_keys_hint">Modifiers stay held until the next key</string>
     <string name="pop_latched">%1$s, held</string>
+    <string name="pop_locked">%1$s, locked</string>
+    <string name="mod_state_latched">Latched</string>
+    <string name="mod_state_locked">Locked</string>
+    <string name="bar_pointer">Pointer mode</string>
+    <string name="bar_modifiers_clear">Release modifiers</string>
     <string name="pop_arrows">Arrows</string>
     <string name="pop_more">More</string>
     <string name="pop_fullscreen">Full screen</string>

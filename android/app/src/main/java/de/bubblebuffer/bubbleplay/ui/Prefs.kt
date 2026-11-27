@@ -73,6 +73,14 @@ class Prefs(private val store: PrefStore) {
         get() = store.getBoolean(KEY_GAME_MODE) ?: false
         set(value) = store.edit { putBoolean(KEY_GAME_MODE, value) }
 
+    /** The touch mode a PC last used; the default touch mode for a PC with none. */
+    fun directTouchFor(pcId: String): Boolean = store.getBoolean(pcKey(KEY_DIRECT_TOUCH, pcId)) ?: directTouch
+    fun setDirectTouchFor(pcId: String, value: Boolean) = store.edit { putBoolean(pcKey(KEY_DIRECT_TOUCH, pcId), value) }
+
+    /** The mouse mode a PC last used; the default mouse mode for a PC with none. */
+    fun gameModeFor(pcId: String): Boolean = store.getBoolean(pcKey(KEY_GAME_MODE, pcId)) ?: gameMode
+    fun setGameModeFor(pcId: String, value: Boolean) = store.edit { putBoolean(pcKey(KEY_GAME_MODE, pcId), value) }
+
     /** Background survival: a foreground service keeps the session open while the app is in the background. */
     var stayConnected: Boolean
         get() = store.getBoolean(KEY_STAY_CONNECTED) ?: true
@@ -151,6 +159,8 @@ class Prefs(private val store: PrefStore) {
         const val KEY_AUTO_COPY_REMOTE_CLIPBOARD = "autoCopyRemoteClipboard"
         const val KEY_DEFAULT_MONITOR = "defaultMonitor"
         const val KEY_DEFAULT_MONITOR_NAME = "defaultMonitorName"
+
+        private fun pcKey(key: String, pcId: String) = "pc.$pcId.$key"
 
         fun normalizeCodec(value: String): String = when (value.trim().lowercase().replace(".", "").replace("-", "")) {
             "hevc", "h265" -> CODEC_HEVC
