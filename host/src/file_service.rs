@@ -1869,7 +1869,6 @@ fn mime_for(name: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::file_control::{valid_id128, AnnouncedFile};
-
     mod auth;
     mod batches;
     mod native;
