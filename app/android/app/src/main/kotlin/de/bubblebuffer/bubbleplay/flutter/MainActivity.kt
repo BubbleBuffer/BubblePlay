@@ -87,7 +87,7 @@ class MainActivity : FlutterActivity() {
 
                 override suspend fun act(actionJson: String) = runner.act(actionJson)
 
-                override fun exportKey(): String = backend.exportKey()
+                override fun exportKey(passphrase: String?): String = backend.exportKey(passphrase)
             },
         )
         CtlHostApi.setUp(

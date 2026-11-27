@@ -83,11 +83,15 @@ void main() {
       expect(find.text('Key file saved.'), findsNothing);
     });
 
-    testWidgets('Export key saves the key text and says so', (tester) async {
+    testWidgets('Export key seals the file with the typed passphrase and says so', (tester) async {
       final app = await pumpApp(tester, contractState('enroll_created'));
       await tester.tap(find.text('Export key'));
       await tester.pumpAndSettle();
-      expect(app.keyFiles.saved, {savedKeyFile: app.channel.keyText});
+      await tester.enterText(find.byType(EditableText), 'pw');
+      await tester.tap(find.text('Export'));
+      await tester.pumpAndSettle();
+      expect(app.channel.exportPassphrases, ['pw']);
+      expect(app.keyFiles.saved, {savedKeyFile: '${app.channel.keyText}#sealed:pw'});
       expect(find.text('Key file saved.'), findsOneWidget);
     });
 

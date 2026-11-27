@@ -131,7 +131,20 @@ internal class AppBackend(
 
     /** The portable key text for the user to save. Never part of a snapshot. */
     @Synchronized
-    fun exportKey(): String = keys.load() ?: throw IllegalStateException("no key to export")
+    fun exportKey(passphrase: String? = null): String {
+        val text = keys.load() ?: throw IllegalStateException("no key to export")
+        if (passphrase.isNullOrEmpty()) return text
+        // The stored copy lives under the Keystore wrap without its own passphrase layer; the
+        // file leaving the device gets one, sealed with a fresh salt and nonce.
+        val file = KeyFileCodec.parse(text)
+        val held = unlocked.get()?.takeIf { it.id == file.id }
+        val key = held ?: KeyFileCodec.unlock(file, null)
+        try {
+            return KeyFileCodec.serialize(KeyFileCodec.rewrap(file, key, passphrase))
+        } finally {
+            if (held == null) key.close()
+        }
+    }
 
     @Synchronized
     fun act(actionJson: String) {

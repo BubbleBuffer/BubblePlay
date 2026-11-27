@@ -6,6 +6,7 @@ import '../app_tokens.dart';
 import '../feedback/feedback_controller.dart';
 import '../logging/app_log.dart';
 import '../model/model.dart';
+import 'key_export.dart';
 
 /// The app version shown in About.
 const appVersion = '0.1.0';
@@ -75,23 +76,14 @@ class _SettingsBodyState extends State<_SettingsBody> {
   bool _exportFailed = false;
 
   Future<void> _export() async {
-    final env = AppScope.of(context);
     setState(() => _exportFailed = false);
-    String text;
+    bool saved;
     try {
-      text = await env.controller.exportKey();
+      saved = await exportKeyFile(context);
     } catch (e) {
       AppLog.error('Settings', 'Key export failed', error: e);
       if (mounted) setState(() => _exportFailed = true);
       return;
-    }
-    if (!mounted) return;
-    bool saved;
-    try {
-      saved = await env.keyFiles.save('bubbleplay-device-key.bpkey', text);
-    } catch (e) {
-      AppLog.error('Settings', 'Key file could not be saved', error: e);
-      saved = false;
     }
     if (!mounted || !saved) return;
     showToast(

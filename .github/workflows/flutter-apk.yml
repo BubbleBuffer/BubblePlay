@@ -71,8 +71,8 @@ jobs:
           flutter pub get
       - name: Build release APK
         working-directory: app
-        # The Windows-only Rust core is not part of the Android build. The APK is debug-signed here;
-        # The publish host re-signs it. versionCode = epoch minutes, the scheme of the native app.
+        # The Windows-only Rust core is not part of the Android build. The APK is left unsigned here (no keystore on
+        # build01); the publish host signs it. versionCode = epoch minutes, the scheme of the native app.
         run: flutter build apk --release --build-number="$(( $(date +%s) / 60 ))"
       - name: Sign and publish
         env:
@@ -82,7 +82,9 @@ jobs:
           for name in APK_PUBLISH_SSH APK_PUBLISH_KEY; do
             if [ -z "${!name}" ]; then echo "::error::Repository variable is empty: $name (set APK_PUBLISH_SSH and APK_PUBLISH_KEY_FLUTTER; see docs/development.md)"; exit 1; fi
           done
-          apk=app/build/app/outputs/flutter-apk/app-release.apk
+          dir=app/build/app/outputs/flutter-apk
+          apk="$dir/app-release.apk"
+          [ -s "$apk" ] || apk="$dir/app-release-unsigned.apk"
           test -s "$apk"
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
             -i "$APK_PUBLISH_KEY" "$APK_PUBLISH_SSH" 'apk-publish bubbleplay-flutter' \

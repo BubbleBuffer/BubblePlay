@@ -21,8 +21,9 @@ abstract class AppHostApi {
   @async
   void act(String actionJson);
 
-  /// The stored key as portable `.bpkey` text, for the user to save. Never part of a snapshot.
-  String exportKey();
+  /// The stored key as portable `.bpkey` text, for the user to save. With a [passphrase] the
+  /// text is sealed under it; without, it is exactly as stored. Never part of a snapshot.
+  String exportKey(String? passphrase);
 }
 
 @FlutterApi()

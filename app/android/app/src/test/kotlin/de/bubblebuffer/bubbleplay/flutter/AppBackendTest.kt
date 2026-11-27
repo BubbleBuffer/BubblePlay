@@ -113,6 +113,30 @@ class AppBackendTest {
     }
 
     @Test
+    fun exportWithAPassphraseSealsTheKeyAndReimportsOnlyWithThatPassphrase() {
+        val f = Fixture()
+        val backend = f.backend()
+        backend.act("\"CreateKey\"")
+        val plain = backend.exportKey(null)
+        assertFalse(KeyFileCodec.parse(plain).isProtected)
+
+        val sealed = backend.exportKey("correct horse")
+        val file = KeyFileCodec.parse(sealed)
+        assertTrue(file.isProtected)
+        assertEquals(KeyFileCodec.parse(plain).id, file.id)
+        // The stored copy is untouched and the plain seed is not in the exported text.
+        assertEquals(plain, f.keys.text)
+        assertFalse(sealed == plain)
+
+        val other = Fixture().backend()
+        other.act(importAction("sealed.bpkey", sealed))
+        other.act("""{"UnlockImport":{"passphrase":"wrong"}}""")
+        assertEquals("", other.state().getJSONObject("this_device").getString("id"))
+        other.act("""{"UnlockImport":{"passphrase":"correct horse"}}""")
+        assertEquals(file.id, other.state().getJSONObject("this_device").getString("id"))
+    }
+
+    @Test
     fun aProtectedImportAsksForItsPassphraseOnceAndIsStoredWithoutIt() {
         val f = Fixture()
         val backend = f.backend()

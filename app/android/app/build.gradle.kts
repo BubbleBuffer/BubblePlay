@@ -4,6 +4,18 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// Release signing material is never committed. Same source as the native app (android/): the
+// keystore dir's keystore.properties; BP_KEYSTORE_DIR overrides the dir. Without it the
+// release APK is built unsigned (never debug-signed); the publish host signs it.
+val keystoreDir = File(
+    System.getenv("BP_KEYSTORE_DIR")
+        ?: File(System.getenv("LOCALAPPDATA") ?: System.getProperty("user.home"), "BubblePlay/android-keystore").path,
+)
+val keystoreProps = Properties().apply {
+    val file = File(keystoreDir, "keystore.properties")
+    if (file.isFile) file.inputStream().use { load(it) }
+}
+
 android {
     namespace = "de.bubblebuffer.bubbleplay.flutter"
     compileSdk = flutter.compileSdkVersion
@@ -29,11 +41,22 @@ android {
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        if (keystoreProps.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = File(keystoreDir, keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // Signed with the debug keys so `flutter run --release` works; the published APK is
-            // re-signed with the BubblePlay release key on linux01 (apk-publish bubbleplay-flutter).
-            signingConfig = signingConfigs.getByName("debug")
+            // Never the debug key: unsigned unless the release keystore is supplied. The
+            // published APK is signed on linux01 (apk-publish bubbleplay-flutter).
+            signingConfig = signingConfigs.findByName("release")
             // Not R8-tested with the Kotlin core (BouncyCastle, OkHttp): ship it unshrunk.
             isMinifyEnabled = false
             isShrinkResources = false
