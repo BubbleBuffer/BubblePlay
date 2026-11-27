@@ -1,6 +1,6 @@
 # File transfer
 
-File bytes use a dedicated WebSocket so an upload or download does not share the signaling/input or media queue. The host caps download send rate against media capacity. Transfer UI is hidden until the host advertises `fileTransfer: 1`.
+File bytes use a dedicated WebSocket so an upload or download does not share the signaling/input or media queue. The host caps download send rate against media capacity. Transfer UI is hidden until the host advertises `fileTransfer: 2`.
 
 ## User behavior and boundaries
 
@@ -21,11 +21,11 @@ The temporary native cache is private and carries Mark-of-the-Web. Destination a
 
 The relay carries the file socket, and a WSS relay can read and forge what travels on it. The host therefore acts on a file-socket packet only when the viewer announced it over the sealed `ctl` channel (device-key AEAD on `/ws`), which the relay cannot forge.
 
-- **Uploads.** Before the first OFFER of a batch, the viewer hashes every file and sends `file-batch` with the batch's purpose, drop point, and each file's name, size and SHA-256. The host admits at most 8 batches at once, answers `file-batch-ack`, and drops a batch after 15 minutes without progress. The viewer sends OFFER packets only after an ok ack.
-- **What the host accepts.** An OFFER must match its announced file exactly (batch id, index, count, purpose, drop point, name, size) and starts at most once, so a replayed OFFER or batch is refused as `unannounced`. The DONE hash must equal the announced hash. Bytes that differ fail as `hash-mismatch` before anything reaches the clipboard, paste or the drop target.
-- **Downloads.** Before each REQUEST packet, the viewer sends `file-request` for the offer id and item ids. The host serves a REQUEST once for an item that `file-request` asked for within 60 seconds; a REQUEST that arrives first waits up to 5 seconds for its `file-request`. Any other REQUEST is cancelled as `unauthorized`. The viewer accepts a download OFFER only when its `batchId` equals the requested offer id.
+- **Uploads.** Before the first OFFER of a batch, the viewer hashes every file and sends `file-batch` with the batch's purpose, drop point, and each file's name, size and SHA-256. The host admits at most 8 batches at once (a full table gives up its oldest batch that has not started a file before it answers `busy`), answers `file-batch-ack` (`not-ready` before the viewer is bound; viewers repeat the announcement once), and sends OFFER packets only after an ok ack. A batch is dropped when its deadline passes: a save batch after 15 minutes without progress, a paste or drop batch 60 seconds plus one second per MiB announced after its announcement, however much progress there is. That hard limit is deliberate: progress is visible only on the unsealed file socket, so an idle timeout could be refreshed by a relay trickling bytes, and bytes held back would be pasted or dropped into whatever the user has in front of them much later. The viewer sends `file-batch-cancel` when it cancels or fails a batch or gets no ack, which frees the slot and stops the batch's uploads on the host. A batch whose file fails or goes missing is dropped as a whole, so the host refuses its later offers.
+- **What the host accepts.** An OFFER must match its announced file exactly (batch id, index, count, purpose, drop point, name, size, mime, mtime) and starts at most once, so a replayed OFFER or batch is refused as `unannounced`; nothing that reaches a saved file or drop descriptor comes from unsealed data. The DONE hash must equal the announced hash. Bytes that differ fail as `hash-mismatch` before anything reaches the clipboard, paste or the drop target. Files are placed only when every announced file of the batch has arrived and verified: if any is missing or failed, none reaches the clipboard, a paste or a drop.
+- **Downloads.** Before each REQUEST packet, the viewer sends `file-request` for the offer id and item ids. The host serves a REQUEST once for an item that `file-request` asked for within 60 seconds; a REQUEST that arrives first waits up to 5 seconds for its `file-request`. Any other REQUEST is cancelled as `unauthorized`. The viewer accepts a download OFFER only when its `batchId` equals the requested offer id and its size equals the sealed offer's; the saved name, type and size come from the sealed `file-offer` item, never from the file socket.
 - **Ids.** Batch ids and offer ids are 32 lowercase hex digits (128 random bits), so a packet cannot guess one.
-- **Not covered.** File payloads on a WSS relay stay readable to it, and a relay can still delay or drop them. Their end-to-end encryption belongs to phase 4 of [device keys](device-keys.md).
+- **Not covered.** File payloads on a WSS relay stay readable to it, and a relay can still delay or drop them. Uploads to the PC cannot be planted or replaced (the announced SHA-256 is sealed), but downloads to the viewer can be altered by a relay: their bytes are neither encrypted nor covered by a sealed hash (the DONE hash comes over the same unsealed socket), so the viewer only learns of damage and not of tampering. A sealed hash for downloads and end-to-end payload encryption (phase 4 of [device keys](device-keys.md)) are follow-ups.
 
 ## Implementation and checks
 
@@ -35,18 +35,19 @@ The setup/update scripts create Send To > BubblePlay. The tray stages requests u
 
 Rust, JavaScript and Kotlin exercise the shared fixture. The isolated Windows lab checks for this (`stream-lab-file-transfer`, `stream-lab-native-file-drop`) were removed at CUT-1 with the JavaScript Worker relay. Source checks and prior Chrome/Explorer evidence do not prove a fresh installation or native interoperability through the Rust relay; see [release status](../release-status.md).
 
-## Wire contract (v1)
+## Wire contract (v2)
 
-Capability: host capabilities gain `fileTransfer: 1`. Clients hide all file UI when it is absent.
+Capability: host capabilities gain `fileTransfer: 2`. Clients hide all file UI when it is absent or lower. Version 2 changed batch and offer ids from numbers to 32-digit hex strings and added the announcement; every sealed file message carries `protocol: 2`, so an older peer is refused or ignored cleanly (no file UI, `file-offer` of another protocol dropped) instead of failing to parse.
 Native drops additionally require `fileDrop: 1`. Older clients and mobile clients continue using save/paste.
 Pre-release host hover additionally requires `fileDropPreview: 1` alongside both existing capabilities, and remains desktop-only.
 
 Signaling (`/ws`, JSON; after the handshake each message is a `ctl` kind, with its type as `kind`). `id128` is 32 lowercase hex digits:
 
-- host → client `{"type":"file-offer","protocol":1,"offerId":id128,"items":[{"id":u32,"name":string,"size":u64}],"source":"clipboard"|"sendto"}`; a new offer replaces the previous one; `items: []` withdraws it.
-- client → host `{"type":"file-batch","protocol":1,"batchId":id128,"purpose":"save"|"paste"|"drop","drop"?:{...},"files":[{"name":string,"size":u64,"sha256":hex64}]}`: one to 64 files, at most 192 KiB of text; `drop` is present exactly for purpose `drop`. See [Authorization](#authorization).
-- host → client `{"type":"file-batch-ack","protocol":1,"batchId":id128,"ok":bool,"error"?:"not-ready"|"duplicate-batch"|"busy"}`.
-- client → host `{"type":"file-request","protocol":1,"offerId":id128,"ids":[u32]}`: one to 64 item ids of the current offer.
+- host → client `{"type":"file-offer","protocol":2,"offerId":id128,"items":[{"id":u32,"name":string,"size":u64}],"source":"clipboard"|"sendto"}`; a new offer replaces the previous one; `items: []` withdraws it.
+- client → host `{"type":"file-batch","protocol":2,"batchId":id128,"purpose":"save"|"paste"|"drop","drop"?:{...},"files":[{"name":string,"size":u64,"mime":string,"mtimeMs":u64,"sha256":hex64}]}`: one to 64 files, at most 192 KiB of text; `drop` is present exactly for purpose `drop`. See [Authorization](#authorization).
+- host → client `{"type":"file-batch-ack","protocol":2,"batchId":id128,"ok":bool,"error"?:"not-ready"|"duplicate-batch"|"busy"}`.
+- client → host `{"type":"file-batch-cancel","protocol":2,"batchId":id128}`: the viewer gave up on the batch (cancelled, failed locally, no ack).
+- client → host `{"type":"file-request","protocol":2,"offerId":id128,"ids":[u32]}`: one to 64 item ids of the current offer.
 - client → host `{"type":"file-drag-preview","protocol":1,"epoch":currentMediaEpoch,"dragId":positiveU32,"action":"update","drop":{"x":u16,"y":u16,"generation":nonzeroU32,"viewportRevision":u32},"types":[mimeHints]}`. One to 64 hints, each at most 96 ASCII graphic bytes; empty means unknown. No names, paths or bytes. Controls are at most 8192 UTF-8 bytes, current-epoch client-only, and never buffered for a later host. `action:"cancel"` omits `drop` and `types`. Client throttles motion to 200 ms and renews stationary hover every 500 ms. Host lease expires after two seconds without controls or 120 seconds overall; readiness/geometry/session changes cancel it. A refused/expired drag ID is not repeatedly restarted. Actual local drop cancels before upload; the final handover waits at most two seconds for complete native cleanup without blocking capture.
 
 File socket: `/file-ws?pc=<id>&epoch=<mediaEpoch>` (viewer: ticket hello as on media sockets; a browser viewer also needs the gate cookie) and `/host-file-ws?pc=<id>&epoch=<mediaEpoch>` (host: its ticket from the `/host-ws` hello-ok, sent in the hello; no authorization header and no host gate token). The relay pairs one file-viewer with one file-host per epoch.

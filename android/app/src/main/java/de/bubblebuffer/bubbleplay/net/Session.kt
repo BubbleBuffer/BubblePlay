@@ -684,7 +684,7 @@ class Session(
             // takes the PC's caps (its "opened" event) and the upload acknowledgements.
             "caps", "logs-state", "logs-ack", "feedback-ack" -> ctl.onEndpoint(msg)
             "host-capabilities" -> {
-                val files = msg.optInt("fileTransfer") >= 1
+                val files = msg.optInt("fileTransfer") >= FileWire.PROTOCOL
                 val sound = msg.optInt("audio") >= 1
                 main.post { listener.onFileCapability(files); listener.onSoundCapability(sound) }
                 followCapable = FollowWindow.capable(msg)

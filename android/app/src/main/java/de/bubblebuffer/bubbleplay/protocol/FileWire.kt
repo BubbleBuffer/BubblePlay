@@ -18,7 +18,8 @@ import java.nio.charset.StandardCharsets
  * transferId u32 LE, seq u32 LE (DATA: chunk index from 0, otherwise 0).
  */
 object FileWire {
-    const val PROTOCOL = 1
+    /** `protocol` of the sealed file messages and the `fileTransfer` capability a host must advertise (2: hex ids, announced batches). */
+    const val PROTOCOL = 2
     const val HEADER = 16
     val MAGIC = byteArrayOf('B'.code.toByte(), 'P'.code.toByte(), 'F'.code.toByte(), '1'.code.toByte())
 
@@ -227,12 +228,24 @@ object FileWire {
     fun randomId128(random: java.security.SecureRandom): String = hex(ByteArray(16).also { random.nextBytes(it) })
 
     /** One file of a `file-batch` announcement: the PC accepts exactly these bytes for it. */
-    data class Announced(val name: String, val size: Long, val sha256: ByteArray)
+    data class Announced(val name: String, val size: Long, val mime: String, val mtimeMs: Long, val sha256: ByteArray)
 
     /** The announcement the viewer sends over the sealed control channel before the batch's OFFER packets. */
     fun batchMessage(batchId: String, purpose: String, files: List<Announced>): JSONObject = JSONObject()
         .put("type", "file-batch").put("protocol", PROTOCOL).put("batchId", batchId).put("purpose", purpose)
-        .put("files", JSONArray(files.map { JSONObject().put("name", it.name).put("size", it.size).put("sha256", hex(it.sha256)) }))
+        .put("files", JSONArray(files.map {
+            JSONObject().put("name", it.name).put("size", it.size).put("mime", it.mime).put("mtimeMs", it.mtimeMs).put("sha256", hex(it.sha256))
+        }))
+
+    /** The viewer gave up on a batch: the PC stops it and frees its slot. */
+    fun batchCancelMessage(batchId: String): JSONObject =
+        JSONObject().put("type", "file-batch-cancel").put("protocol", PROTOCOL).put("batchId", batchId)
+
+    /**
+     * Whether the file socket's OFFER for a download agrees with the sealed offer [item]. Only the size has to
+     * match: the saved name, type and size come from the sealed offer, never from the file socket.
+     */
+    fun matchesOffer(item: Item, offerId: String, meta: Meta): Boolean = meta.batchId == offerId && meta.size == item.size
 
     /** Asks the PC, over the sealed control channel, for items of its offer before the REQUEST packets. */
     fun requestMessage(offerId: String, ids: List<Long>): JSONObject =

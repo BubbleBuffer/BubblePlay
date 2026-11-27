@@ -28,6 +28,8 @@ import java.io.InputStream
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.ArrayDeque
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -68,6 +70,10 @@ class FileTransfers(
     private val store = DownloadStore(app)
     private val thread = HandlerThread("bp-file").apply { start() }
     private val handler = Handler(thread.looper)
+    /** Reads, sizes and hashes files off the socket thread, so pings and a running download are not held up. */
+    private val prep: ExecutorService = Executors.newSingleThreadExecutor { Thread(it, "bp-file-prep").apply { isDaemon = true } }
+    /** Bumped when uploads are cancelled: batches still being prepared are then dropped. */
+    private var uploadGeneration = 0
     private val main = Handler(Looper.getMainLooper())
     private val random = SecureRandom()
     private val http = OkHttpClient.Builder()
@@ -83,10 +89,16 @@ class FileTransfers(
     )
 
     /** Where a batch stands with the PC: announced over the sealed control channel, then admitted (ACKED), before any OFFER. */
-    private enum class Announce { NEW, SENT, ACKED, FAILED }
+    private enum class Announce { NEW, SENT, RETRY, ACKED, FAILED }
 
     private class Batch(val id: String, val purpose: String, var count: Int) {
         var announce = Announce.NEW
+        /** Counts announcements, so a timer of an earlier one (before an epoch change) does not fail the new one. */
+        var announceSeq = 0
+        /** The PC answered `not-ready` once and the announcement was repeated. */
+        var retried = false
+        /** The PC was told (`file-batch-cancel`) to drop this batch. */
+        var cancelSent = false
         val jobs = ArrayList<Upload>()
         var finished = 0
         var saved = 0
@@ -151,7 +163,7 @@ class FileTransfers(
 
     // ---- public API (any thread) ----------------------------------------------------------
 
-    /** The host announced (or lost) `fileTransfer: 1`. Queued work waits while disabled. */
+    /** The host announced (or lost) the `fileTransfer` capability. Queued work waits while disabled. */
     fun setEnabled(value: Boolean) = handler.post {
         enabled = value
         if (value) startNext()
@@ -163,6 +175,12 @@ class FileTransfers(
      */
     fun upload(uris: List<Uri>, purpose: String) = handler.post {
         if (closed || uris.isEmpty()) return@post
+        val generation = uploadGeneration
+        prep.execute { prepareBatch(uris, purpose, generation) }
+    }
+
+    /** Runs on the prep thread: reads and hashes every file, then queues the batch on the socket thread. */
+    private fun prepareBatch(uris: List<Uri>, purpose: String, generation: Int) {
         val batch = Batch(FileWire.randomId128(random), purpose, 0)
         val jobs = ArrayList<Upload>()
         for (uri in uris.take(FileWire.MAX_BATCH)) {
@@ -174,7 +192,12 @@ class FileTransfers(
             }
             if (job != null) jobs += job
         }
-        if (jobs.isEmpty()) return@post
+        handler.post { enqueue(batch, jobs, generation) }
+    }
+
+    private fun enqueue(batch: Batch, jobs: List<Upload>, generation: Int) {
+        if (closed || generation != uploadGeneration) { jobs.forEach { it.staged?.delete() }; return }
+        if (jobs.isEmpty()) return
         batch.count = jobs.size
         batch.jobs.addAll(jobs)
         ups.addAll(jobs)
@@ -197,6 +220,15 @@ class FileTransfers(
      */
     fun epochChanged() = handler.post {
         if (ws != null) socketLost("epoch changed", counts = false)
+        // The host forgot every announced batch when it rebound: untouched batches are announced again, and a
+        // batch that already lost or finished a file cannot be completed any more.
+        for (batch in ups.map { it.batch }.distinct()) {
+            if (batch.finished > 0) { abandonBatch(batch); continue }
+            batch.announce = Announce.NEW
+            batch.retried = false
+            batch.cancelSent = false
+        }
+        progress(force = true)
     }
 
     /** Stops the active transfer in [direction] and everything queued behind it. */
@@ -215,6 +247,7 @@ class FileTransfers(
             cancelDirection(Direction.UP, ERR_CANCELLED, report = false)
             cancelDirection(Direction.DOWN, ERR_CANCELLED, report = false)
             closeSocket("shutdown")
+            prep.shutdownNow()
             thread.quitSafely()
         }
     }
@@ -405,6 +438,7 @@ class FileTransfers(
     private fun cancelDirection(direction: Direction, error: String, report: Boolean) {
         val socket = ws
         if (direction == Direction.UP) {
+            uploadGeneration++
             up?.job?.batch?.silent = !report
             ups.forEach { it.batch.silent = !report }
             up?.let { active ->
@@ -434,10 +468,11 @@ class FileTransfers(
     /** True once the PC admitted [batch]; announces it first (over the sealed control channel) and waits for the ack. */
     private fun admitted(batch: Batch): Boolean {
         if (batch.announce != Announce.NEW) return batch.announce == Announce.ACKED
-        val files = batch.jobs.map { FileWire.Announced(it.name, it.size, it.sha256) }
+        val files = batch.jobs.map { FileWire.Announced(it.name, it.size, it.mime, it.mtimeMs, it.sha256) }
         if (!sendControl(FileWire.batchMessage(batch.id, batch.purpose, files))) { failBatch(batch, ERR_UNAVAILABLE); return false }
         batch.announce = Announce.SENT
-        handler.postDelayed({ if (batch.announce == Announce.SENT) failBatch(batch, ERR_TIMEOUT) }, ACK_WAIT_MS)
+        val seq = ++batch.announceSeq
+        handler.postDelayed({ if (batch.announce == Announce.SENT && batch.announceSeq == seq) failBatch(batch, ERR_TIMEOUT) }, ACK_WAIT_MS)
         return false
     }
 
@@ -445,6 +480,13 @@ class FileTransfers(
     fun onBatchAck(ack: FileWire.BatchAck) = handler.post {
         val batch = ups.firstOrNull { it.batch.id == ack.batchId }?.batch ?: return@post
         if (batch.announce != Announce.SENT) return@post
+        if (!ack.ok && ack.error == ERR_NOT_READY && !batch.retried) {
+            // The PC has not bound this viewer yet (session start): ask once more shortly.
+            batch.retried = true
+            batch.announce = Announce.RETRY
+            handler.postDelayed({ if (batch.announce == Announce.RETRY) { batch.announce = Announce.NEW; startNext() } }, NOT_READY_RETRY_MS)
+            return@post
+        }
         if (!ack.ok) return@post failBatch(batch, ack.error ?: ERR_REFUSED)
         batch.announce = Announce.ACKED
         startNext()
@@ -452,12 +494,33 @@ class FileTransfers(
 
     /** The batch was refused or never answered: none of its queued files goes out. */
     private fun failBatch(batch: Batch, error: String) {
+        cancelOnPc(batch)
         batch.announce = Announce.FAILED
         val queued = ups.filter { it.batch === batch }
         ups.removeAll(queued.toSet())
         for (job in queued) { finishBatchItem(job, false); job.staged?.delete(); fail(Direction.UP, job.name, error) }
         progress(force = true)
         startNext()
+    }
+
+    /** Tells the PC to drop an announced batch (once): its slot is freed and nothing of it is pasted or dropped later. */
+    private fun cancelOnPc(batch: Batch) {
+        if (batch.cancelSent || (batch.announce != Announce.SENT && batch.announce != Announce.ACKED)) return
+        batch.cancelSent = true
+        sendControl(FileWire.batchCancelMessage(batch.id))
+    }
+
+    /** A file of the batch failed or was cancelled: the PC drops the batch, so its queued files do not go out. */
+    private fun abandonBatch(batch: Batch) {
+        cancelOnPc(batch)
+        val rest = ups.filter { it.batch === batch }
+        if (rest.isEmpty()) return
+        ups.removeAll(rest.toSet())
+        for (job in rest) {
+            finishBatchItem(job, false)
+            job.staged?.delete()
+            if (!batch.silent) fail(Direction.UP, job.name, ERR_BATCH)
+        }
     }
 
     // ---- upload ---------------------------------------------------------------------------------
@@ -527,7 +590,7 @@ class FileTransfers(
     private fun finishBatchItem(job: Upload, ok: Boolean) {
         val batch = job.batch
         batch.finished++
-        if (ok) batch.saved++
+        if (ok) batch.saved++ else abandonBatch(batch)
         if (batch.finished == batch.count && !batch.silent) {
             val saved = batch.saved
             val failed = batch.count - saved
@@ -634,15 +697,17 @@ class FileTransfers(
         when (packet.type) {
             FileWire.OFFER -> {
                 if (active.meta != null) return abortDownload(active, ERR_PROTOCOL)
-                val meta = FileWire.parseMeta(packet.payload)?.takeIf { it.batchId == active.job.offerId } ?: return abortDownload(active, ERR_PROTOCOL)
+                val item = active.job.item
+                val meta = FileWire.parseMeta(packet.payload)?.takeIf { FileWire.matchesOffer(item, active.job.offerId, it) } ?: return abortDownload(active, ERR_PROTOCOL)
                 active.meta = meta
-                val name = FileNames.forDownload(meta.name)
-                val mime = FileNames.mime(name, meta.mime) { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it) }
+                // Name, type and size come from the sealed offer item; the file socket's OFFER only has to agree on size.
+                val name = FileNames.forDownload(item.name)
+                val mime = FileNames.mime(name, null) { MimeTypeMap.getSingleton().getMimeTypeFromExtension(it) }
                 active.target = try { store.create(name, mime) } catch (e: Exception) {
                     Log.w(TAG, "download create failed: ${e.message}")
                     return abortDownload(active, ERR_STORAGE)
                 }
-                active.check = ReceiveCheck(meta.size)
+                active.check = ReceiveCheck(item.size)
                 ws?.let { send(it, FileWire.encode(FileWire.ACCEPT, active.tid)) }
                 progress(force = true)
             }
@@ -734,6 +799,8 @@ class FileTransfers(
         private const val PING_MS = 15_000L
         private const val PEER_WAIT_MS = 10_000L
         private const val ACK_WAIT_MS = 10_000L
+        private const val NOT_READY_RETRY_MS = 500L
+        private const val ERR_NOT_READY = "not-ready"
         private const val PING = "{\"type\":\"ping\"}"
 
         const val ERR_CANCELLED = "cancelled"
@@ -746,5 +813,6 @@ class FileTransfers(
         const val ERR_PROTOCOL = "unexpected"
         const val ERR_REFUSED = "refused"
         const val ERR_TIMEOUT = "timeout"
+        const val ERR_BATCH = "batch-failed"
     }
 }

@@ -3,8 +3,10 @@ package de.bubblebuffer.bubbleplay.protocol
 import org.json.JSONObject
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** Spec-derived checks (`docs/architecture/file-transfer.md`); the shared fixture is in FileContractTest. */
@@ -82,6 +84,16 @@ class FileWireTest {
         assertNull(FileWire.parse(FileWire.encodeJson(FileWire.OFFER, 1, meta().toJson().put("name", "é".repeat(512)))).error)
     }
 
+    @Test
+    fun aDownloadOfferFromTheFileSocketMustAgreeWithTheSealedOffer() {
+        val item = FileWire.Item(1, "report.pdf", 1234)
+        // The file socket may carry another name or type; only the offer id and the size have to match.
+        val other = FileWire.Meta("evil.exe", 1234, "application/x-msdownload", 0, "save", id(9), 0, 1)
+        assertTrue(FileWire.matchesOffer(item, id(9), other))
+        assertFalse(FileWire.matchesOffer(item, id(9), other.copy(size = 1235)))
+        assertFalse(FileWire.matchesOffer(item, id(8), other))
+    }
+
     private fun meta() = FileWire.Meta("photo.jpg", 1234, "image/jpeg", 1_700_000_000_000, "save", id(42), 0, 2)
 
     private fun id(n: Int) = "%032x".format(n)
@@ -104,15 +116,15 @@ class FileWireTest {
 
     @Test
     fun fileOfferMessage() {
-        val msg = JSONObject("""{"type":"file-offer","protocol":1,"offerId":"${id(5)}","source":"clipboard",
+        val msg = JSONObject("""{"type":"file-offer","protocol":2,"offerId":"${id(5)}","source":"clipboard",
             "items":[{"id":1,"name":"a.txt","size":3},{"id":2,"name":"b.png","size":2048}]}""")
         val offer = FileWire.parseOfferMessage(msg)!!
         assertEquals(id(5), offer.offerId)
         assertEquals(2, offer.items.size)
         assertEquals(2051L, offer.totalBytes)
-        val withdrawn = FileWire.parseOfferMessage(JSONObject("""{"type":"file-offer","protocol":1,"offerId":"${id(6)}","source":"sendto","items":[]}"""))!!
+        val withdrawn = FileWire.parseOfferMessage(JSONObject("""{"type":"file-offer","protocol":2,"offerId":"${id(6)}","source":"sendto","items":[]}"""))!!
         assertEquals(0, withdrawn.items.size)
-        assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("protocol", 2)))
+        assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("protocol", 1)), "an older host is rejected, not misparsed")
         assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("source", "disk")))
         val dup = JSONObject(msg.toString())
         dup.getJSONArray("items").getJSONObject(1).put("id", 1)

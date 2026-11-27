@@ -151,7 +151,7 @@ class FileContractTest {
             assertEquals(case.getString("text").take(80), case.getBoolean("accepted"), offer != null)
         }
         val caps = JSONObject(fixture.getJSONObject("signaling").getJSONObject("hostCapabilities").getString("text"))
-        assertTrue(caps.optInt("fileTransfer") >= 1)
+        assertTrue(caps.optInt("fileTransfer") >= FileWire.PROTOCOL)
     }
 
     @Test
@@ -167,7 +167,7 @@ class FileContractTest {
         val batch = JSONObject(signaling.getJSONObject("fileBatch").getJSONArray("cases").getJSONObject(0).getString("text"))
         val file = batch.getJSONArray("files").getJSONObject(0)
         val built = FileWire.batchMessage(batch.getString("batchId"), batch.getString("purpose"),
-            listOf(FileWire.Announced(file.getString("name"), file.getLong("size"), hex(file.getString("sha256")))))
+            listOf(FileWire.Announced(file.getString("name"), file.getLong("size"), file.getString("mime"), file.getLong("mtimeMs"), hex(file.getString("sha256")))))
         assertEquals(batch.getString("type"), built.getString("type"))
         assertEquals(batch.getString("batchId"), built.getString("batchId"))
         assertEquals(batch.getString("purpose"), built.getString("purpose"))
@@ -175,6 +175,13 @@ class FileContractTest {
         assertEquals(file.getString("name"), builtFile.getString("name"))
         assertEquals(file.getLong("size"), builtFile.getLong("size"))
         assertEquals(file.getString("sha256"), builtFile.getString("sha256"))
+        assertEquals(file.getString("mime"), builtFile.getString("mime"))
+        assertEquals(file.getLong("mtimeMs"), builtFile.getLong("mtimeMs"))
+        val cancel = JSONObject(signaling.getJSONObject("fileBatchCancel").getJSONArray("cases").getJSONObject(0).getString("text"))
+        val builtCancel = FileWire.batchCancelMessage(cancel.getString("batchId"))
+        assertEquals(cancel.getString("type"), builtCancel.getString("type"))
+        assertEquals(cancel.getInt("protocol"), builtCancel.getInt("protocol"))
+        assertEquals(cancel.getString("batchId"), builtCancel.getString("batchId"))
         val request = JSONObject(signaling.getJSONObject("fileRequest").getJSONArray("cases").getJSONObject(0).getString("text"))
         val ids = request.getJSONArray("ids")
         val builtRequest = FileWire.requestMessage(request.getString("offerId"), (0 until ids.length()).map { ids.getLong(it) })
