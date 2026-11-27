@@ -33,6 +33,8 @@ use tracing::{debug, info, warn};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
+mod requests;
+
 use crate::file_auth::Authorizations;
 use crate::file_control::{
     file_offer_message, random_id128, BatchAnnouncement, DownloadRequest, FileOfferItem,
@@ -1462,50 +1464,26 @@ impl Session {
 
     fn start_next_request(&mut self, ws: &mut Socket, shared: &Mutex<Shared>) -> Result<()> {
         while let Some((id, request, asked_at)) = self.requests.pop_front() {
-            let offered = {
-                let mut state = lock(shared);
-                let found = state.offer.as_ref().and_then(|offer| {
-                    (offer.id == request.offer_id)
-                        .then(|| {
-                            let index =
-                                offer.items.iter().position(|item| item.id == request.id)?;
-                            Some((
-                                offer.items[index].clone(),
-                                index as u32,
-                                offer.items.len() as u32,
-                            ))
-                        })
-                        .flatten()
-                });
-                match found {
-                    Some(found) => {
-                        // The viewer must have asked for this item over the sealed control
-                        // channel; its message may trail the REQUEST by a moment.
-                        if state
-                            .auth
-                            .take_grant(&request.offer_id, request.id, Instant::now())
-                        {
-                            Some(found)
-                        } else if asked_at.elapsed() < self.request_grace {
-                            self.requests.push_front((id, request, asked_at));
-                            return Ok(());
-                        } else {
-                            warn!(
-                                transfer = id,
-                                "file request refused: not asked for over the control channel"
-                            );
-                            drop(state);
-                            send_cancel(ws, id, "unauthorized")?;
-                            continue;
-                        }
+            let (item, index, count) =
+                match requests::resolve(shared, &request, asked_at, self.request_grace) {
+                    requests::Resolved::Item(item, index, count) => (item, index, count),
+                    requests::Resolved::Wait => {
+                        self.requests.push_front((id, request, asked_at));
+                        return Ok(());
                     }
-                    None => None,
-                }
-            };
-            let Some((item, index, count)) = offered else {
-                send_cancel(ws, id, "unknown-offer")?;
-                continue;
-            };
+                    requests::Resolved::Unauthorized => {
+                        warn!(
+                            transfer = id,
+                            "file request refused: not asked for over the control channel"
+                        );
+                        send_cancel(ws, id, "unauthorized")?;
+                        continue;
+                    }
+                    requests::Resolved::Unknown => {
+                        send_cancel(ws, id, "unknown-offer")?;
+                        continue;
+                    }
+                };
             let opened = File::open(&item.path).and_then(|file| {
                 let metadata = file.metadata()?;
                 Ok((file, metadata))
