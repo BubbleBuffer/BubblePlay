@@ -13,7 +13,10 @@ import android.graphics.drawable.StateListDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.text.Spannable
+import android.text.SpannableString
 import android.text.TextUtils
+import android.text.style.StyleSpan
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
@@ -52,6 +55,13 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         val zoomed: Boolean
         val immersive: Boolean
         val latched: Set<String>
+        /** Modifiers held down until tapped again. */
+        val locked: Set<String>
+        /** A mouse or other pointer device is connected (shows the Work/Game item). */
+        val pointerPresent: Boolean
+        /** Mouse mode: Game (captured, relative) instead of Work (absolute). */
+        val gameMode: Boolean
+        fun toggleGameMode()
         val monitors: List<Session.Monitor>
         val monitorError: String?
         val switchingMonitor: String?
@@ -75,7 +85,12 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         fun sendChord(chord: Chord)
         fun pastePhoneClipboard()
         fun copyPcClipboard()
-        fun toggleLatch(code: String)
+        /** Tap a modifier: off, latched, locked, off. */
+        fun tapModifier(code: String)
+        /** Long-press a modifier: lock it, or unlock it when locked. */
+        fun longPressModifier(code: String)
+        /** Let go of every latched and locked modifier. */
+        fun clearModifiers()
         /** Tap a key with any latched modifiers (then the latch clears). */
         fun tapKey(code: String)
         /** Hold-to-repeat: first press (takes the latched modifiers), repeats, release. */
@@ -98,6 +113,10 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
     private val keyboardItem: ImageButton
     private val screenItem: ImageButton
     private val modeItem: ImageButton
+    private val pointerItem: ImageButton
+    private val pointerLabel: TextView
+    private val modifierRow: LinearLayout
+    private val clearItem: ImageButton
     private val shortcutsItem: ImageButton
     private val keysItem: ImageButton
     private val arrowsItem: ImageButton
@@ -110,6 +129,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
     private var panel: View? = null
     private var openKind: Kind? = null
     private val modifierKeys = HashMap<String, TextView>()
+    private val barModifierKeys = HashMap<String, TextView>()
 
     /** The docked bar's height in px (hairline plus one row of 48 dp targets). */
     val height: Int get() = dp(1) + dp(BAR_ITEM_DP)
@@ -147,7 +167,19 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
 
         keyboardItem = item(R.drawable.ic_bar_keyboard, R.string.bar_keyboard_show) { host.toggleKeyboard(); render() }
         screenItem = item(R.drawable.ic_bar_monitor, R.string.bar_screen) { toggle(Kind.SCREEN) }
-        modeItem = item(R.drawable.ic_bar_trackpad, R.string.bar_shortcuts) { host.toggleTouchMode(); render() }
+        modeItem = item(R.drawable.ic_bar_trackpad, R.string.mode_trackpad) { host.toggleTouchMode(); render() }
+        pointerItem = item(R.drawable.ic_bar_work, R.string.bar_pointer) { host.toggleGameMode(); render() }
+        pointerLabel = TextView(activity).apply {
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(MILK)
+            isSingleLine = true
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, dp(6), 0)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO // the item carries the state
+            setOnClickListener { host.toggleGameMode(); render() }
+        }
+        row.addView(pointerLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(BAR_ITEM_DP)))
         shortcutsItem = item(R.drawable.ic_bar_shortcuts, R.string.bar_shortcuts) { toggle(Kind.SHORTCUTS) }
         keysItem = item(R.drawable.ic_bar_keys, R.string.bar_keys) { toggle(Kind.KEYS) }
         arrowsItem = item(R.drawable.ic_bar_arrows, R.string.bar_arrows) { toggle(Kind.ARROWS) }
@@ -164,8 +196,22 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO // announced via the Keys item
         }
         row.addView(latchLabel, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        clearItem = item(R.drawable.ic_bar_close, R.string.bar_modifiers_clear) { host.clearModifiers(); render() }
         moreItem = item(R.drawable.ic_bar_more, R.string.bar_more) { toggle(Kind.MORE) }
         items = mapOf(Kind.SCREEN to screenItem, Kind.SHORTCUTS to shortcutsItem, Kind.KEYS to keysItem, Kind.ARROWS to arrowsItem, Kind.MORE to moreItem)
+
+        // The four modifiers directly above the soft keyboard (the bar is the dock's last row).
+        modifierRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(4), 0, dp(4), dp(2))
+            visibility = View.GONE
+        }
+        for (code in Shortcuts.MODIFIERS) {
+            val key = modifierKey(code)
+            barModifierKeys[code] = key
+            modifierRow.addView(key, LinearLayout.LayoutParams(0, dp(40), 1f).apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+        }
+        bar.addView(modifierRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         dock.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         render()
@@ -201,16 +247,37 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         modeItem.setImageResource(if (direct) R.drawable.ic_bar_direct else R.drawable.ic_bar_trackpad)
         describe(modeItem, activity.getString(R.string.bar_mode, activity.getString(if (direct) R.string.mode_direct else R.string.mode_trackpad)))
 
+        val game = host.gameMode
+        val pointerState = activity.getString(if (game) R.string.settings_pointer_game else R.string.settings_pointer_work)
+        pointerItem.visibility = if (host.pointerPresent) View.VISIBLE else View.GONE
+        pointerItem.setImageResource(if (game) R.drawable.ic_bar_game else R.drawable.ic_bar_work)
+        describe(pointerItem, activity.getString(R.string.bar_pointer))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) pointerItem.stateDescription = pointerState
+        pointerLabel.text = pointerState
+        modifierRow.visibility = if (keyboard) View.VISIBLE else View.GONE
+
         zoomItem.visibility = if (host.zoomed) View.VISIBLE else View.GONE
         attachItem.visibility = if (host.fileTransfer) View.VISIBLE else View.GONE
 
         val latched = host.latched
-        val names = Shortcuts.MODIFIERS.filter { it in latched }.joinToString("+") { Shortcuts.keyName(it) }
-        latchLabel.text = names
+        val locked = host.locked
+        val held = Shortcuts.MODIFIERS.filter { it in latched || it in locked }
+        val names = held.joinToString("+") { Shortcuts.keyName(it) }
+        latchLabel.text = SpannableString(names).apply {
+            // Locked names are bold; latched ones are regular.
+            var at = 0
+            for (code in held) {
+                val name = Shortcuts.keyName(code)
+                if (code in locked) setSpan(StyleSpan(Typeface.BOLD), at, at + name.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                at += name.length + 1
+            }
+        }
+        clearItem.visibility = if (held.isEmpty()) View.GONE else View.VISIBLE
         describe(keysItem, if (names.isEmpty()) activity.getString(R.string.bar_keys) else activity.getString(R.string.bar_keys_latched, names))
-        for ((kind, view) in items) view.isActivated = openKind == kind || (kind == Kind.KEYS && latched.isNotEmpty())
+        for ((kind, view) in items) view.isActivated = openKind == kind || (kind == Kind.KEYS && held.isNotEmpty())
 
-        for ((code, key) in modifierKeys) renderModifier(key, code, code in latched)
+        for ((code, key) in modifierKeys) renderModifier(key, code, code in latched, code in locked)
+        for ((code, key) in barModifierKeys) renderModifier(key, code, code in latched, code in locked)
     }
 
     private fun describe(view: View, text: String) {
@@ -387,7 +454,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         val column = column()
         column.addView(caption(R.string.pop_keys))
         column.addView(keyRow(Shortcuts.MODIFIERS.map { code ->
-            key(Shortcuts.keyName(code)) { host.toggleLatch(code); render() }.also { modifierKeys[code] = it }
+            modifierKey(code).also { modifierKeys[code] = it }
         }))
         column.addView(keyRow(listOf(tapKey("Escape"), tapKey("Tab"), tapKey("Home"), tapKey("End"), holdKey("PageUp"), holdKey("PageDown"))))
         column.addView(keyRow(listOf(holdKey("Delete"), holdKey("ArrowLeft", R.string.key_left), holdKey("ArrowUp", R.string.key_up),
@@ -558,13 +625,29 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         }
     }
 
-    private fun renderModifier(key: TextView, code: String, latched: Boolean) {
+    /** Tap latches, locks and unlocks; a long press locks (or unlocks). */
+    private fun modifierKey(code: String) = key(Shortcuts.keyName(code)) { host.tapModifier(code); render() }.apply {
+        setOnLongClickListener { host.longPressModifier(code); render(); true }
+    }
+
+    /** Latched: inverted fill and underline. Locked: apricot fill, bold and a milk outline. */
+    private fun renderModifier(key: TextView, code: String, latched: Boolean, locked: Boolean) {
         key.isActivated = latched
+        key.isSelected = locked
         val name = Shortcuts.keyName(code)
-        key.contentDescription = if (latched) activity.getString(R.string.pop_latched, name) else name
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) key.stateDescription = if (latched) activity.getString(R.string.pop_on) else activity.getString(R.string.pop_off)
-        // Held is also shown by shape (inverted fill), not only by colour.
+        key.contentDescription = when {
+            locked -> activity.getString(R.string.pop_locked, name)
+            latched -> activity.getString(R.string.pop_latched, name)
+            else -> name
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) key.stateDescription = activity.getString(when {
+            locked -> R.string.mod_state_locked
+            latched -> R.string.mod_state_latched
+            else -> R.string.pop_off
+        })
+        // Held is also shown by shape (underline, bold), not only by colour.
         key.paintFlags = if (latched) key.paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG else key.paintFlags and android.graphics.Paint.UNDERLINE_TEXT_FLAG.inv()
+        key.typeface = if (locked) Typeface.create(Typeface.MONOSPACE, Typeface.BOLD) else Typeface.MONOSPACE
     }
 
     private fun startRepeat(code: String) {
@@ -609,6 +692,7 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
     }
 
     private fun keyBackground(): Drawable = StateListDrawable().apply {
+        addState(intArrayOf(android.R.attr.state_selected), shape(APRICOT, MILK))
         addState(intArrayOf(android.R.attr.state_activated), shape(MILK))
         addState(intArrayOf(android.R.attr.state_pressed), shape(THREAD))
         addState(intArrayOf(), shape(SURFACE_MUTED))
@@ -630,8 +714,12 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
         override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
             val available = MeasureSpec.getSize(widthMeasureSpec) - paddingLeft - paddingRight
             val buttons = (0 until childCount).map { getChildAt(it) }.filter { it is ImageButton && it.visibility != View.GONE }
+            // The Work/Game label shows only when the buttons keep (nearly) their full size beside it.
+            val labelWidth = dp(POINTER_LABEL_DP)
+            val label = pointerItem.visibility == View.VISIBLE && available - buttons.size * dp(44) >= labelWidth
+            pointerLabel.visibility = if (label) View.VISIBLE else View.GONE
             if (buttons.isNotEmpty() && MeasureSpec.getMode(widthMeasureSpec) != MeasureSpec.UNSPECIFIED) {
-                val size = (available / buttons.size).coerceIn(dp(40), dp(BAR_ITEM_DP))
+                val size = ((available - if (label) labelWidth else 0) / buttons.size).coerceIn(dp(40), dp(BAR_ITEM_DP))
                 for (b in buttons) (b.layoutParams as LayoutParams).width = size
             }
             super.onMeasure(widthMeasureSpec, heightMeasureSpec)
@@ -666,11 +754,12 @@ class QuickBar(private val activity: Activity, private val root: FrameLayout, pr
             intArrayOf(0x73999DA6, MILK), // disabled: lower contrast, same glyph and name
         )
         val KEY_TEXT = ColorStateList(
-            arrayOf(intArrayOf(android.R.attr.state_activated), intArrayOf()),
-            intArrayOf(DUVET, MILK),
+            arrayOf(intArrayOf(android.R.attr.state_selected), intArrayOf(android.R.attr.state_activated), intArrayOf()),
+            intArrayOf(DUVET, DUVET, MILK),
         )
 
         const val BAR_ITEM_DP = 48
+        const val POINTER_LABEL_DP = 48
         const val REPEAT_DELAY_MS = 350L
         const val REPEAT_INTERVAL_MS = 40L
     }

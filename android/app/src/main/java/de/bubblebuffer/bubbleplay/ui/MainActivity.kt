@@ -417,6 +417,7 @@ class MainActivity : Activity(), SettingsView.Host {
 
     override val settingsConfig: ServerConfig? get() = prefs.serverConfig()
     override val inSession: Boolean get() = false
+    override val settingsPcId: String? get() = null
     override val settingsMonitors: List<Session.Monitor> get() = emptyList()
     override fun diagnostics(): Session.Diagnostics? = null
     override fun probeRoundTrip() {}
