@@ -889,15 +889,15 @@ mod tests {
     #[test]
     fn decoder_rejects_inconsistent_control_payloads() {
         let offer = |json: &str| encode_raw(PacketType::Offer, 1, 0, json.as_bytes());
-        let ok = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#;
+        let ok = r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#;
         assert!(decode(&offer(ok)).is_ok());
         for bad in [
-            r#"{"name":"","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#,
-            r#"{"name":"a","size":2147483649,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#,
-            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"open","batchId":1,"batchIndex":0,"batchCount":1}"#,
-            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":1,"batchCount":1}"#,
-            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":65}"#,
-            r#"{"name":"a","size":1.5,"mime":"","mtimeMs":0,"purpose":"save","batchId":1,"batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"a","size":2147483649,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"open","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
+            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":1,"batchCount":1}"#,
+            r#"{"name":"a","size":1,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":65}"#,
+            r#"{"name":"a","size":1.5,"mime":"","mtimeMs":0,"purpose":"save","batchId":"00000000000000000000000000000001","batchIndex":0,"batchCount":1}"#,
             r#"[1]"#,
         ] {
             assert_eq!(decode(&offer(bad)), Err(Reject::Json), "{bad}");
