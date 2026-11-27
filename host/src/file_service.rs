@@ -35,7 +35,7 @@ use tungstenite::{Message, WebSocket};
 
 use crate::file_auth::Authorizations;
 use crate::file_control::{
-    random_id128, valid_id128, AnnouncedFile, BatchAnnouncement, DownloadRequest,
+    file_offer_message, random_id128, BatchAnnouncement, DownloadRequest, FileOfferItem,
 };
 use crate::file_hash::Sha256;
 use crate::file_transfer::{
@@ -1868,6 +1868,7 @@ fn mime_for(name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_control::{valid_id128, AnnouncedFile};
 
     mod auth;
     mod batches;
