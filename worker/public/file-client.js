@@ -18,7 +18,7 @@ import {
   FT_ACK_EVERY_BYTES, FT_ACK_EVERY_MS, FT_BLOB_DOWNLOAD_MAX_BYTES, FT_WINDOW_BYTES,
   FileIncoming, FileSendWindow, Sha256, decodeFilePacket, encodeAccept, encodeAck, encodeCancel, encodeData,
   encodeDone, encodeOffer, encodeRequest, encodeResult, validDropPoint, validFileOffer, validOfferMeta,
-  FT_PROTOCOL, bytesToHex, fileRequestMessage, randomId128, validBatchAck,
+  FT_PROTOCOL, fileRequestMessage, randomId128, validBatchAck,
 } from "./file-transfer.js";
 import { ensureAnnounced, settleBatch } from "./file-announce.js";
 import { describeFileError } from "./file-errors.js";
@@ -123,14 +123,10 @@ export class FileTransferClient extends EventTarget {
     if (!offer) return [];
     const ids = [];
     for (const asked of items) {
-      // Name, size and SHA-256 come from the sealed offer, never from the caller or the file socket.
-      const item = offer.items.find(candidate => candidate.id === asked.id);
+      const item = offer.items.find(candidate => candidate.id === asked.id); // sealed name, size and hash
       if (!item) continue;
       const row = this.addRow("download", item.name, item.size, "save");
-      row.offerId = offer.offerId;
-      row.itemId = item.id;
-      row.sealedSha256 = item.sha256;
-      row.sinkFor = sinkFor;
+      Object.assign(row, { offerId: offer.offerId, itemId: item.id, sealedSha256: item.sha256, sinkFor });
       ids.push(row.id);
     }
     this.changed();
@@ -489,11 +485,7 @@ export class FileTransferClient extends EventTarget {
     if (row.writeError) throw Object.assign(new Error(), { code: "save-failed" });
     row.state = "verifying";
     this.changed();
-    // The bytes must match the hash the PC sealed in its offer; the DONE hash on the unsealed socket is only a cross-check.
-    const actual = row.hash.finish();
-    const verdict = bytesToHex(actual) !== row.sealedSha256
-      ? (row.incoming.received !== row.size ? "size-mismatch" : "hash-mismatch")
-      : row.incoming.onDone(Array.from(row.doneHash), Array.from(actual));
+    const verdict = row.incoming.onDone(Array.from(row.doneHash), Array.from(row.hash.finish()), row.sealedSha256);
     if (verdict) {
       this.sendBinary(encodeResult(row.transferId, false, verdict));
       this.fail(row, verdict);

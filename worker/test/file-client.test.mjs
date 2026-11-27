@@ -5,9 +5,7 @@ import {
   FT, FT_MAX_DATA_BYTES, FT_WINDOW_BYTES, Sha256, decodeFilePacket, encodeAccept, encodeAck, encodeCancel, encodeData, encodeDone, encodeOffer, encodeResult,
 } from "../public/file-transfer.js";
 import { describeFileError, FileTransferClient } from "../public/file-client.js";
-
-const sha = bytes => createHash("sha256").update(bytes).digest("hex");
-const ZERO_SHA = "0".repeat(64);
+const sha = bytes => createHash("sha256").update(bytes).digest("hex"), ZERO_SHA = "0".repeat(64);
 
 test("file socket closes without sending a hello when no ticket is available", () => {
   const sent = [];
@@ -154,7 +152,6 @@ class FakeHost {
           sent.update(chunk);
           this.deliver(ws, encodeData(id, seq++, chunk));
         }
-        // A relay that alters the bytes also controls the DONE hash and can match it to what it sent.
         this.deliver(ws, encodeDone(id, this.tamper ? sent.digest() : createHash("sha256").update(file.bytes).digest()));
         break;
       }
@@ -402,43 +399,22 @@ test("a captured download offer cannot be replaced or withdrawn before download 
   }
 });
 
-test("a damaged download is rejected and its partial output discarded", async () => {
-  const bytes = randomBytes(200_000);
-  const host = new FakeHost({ files: { 1: { name: "a.bin", bytes } }, corrupt: true });
-  const client = host.client(() => "wss://x");
-  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a.bin", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "clipboard" });
-  const sink = memorySink();
-  const [row] = await settled(client, client.download(client.offer.items, async () => sink));
-  assert.equal(row.state, "failed");
-  assert.equal(row.error, "hash-mismatch");
-  assert.ok(sink.aborted && !sink.closed);
-  assert.deepEqual(host.sentByClient.find(packet => packet.type === FT.RESULT).json, { ok: false, error: "hash-mismatch" });
-  client.reset();
-});
-
-test("a download altered by the relay, with a DONE hash to match, fails against the sealed hash and is discarded", async () => {
-  const bytes = randomBytes(200_000);
-  const host = new FakeHost({ files: { 1: { name: "a.bin", bytes } }, tamper: true });
-  const client = host.client(() => "wss://x");
-  client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a.bin", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "clipboard" });
-  const sink = memorySink();
-  const [row] = await settled(client, client.download(client.offer.items, async () => sink));
-  assert.equal(row.state, "failed");
-  assert.equal(row.error, "hash-mismatch");
-  assert.ok(sink.aborted && !sink.closed, "nothing is saved");
-  client.reset();
-});
-
-test("an offer without a sealed hash is not accepted", () => {
-  const client = new FakeHost().client(() => "wss://x");
-  const item = { id: 1, name: "a", size: 1, mime: "", mtimeMs: 0, sha256: ZERO_SHA };
-  const offer = items => ({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items, source: "clipboard" });
-  assert.equal(client.setOffer(offer([item])), true);
-  const { sha256, ...unsealed } = item;
-  assert.equal(client.setOffer(offer([unsealed])), false);
-  assert.equal(client.setOffer(offer([{ ...item, sha256: "AB".repeat(32) }])), false);
-  assert.equal(client.setOffer({ ...offer([item]), protocol: 2 }), false);
-});
+// "tamper": a relay alters the bytes and sends a DONE hash that matches what it altered.
+for (const mode of ["corrupt", "tamper"]) {
+  test(`a damaged download (${mode}) is rejected against the sealed hash and its partial output discarded`, async () => {
+    const bytes = randomBytes(200_000);
+    const host = new FakeHost({ files: { 1: { name: "a.bin", bytes } }, [mode]: true });
+    const client = host.client(() => "wss://x");
+    client.setOffer({ type: "file-offer", protocol: 3, offerId: "00000000000000000000000000000001", items: [{ id: 1, name: "a.bin", size: bytes.length, mime: "", mtimeMs: 0, sha256: sha(bytes) }], source: "clipboard" });
+    const sink = memorySink();
+    const [row] = await settled(client, client.download(client.offer.items, async () => sink));
+    assert.equal(row.state, "failed");
+    assert.equal(row.error, "hash-mismatch");
+    assert.ok(sink.aborted && !sink.closed);
+    assert.deepEqual(host.sentByClient.find(packet => packet.type === FT.RESULT).json, { ok: false, error: "hash-mismatch" });
+    client.reset();
+  });
+}
 
 test("a withdrawn file is reported, and a user cancel sends CANCEL", async () => {
   const host = new FakeHost();

@@ -244,8 +244,10 @@ export class FileIncoming {
     this.lastAckMs = nowMs;
     return this.received;
   }
-  onDone(expected, actual) {
+  /** `sealed` is the SHA-256 (hex) from the PC's sealed offer; the DONE hash `expected` is only a cross-check. */
+  onDone(expected, actual, sealed) {
     if (this.received !== this.size) return "size-mismatch";
+    if (bytesToHex(actual) !== sealed) return "hash-mismatch";
     if (expected.length !== actual.length || expected.some((byte, i) => byte !== actual[i])) return "hash-mismatch";
     return null;
   }
