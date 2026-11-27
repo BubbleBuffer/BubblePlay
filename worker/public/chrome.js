@@ -22,6 +22,7 @@ export const SHORTCUTS = Object.freeze([
   { id: "find", label: "Find", keys: [CTRL, "KeyF"], desktop: false },
   { id: "close-tab", label: "Close tab", keys: [CTRL, "KeyW"] },
   { id: "new-tab", label: "New tab", keys: [CTRL, "KeyT"] },
+  { id: "new-window", label: "New window", keys: [CTRL, "KeyN"] },
   { id: "reopen-tab", label: "Reopen closed tab", keys: [CTRL, SHIFT, "KeyT"] },
   { id: "switch-window", label: "Switch window", keys: [ALT, "Tab"] },
   { id: "close-window", label: "Close window", keys: [ALT, "F4"] },

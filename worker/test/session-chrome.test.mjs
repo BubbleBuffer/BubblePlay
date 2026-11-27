@@ -189,12 +189,17 @@ test("pointer mode is remembered per PC and falls back to the global value", () 
   assert.equal(normalizeSettings({ pointerModes: { x: "bogus", y: "game", __proto__: "game" } }).pointerModes.x, undefined);
 });
 
-test("the Shortcuts list matches the Android list, in order", () => {
-  assert.deepEqual(SHORTCUTS.map(shortcut => shortcut.label), [
+test("the Shortcuts list holds every Android row in Android's order, plus named web extras", () => {
+  const android = [
     "Copy", "Paste", "Cut", "Undo", "Redo", "Select all", "Save", "Find", "Close tab", "New tab",
     "Reopen closed tab", "Switch window", "Close window", "Start menu", "Show desktop", "Task Manager",
     "Escape", "Tab", "Enter",
-  ]);
+  ];
+  // The browser swallows Ctrl+N, so the preset is the only way to send it from the web viewer.
+  const webExtras = ["New window"];
+  const labels = SHORTCUTS.map(shortcut => shortcut.label);
+  assert.deepEqual(labels.filter(label => !android.includes(label)), webExtras);
+  assert.deepEqual(labels.filter(label => android.includes(label)), android);
 });
 
 test("Ctrl+Alt+Shift+M is the mode shortcut and nothing else is", () => {
