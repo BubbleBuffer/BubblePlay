@@ -86,28 +86,29 @@ impl Session {
         // EmptyClipboard may message a hung owner. Never hold the mutex the
         // input/session thread uses for take_outbox, epochs and rate updates.
         match set_files(&batch.saved) {
-            Ok(seq) => {
-                let mut state = lock(shared);
-                // Recorded even when stale, so our own write is never offered back.
-                state.own_clipboard_seq = Some(seq);
-                if !state.is_bound(&self.bound) {
-                    info!(
-                        files = batch.saved.len(),
-                        "uploaded files were placed while the viewer changed; no paste"
-                    );
-                    return;
-                }
-                info!(
-                    files = batch.saved.len(),
-                    "uploaded files placed on the clipboard"
-                );
-                if batch.purpose == Some(Purpose::Paste) {
-                    state.outbox.pastes += 1;
-                }
-            }
+            Ok(seq) => self.placed(shared, seq, &batch),
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "cannot place uploaded files on the clipboard")
             }
+        }
+    }
+
+    /// The files are on the clipboard (`seq`): remember our own write and ask for a paste if due.
+    fn placed(&self, shared: &Mutex<Shared>, seq: u32, batch: &Batch) {
+        let mut state = lock(shared);
+        // Recorded even when stale, so our own write is never offered back.
+        state.own_clipboard_seq = Some(seq);
+        let files = batch.saved.len();
+        if !state.is_bound(&self.bound) {
+            info!(
+                files,
+                "uploaded files were placed while the viewer changed; no paste"
+            );
+            return;
+        }
+        info!(files, "uploaded files placed on the clipboard");
+        if batch.purpose == Some(Purpose::Paste) {
+            state.outbox.pastes += 1;
         }
     }
 }
