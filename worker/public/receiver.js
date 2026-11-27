@@ -12,6 +12,8 @@ import { createOnceReporter } from "/report.js";
 import { createSignalingSocket } from "/signaling-socket.js";
 import { createPeer } from "/peer.js";
 import { createKeyboardDraft } from "/keyboard-draft.js";
+import { createModifierLatch } from "/modifier-latch.js";
+import { createModifierUi } from "/modifier-ui.js";
 import { ClipboardReceiver, keyDescriptor, WheelAccumulator } from "/input.js";
 import { BrowserCursorAppearance } from "/cursor.js";
  import { canMoveAbsoluteCursor, touchTranslateWheel, CursorReconciler, decodeCursorState, InputController, RemoteCursor, shouldCaptureKeyboard, shouldCenterCameraOnCursor, shouldCorrectCursorDrift, shouldShowCursorOverlay, shouldShowPredictedCursor, TouchGesture, Viewport } from "/input.js";
@@ -30,8 +32,8 @@ import {
   desktopTransitionPlan, monitorRequestAfterRestart, monitorRequestReadiness, restartPeerInNewEpoch,
   rtcAdmissionGate, rtcGateOpens, rtcInPlaceCapable, rtpTimestampAtOrAfter, transitionKeyframeVerdict,
 } from "/monitor-selection.js";
-import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, keyName, shortcutsFor } from "/chrome.js";
-import { loadSettings, qualityStorageView, saveSettings } from "/settings.js";
+import { chordLabel, chordSteps, createEdgeReveal, createPopoverController, isModeShortcut, keyName, shortcutsFor } from "/chrome.js";
+import { loadSettings, pointerModeFor, qualityStorageView, rememberPointerMode, saveSettings } from "/settings.js";
 // File transfer hook (1/5): client + minimal UI; see the "file transfer" section.
 import { SoundController, isAudioPacket, probeOpusDecode, soundButtonView } from "/audio.js";
 import { formatHud, renderHud } from "/hud-text.js";
@@ -708,7 +710,13 @@ try {
 // Signaling liveness (performance.now ms): the oldest unanswered ping, and the last inbound message.
 // Set while a monitor transition gates input with held keys/buttons kept.
 let cursorReconciler = null;
-const latchedModifiers = new Set();
+// Sticky Ctrl/Alt/Shift/Win (modifier-latch.js): pressed on the PC while latched or locked.
+const modifierLatch = createModifierLatch({
+  press: vk => input.key(vk, false),
+  release: vk => input.key(vk, true),
+  onChange: () => modifierUi?.render(),
+});
+let modifierUi = null; // modifier-ui.js: button states, labels and the bar above the soft keyboard
 const input = new InputController({
   sendControl: data => { sessionState.lastInputSentMs = Date.now(); return sendInput(data, sessionState.dc); },
   sendMotion: data => { sessionState.lastInputSentMs = Date.now(); return sendInput(data, sessionState.motionDc); },
@@ -747,7 +755,7 @@ function queueTouchMotion(dx, dy, wheelX = 0, wheelY = 0) { input.motionNow(dx, 
 // Reconcile against the cursor sequence, not the last wheel: wheel-only sends never move the pointer.
 function queueTouchAbsolute(x, y) { const before = input.lastCursorSequence; input.absolute(x, y); const sent = input.flushMotion(); if (input.lastCursorSequence !== before) cursorReconciler?.noteSent(input.lastCursorSequence); retryMotionTail(); updateMotionHud(); return sent; }
 function queueAbsolute(x, y) { input.absolute(x, y); armMotionFlush(); }
-function releaseInput(send = true) { sessionState.inputTransitionHold = false; input.releaseAll(send); held.clear(); latchedModifiers.clear(); buttons = touchButtons = 0; if (sessionState.motionFrame !== null) cancelAnimationFrame(sessionState.motionFrame); sessionState.motionFrame = null; renderKeyboardModifiers?.(); }
+function releaseInput(send = true) { sessionState.inputTransitionHold = false; input.releaseAll(send); held.clear(); modifierLatch.forget(); buttons = touchButtons = 0; if (sessionState.motionFrame !== null) cancelAnimationFrame(sessionState.motionFrame); sessionState.motionFrame = null; modifierUi?.render(); }
 // WSS v4 per-session frame state; the socket itself is wssSocket (wss-media-socket.js).
 const wssV4 = {
   gate: new V4ReceiveGate(),
@@ -1798,6 +1806,7 @@ export function startSession({ identity, pc, pinnedPublic, gate = null }) {
   if (pin.length !== 32) throw new TypeError("startSession needs the PC's pinned public key.");
   sessionState.sessionIdentity = identity;
   sessionState.sessionPc = pc;
+  { const remembered = pointerModeFor(settings, pc); if (remembered !== pointerMode) setPointerMode(remembered, false); }
   sessionState.sessionPinnedPublic = pin;
   sessionState.sessionGate = gate;
   sessionState.terminalSignalingFailure = false;
@@ -3206,6 +3215,14 @@ function keyboardActive() {
   return shouldCaptureKeyboard({ inputReady: sessionState.inputReady, pointerMode, locked,
     surfaceFocused: active === inputSurface, keyboardFocused: active === keyboard, localControlFocused });
 }
+// Ctrl+Alt+Shift+M switches Work/Game. It is handled here, in the capture phase, so it never
+// reaches the PC and works inside and outside pointer lock. The modifiers it was typed with are
+// released on the PC by the mode change.
+document.addEventListener("keydown", (e) => {
+  if (!isModeShortcut(e)) return;
+  e.preventDefault(); e.stopPropagation();
+  if (!e.repeat) setPointerMode(pointerMode === "desktop" ? "game" : "desktop");
+}, true);
 document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && !e.altKey && ["c", "C", "x", "X"].includes(e.key)) clearRemoteClipboard();
   if (isPasteShortcut(e)) discardPendingClipboard();
@@ -3247,6 +3264,7 @@ const keyboardStatus = document.getElementById("keyboard-status");
 const keyboardDraft = createKeyboardDraft({
   input, field: keyboardInput, inputReady: () => sessionState.inputReady, desktopKind: () => sessionState.desktopKind,
   desktopInputState: () => sessionState.desktopInputState, setStatus: text => { keyboardStatus.textContent = text; },
+  modifiers: { active: () => modifierLatch.active(), consumeOneShot: () => modifierLatch.consumeOneShot() },
 });
 // Keys popover (touch), after the Android app: navigation and editing keys,
 // then function keys. Arrows live in their own popover.
@@ -3261,37 +3279,14 @@ const arrowPad = [
   ["←", 0x25, true], ["Enter", 0x0D, false, true], ["→", 0x27, true],
   ["End", 0x23, false, true], ["↓", 0x28, true], ["PgDn", 0x22, true, true],
 ];
-const modifierNames = new Map([[162, "Ctrl"], [164, "Alt"], [160, "Shift"], [91, "Win"]]);
-function renderKeyboardModifiers() {
-  document.querySelectorAll(".modifier[data-vk]").forEach(button => {
-    const held = latchedModifiers.has(Number(button.dataset.vk));
-    button.classList.toggle("active", held);
-    button.setAttribute("aria-pressed", String(held));
-  });
-  const names = [...modifierNames].filter(([vk]) => latchedModifiers.has(vk)).map(([, name]) => name);
-  const latch = document.getElementById("latch-label");
-  if (latch) latch.textContent = names.map(name => name[0]).join("");
-  document.getElementById("strip-keys")?.setAttribute("aria-label", names.length ? `Keys, holding ${names.join("+")}` : "Keys");
-}
-function releaseLatchedModifiers() {
-  for (const vk of latchedModifiers) input.key(vk, true);
-  latchedModifiers.clear();
-  renderKeyboardModifiers();
-}
+function releaseLatchedModifiers() { modifierLatch.releaseAll(); }
 function sendSpecialKey(vk) {
   if (!sessionState.inputReady) return;
   input.key(vk, false); input.key(vk, true);
-  releaseLatchedModifiers();
+  modifierLatch.consumeOneShot();
 }
-document.querySelectorAll(".modifier[data-vk]").forEach(button => {
-  button.onclick = () => {
-    if (!sessionState.inputReady) return;
-    const vk = Number(button.dataset.vk);
-    if (latchedModifiers.has(vk)) { input.key(vk, true); latchedModifiers.delete(vk); }
-    else { input.key(vk, false); latchedModifiers.add(vk); }
-    renderKeyboardModifiers();
-  };
-});
+modifierUi = createModifierUi({ latch: modifierLatch, ready: () => sessionState.inputReady });
+modifierUi.bind();
 for (const [label, vk] of specialKeys) {
   const button = document.createElement("button");
   button.type = "button"; button.className = "key"; button.textContent = label; button.dataset.vk = String(vk);
@@ -3306,7 +3301,7 @@ function stopPadRepeat() {
   clearTimeout(heldPadKey.timer);
   if (sessionState.inputReady) input.key(heldPadKey.vk, true);
   heldPadKey = null;
-  releaseLatchedModifiers();
+  modifierLatch.consumeOneShot();
 }
 for (const [label, vk, repeats, small] of arrowPad) {
   const button = document.createElement("button");
@@ -3331,7 +3326,7 @@ for (const [label, vk, repeats, small] of arrowPad) {
 // Shortcuts popover: one row per chord, sent as physical keys.
 function sendChord(keys) {
   if (!sessionState.inputReady) return false;
-  for (const [code, up] of chordSteps(keys)) input.physicalKey(code, up);
+  modifierLatch.withChord(keys, () => { for (const [code, up] of chordSteps(keys)) input.physicalKey(code, up); });
   return true;
 }
 function renderShortcutList() {
@@ -3355,6 +3350,7 @@ function renderShortcutList() {
 }
 keyboardInput.addEventListener("compositionstart", () => keyboardDraft.compositionStart());
 keyboardInput.addEventListener("input", event => keyboardDraft.input(event));
+keyboardInput.addEventListener("blur", () => modifierLatch.releaseAll());
 keyboardInput.addEventListener("compositionend", event => keyboardDraft.compositionEnd(event));
 window.addEventListener("blur", () => {
   releaseInput(); held.clear(); keyboardDraft.reset();
@@ -3404,8 +3400,10 @@ function syncShellMode() {
   document.body.classList.toggle("mode-work", !gameMode);
   const touchMode = document.getElementById("strip-touch-mode");
   touchMode.setAttribute("aria-pressed", String(gameMode));
-  touchMode.setAttribute("aria-label", `Touch mode: ${gameMode ? "Game (relative)" : "Work (pointer)"}`);
-  touchMode.title = gameMode ? "Touch mode: Game" : "Touch mode: Work";
+  touchMode.setAttribute("aria-label", `Pointer mode: ${gameMode ? "Game (relative)" : "Work (pointer)"}`);
+  touchMode.title = `Pointer mode: ${gameMode ? "Game" : "Work"} (Ctrl+Alt+Shift+M)`;
+  const modeLabel = document.getElementById("strip-mode-label");
+  if (modeLabel) modeLabel.textContent = gameMode ? "Game" : "Work";
 }
 
 function showContextHint() {
@@ -3416,7 +3414,7 @@ function showContextHint() {
   contextHint.hidden = dismissed;
   contextHint.dataset.mode = mode;
   contextHintCopy.textContent = mode === "game"
-    ? (chromeLayout() === "touch" ? "Drag to move the pointer · tap to click · Touch mode switches back to Work." : "Click the stream to capture the pointer · Esc releases it.")
+    ? (chromeLayout() === "touch" ? "Drag to move the pointer · tap to click · Mode switches back to Work." : "Click the stream to capture the pointer · Esc releases it.")
     : "Drag to move the pointer · pinch to zoom · two-finger tap to right-click.";
 }
 
@@ -3466,7 +3464,7 @@ function setPointerMode(next, persist=true) {
   releaseInput(); gestures.reset(); cursorReconciler.reset(); touchCursorVisible=false; pointerMode=next;
   locallyAuthoritativeCursor=false;
   if (pointerMode === "desktop" && document.pointerLockElement) document.exitPointerLock?.();
-  if (persist) { settings.pointerMode = pointerMode; persistSettings(); }
+  if (persist) { rememberPointerMode(settings, sessionState.sessionPc, pointerMode); persistSettings(); }
   if (persist) sendStreamMode("user-mode");
   clearCursorSyncTimer(); updatePointerHud(); renderTouchCursor();
   if (sessionState.inputReady) {
@@ -3685,8 +3683,8 @@ function toggleTouchKeyboard() {
   else keyboardInput.focus({ preventScroll: true });
   renderKeyboardButton();
 }
-keyboardInput.addEventListener("focus", renderKeyboardButton);
-keyboardInput.addEventListener("blur", renderKeyboardButton);
+keyboardInput.addEventListener("focus", () => { renderKeyboardButton(); modifierUi.syncKeyboardBar(); });
+keyboardInput.addEventListener("blur", () => { renderKeyboardButton(); modifierUi.syncKeyboardBar(); });
 
 const stripActions = {
   keyboard: () => toggleTouchKeyboard(),
@@ -3864,7 +3862,7 @@ setDiagnosticsVisible(diagnosticsEnabled);
 renderAbout();
 renderMonitorList();
 renderShortcutList();
-renderKeyboardModifiers();
+modifierUi.render();
 renderKeyboardButton();
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
