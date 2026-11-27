@@ -124,7 +124,7 @@ class FileWireTest {
         assertEquals(2051L, offer.totalBytes)
         val withdrawn = FileWire.parseOfferMessage(JSONObject("""{"type":"file-offer","protocol":2,"offerId":"${id(6)}","source":"sendto","items":[]}"""))!!
         assertEquals(0, withdrawn.items.size)
-        assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("protocol", 1)), "an older host is rejected, not misparsed")
+        assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("protocol", 1))) // an older host is rejected, not misparsed
         assertNull(FileWire.parseOfferMessage(JSONObject(msg.toString()).put("source", "disk")))
         val dup = JSONObject(msg.toString())
         dup.getJSONArray("items").getJSONObject(1).put("id", 1)

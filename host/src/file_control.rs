@@ -122,34 +122,10 @@ pub fn parse_client_control(text: &str) -> Option<ClientControl> {
             {
                 return None;
             }
-            let mut files = Vec::with_capacity(list.len());
-            for entry in list {
-                let entry = entry.as_object()?;
-                if entry.keys().any(|key| {
-                    !["name", "size", "mime", "mtimeMs", "sha256"].contains(&key.as_str())
-                }) {
-                    return None;
-                }
-                let name = entry.get("name")?.as_str()?.to_owned();
-                let size = entry.get("size")?.as_u64()?;
-                let mime = entry.get("mime")?.as_str()?.to_owned();
-                let mtime_ms = entry.get("mtimeMs")?.as_u64()?;
-                let sha256 = parse_sha256_hex(entry.get("sha256")?.as_str()?)?;
-                if name.is_empty()
-                    || name.len() > MAX_NAME_BYTES
-                    || size > MAX_FILE_BYTES
-                    || mime.len() > MAX_MIME_BYTES
-                {
-                    return None;
-                }
-                files.push(AnnouncedFile {
-                    name,
-                    size,
-                    mime,
-                    mtime_ms,
-                    sha256,
-                });
-            }
+            let files = list
+                .iter()
+                .map(announced_file)
+                .collect::<Option<Vec<_>>>()?;
             Some(ClientControl::Batch(BatchAnnouncement {
                 batch_id,
                 purpose,
@@ -185,6 +161,36 @@ pub fn parse_client_control(text: &str) -> Option<ClientControl> {
         }
         _ => None,
     }
+}
+
+/// One entry of a `file-batch` file list: all five fields, nothing else.
+fn announced_file(entry: &serde_json::Value) -> Option<AnnouncedFile> {
+    let entry = entry.as_object()?;
+    if entry
+        .keys()
+        .any(|key| !["name", "size", "mime", "mtimeMs", "sha256"].contains(&key.as_str()))
+    {
+        return None;
+    }
+    let name = entry.get("name")?.as_str()?.to_owned();
+    let size = entry.get("size")?.as_u64()?;
+    let mime = entry.get("mime")?.as_str()?.to_owned();
+    let mtime_ms = entry.get("mtimeMs")?.as_u64()?;
+    let sha256 = parse_sha256_hex(entry.get("sha256")?.as_str()?)?;
+    if name.is_empty()
+        || name.len() > MAX_NAME_BYTES
+        || size > MAX_FILE_BYTES
+        || mime.len() > MAX_MIME_BYTES
+    {
+        return None;
+    }
+    Some(AnnouncedFile {
+        name,
+        size,
+        mime,
+        mtime_ms,
+        sha256,
+    })
 }
 
 /// Host -> client `file-batch-ack`: the batch was admitted (`error` absent) or refused.

@@ -34,15 +34,17 @@ impl Session {
     ) -> Result<()> {
         let now = Instant::now();
         let alive = |id: &str| lock(shared).auth.has_batch(id, now);
-        if let Some(receiving) = &self.receiving {
-            let id = receiving.state.transfer_id;
-            if !alive(&receiving.meta.batch_id) {
-                info!(
-                    transfer = id,
-                    "upload stopped: its batch was cancelled or expired"
-                );
-                self.fail_upload(Some(ws), id, "cancelled", shared);
-            }
+        let receiving = self
+            .receiving
+            .as_ref()
+            .filter(|receiving| !alive(&receiving.meta.batch_id))
+            .map(|receiving| receiving.state.transfer_id);
+        if let Some(id) = receiving {
+            info!(
+                transfer = id,
+                "upload stopped: its batch was cancelled or expired"
+            );
+            self.fail_upload(Some(ws), id, "cancelled", shared);
         }
         if self
             .drop_upload

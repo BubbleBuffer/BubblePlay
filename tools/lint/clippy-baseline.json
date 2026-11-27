@@ -336,7 +336,7 @@
   },
   "host/src/file_service.rs": {
     "clippy::let_underscore_must_use": 13,
-    "clippy::cognitive_complexity": 5,
+    "clippy::cognitive_complexity": 4,
     "clippy::too_many_lines": 5,
     "clippy::expect_used": 9,
     "clippy::unwrap_used": 14
