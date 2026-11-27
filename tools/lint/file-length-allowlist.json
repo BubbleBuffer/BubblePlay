@@ -50,7 +50,7 @@
   "client-win/tools/fake-wss-host/tests/webrtc.rs": 729,
   "crates/bp-device-key/src/proof.rs": 589,
   "crates/bp-device-key/tests/phase2_contract.rs": 600,
-  "host/scripts/setup-tray.ps1": 1099,
+  "host/scripts/setup-tray.ps1": 1098,
   "host/src/admin_agent/client.rs": 1150,
   "host/src/admin_agent/protocol.rs": 749,
   "host/src/admin_agent/session.rs": 671,

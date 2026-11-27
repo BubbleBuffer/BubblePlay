@@ -134,8 +134,14 @@ user (local DXGI capture + SendInput). The relay token reaches the host only as
   deleted only if they match `installed-hashes.json`; ProgramData is left as
   is. `-SkipAgent` installs no agent; `-AgentOnly` does just the agent part.
 - Updates, non-elevated: `host/scripts/update-tray.ps1 [-Build]`. It never
-  prompts for UAC; `-IncludeAgent` also installs the staged agent (one UAC
-  prompt). Host changes never need a new agent.
+  prompts for UAC; `-IncludeAgent` also installs the privileged agent and
+  helper from the new build (one UAC prompt). That prompt comes first, while the
+  old host still runs, so a remote user can confirm it; the host is stopped only
+  afterwards. If the prompt is declined or times out, nothing else changes. If a
+  later step fails, the tray is started again before the error is raised. Host
+  changes never need a new agent. `setup-tray.ps1 -AgentOnly` by hand without
+  `-SourceDir` uses the install folder's staged copies when there is no build
+  output, and a missing source fails before the prompt.
 - Uninstall: Settings > Apps > BubblePlay, or `uninstall-tray.ps1` in the
   install folder. It removes the agent and old elevated leftovers first (one
   UAC prompt, only if present), then the per-user install. `%LOCALAPPDATA%\BubblePlay`

@@ -31,7 +31,12 @@
     rarely changing component with a versioned pipe protocol: host updates
     never require it to change. When the staged agent differs from the
     installed one this script only reports it; -IncludeAgent installs it with
-    one UAC prompt (setup-tray.ps1 -AgentOnly). If the host ever needs a newer
+    one UAC prompt (setup-tray.ps1 -AgentOnly) taken from the new build.
+    That elevation happens FIRST, while the old host still runs and streams
+    (a remote user can then see and confirm the prompt); only afterwards is
+    the host stopped and replaced. If the prompt is declined or times out the
+    script stops with nothing changed. If a later step fails after the tray
+    was stopped, the tray is started again before the error propagates. If the host ever needs a newer
     agent protocol, the tray itself offers "Admin agent needs update (one
     admin prompt)" and injects at user level until then.
 
@@ -236,124 +241,133 @@ $dataDir = if ($env:BUBBLEPLAY_TRAY_DATA_DIR) { $env:BUBBLEPLAY_TRAY_DATA_DIR } 
 if (-not (Test-Path -LiteralPath (Join-Path $dataDir 'host.json'))) {
     Write-Warning 'host.json is missing: run setup-tray.ps1 once to write the host configuration.'
 }
-$binariesChanged = @($changed | Where-Object { $Binaries -contains $_ })
-if ($changed.Count -eq 0) {
-    Write-Host "Install in $InstallDir is already current."
-}
-elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $($changed -join ', ')")) {
-    if ($binariesChanged.Count) {
-        $wasRunning = [bool](Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
-        if ($wasRunning -and (Test-Path -LiteralPath $TrayExe)) {
-            # Graceful: the tray stops its host and the admin agent.
-            $quit = Start-Process -FilePath $TrayExe -ArgumentList '--quit' -PassThru -Wait -WindowStyle Hidden
-            if ($quit.ExitCode -ne 0) { Write-Warning 'Tray did not confirm shutdown in time.' }
-        }
-        $deadline = [DateTime]::UtcNow.AddSeconds(15)
-        do {
-            $busy = @(Get-Process bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) })
-            if ($busy.Count -eq 0) { break }
-            Start-Sleep -Milliseconds 300
-        } while ([DateTime]::UtcNow -lt $deadline)
-        if ($busy.Count -gt 0) {
-            # Only our own non-elevated processes can be stopped here.
-            $busy | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Milliseconds 500
-        }
-    }
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    $previousDir = Join-Path $InstallDir 'previous'
-    New-Item -ItemType Directory -Force -Path $previousDir | Out-Null
-    $hostPreviousHash = $null
-    # A host still on probation (pending) or without a rollback (failed) has not proven itself: it must
-    # not become the rollback target, so the earlier known-good previous\ host stays in place.
-    $statePath = Join-Path $dataDir 'update-state.json'
-    $keptPreviousHash = $null
-    if ((Test-Path -LiteralPath $statePath) -and (Test-Path -LiteralPath (Join-Path $previousDir 'bubbleplay-host.exe'))) {
-        try { $oldState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { $oldState = $null }
-        if ($oldState -and @('pending', 'failed') -contains $oldState.status -and $oldState.previousHash) {
-            $keptPreviousHash = [string]$oldState.previousHash
-            Write-Warning "The installed host ($($oldState.status)) is unproven; keeping the earlier known-good host as the rollback target."
-        }
-    }
-    foreach ($name in $changed) {
-        $target = Join-Path $InstallDir $name
-        $temp = "$target.new"
-        Copy-Item -Force -LiteralPath $sources[$name] -Destination $temp
-        if ($keptPreviousHash -and $name -eq 'bubbleplay-host.exe') {
-            $hostPreviousHash = $keptPreviousHash
-        }
-        elseif ((Test-Path -LiteralPath $target) -and $Binaries -contains $name) {
-            # Keep exactly one previous build of each binary.
-            $previous = Join-Path $previousDir $name
-            Move-Item -Force -LiteralPath $target -Destination $previous
-            if ($name -eq 'bubbleplay-host.exe') { $hostPreviousHash = Get-Sha256 $previous }
-        }
-        # Pre-rollback-scheme leftovers.
-        Remove-Item -Force -LiteralPath "$target.previous" -ErrorAction SilentlyContinue
-        Move-Item -Force -LiteralPath $temp -Destination $target
-        if ((Get-Sha256 $target) -ne (Get-Sha256 $sources[$name])) { throw "Hash mismatch after copying $name." }
-    }
-    if ($changed -contains 'bubbleplay-host.exe') {
-        # The tray puts a pending host on probation and rolls back on failure.
-        New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
-        $state = [ordered]@{
-            status        = 'pending'
-            newHash       = Get-Sha256 (Join-Path $InstallDir 'bubbleplay-host.exe')
-            previousHash  = $hostPreviousHash
-            updatedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-            reason        = $null
-        }
-        $json = $state | ConvertTo-Json
-        [IO.File]::WriteAllText((Join-Path $dataDir 'update-state.json'), $json, (New-Object Text.UTF8Encoding($false)))
-        if (-not $hostPreviousHash) { Write-Warning 'No previous host to roll back to; this update cannot be rolled back automatically.' }
-    }
-    Write-Host "Updated: $($changed -join ', ')"
-}
-
-# Flutter Devices app (optional): mirrored beside the tray exe.
-if (Test-Path -LiteralPath (Join-Path $AppDir $AppExeName) -PathType Leaf) {
-    [void](Sync-AppFiles -Source $AppDir -Target $InstallDir)
-}
-else {
-    Write-Host "Note: no $AppExeName in $AppDir; the Flutter app is not installed (optional)."
-}
-
 if ($refreshAgent) {
-    $setup = Join-Path $InstallDir 'setup-tray.ps1'
-    if ($PSCmdlet.ShouldProcess($AgentDir, 'Check/install both staged privileged helpers (at most one UAC prompt: setup-tray.ps1 -AgentOnly)')) {
+    # Elevate FIRST, while the old host still runs: a remote user can only see and confirm the UAC
+    # prompt while the host streams. The binaries come from the new build (-SourceDir);
+    # setup-tray.ps1 still verifies hashes, ACLs and tasks itself. A declined or timed-out
+    # prompt aborts here, before anything else was changed.
+    if ($PSCmdlet.ShouldProcess($AgentDir, 'Check/install both privileged helpers from the new build (at most one UAC prompt: setup-tray.ps1 -AgentOnly), before the host is stopped')) {
         $shell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$setup`"", '-AgentOnly',
-            '-SourceDir', "`"$($InstallDir.TrimEnd('\'))`"", '-InstallDir', "`"$($InstallDir.TrimEnd('\'))`"")
-        # Setup evaluates hashes, ACLs and task configuration first, then
-        # elevates once only when machine changes are actually needed.
+        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$($sources['setup-tray.ps1'])`"", '-AgentOnly',
+            '-SourceDir', "`"$($SourceDir.TrimEnd('\'))`"", '-InstallDir', "`"$($InstallDir.TrimEnd('\'))`"")
         $setupProcess = Start-Process -FilePath $shell -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
-        if ($setupProcess.ExitCode -ne 0) { throw "Agent install failed with exit code $($setupProcess.ExitCode); see setup-tray-machine-*.json in %LOCALAPPDATA%\BubblePlay\receipts." }
+        if ($setupProcess.ExitCode -ne 0) { throw "Admin step declined or failed (exit code $($setupProcess.ExitCode)): nothing was changed and the host keeps running. Receipts: %LOCALAPPDATA%\BubblePlay\receipts." }
         Write-Host "Installed the admin agent and secure-desktop helper in $AgentDir."
     }
 }
 
-# Send To entry (file transfer), for installs made before it existed.
-$SendToShortcut = Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay.lnk'
-if ((Test-Path -LiteralPath $TrayExe) -and -not (Test-Path -LiteralPath $SendToShortcut)) {
-    if ($PSCmdlet.ShouldProcess($SendToShortcut, "Create Send To entry for $TrayExe --send-files")) {
-        New-Item -ItemType Directory -Force -Path (Split-Path $SendToShortcut) | Out-Null
-        $shell = New-Object -ComObject WScript.Shell
-        $link = $shell.CreateShortcut($SendToShortcut)
-        $link.TargetPath = $TrayExe
-        $link.Arguments = '--send-files'
-        $link.WorkingDirectory = $InstallDir
-        $link.Description = 'Offer files to the connected BubblePlay viewer'
-        $link.IconLocation = "$TrayExe,0"
-        $link.Save()
-        Write-Host "Created $SendToShortcut."
+$binariesChanged = @($changed | Where-Object { $Binaries -contains $_ })
+$trayWasRunning = [bool](Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
+$updateOk = $false
+try {
+    if ($changed.Count -eq 0) {
+        Write-Host "Install in $InstallDir is already current."
     }
-}
+    elseif ($PSCmdlet.ShouldProcess($InstallDir, "Stop tray and replace $($changed -join ', ')")) {
+        if ($binariesChanged.Count) {
+            $wasRunning = [bool](Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)
+            if ($wasRunning -and (Test-Path -LiteralPath $TrayExe)) {
+                # Graceful: the tray stops its host and the admin agent.
+                $quit = Start-Process -FilePath $TrayExe -ArgumentList '--quit' -PassThru -Wait -WindowStyle Hidden
+                if ($quit.ExitCode -ne 0) { Write-Warning 'Tray did not confirm shutdown in time.' }
+            }
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            do {
+                $busy = @(Get-Process bubbleplay_tray, bubbleplay-host -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, [StringComparison]::OrdinalIgnoreCase) })
+                if ($busy.Count -eq 0) { break }
+                Start-Sleep -Milliseconds 300
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if ($busy.Count -gt 0) {
+                # Only our own non-elevated processes can be stopped here.
+                $busy | Stop-Process -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+        $previousDir = Join-Path $InstallDir 'previous'
+        New-Item -ItemType Directory -Force -Path $previousDir | Out-Null
+        $hostPreviousHash = $null
+        # A host still on probation (pending) or without a rollback (failed) has not proven itself: it must
+        # not become the rollback target, so the earlier known-good previous\ host stays in place.
+        $statePath = Join-Path $dataDir 'update-state.json'
+        $keptPreviousHash = $null
+        if ((Test-Path -LiteralPath $statePath) -and (Test-Path -LiteralPath (Join-Path $previousDir 'bubbleplay-host.exe'))) {
+            try { $oldState = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json } catch { $oldState = $null }
+            if ($oldState -and @('pending', 'failed') -contains $oldState.status -and $oldState.previousHash) {
+                $keptPreviousHash = [string]$oldState.previousHash
+                Write-Warning "The installed host ($($oldState.status)) is unproven; keeping the earlier known-good host as the rollback target."
+            }
+        }
+        foreach ($name in $changed) {
+            $target = Join-Path $InstallDir $name
+            $temp = "$target.new"
+            Copy-Item -Force -LiteralPath $sources[$name] -Destination $temp
+            if ($keptPreviousHash -and $name -eq 'bubbleplay-host.exe') {
+                $hostPreviousHash = $keptPreviousHash
+            }
+            elseif ((Test-Path -LiteralPath $target) -and $Binaries -contains $name) {
+                # Keep exactly one previous build of each binary.
+                $previous = Join-Path $previousDir $name
+                Move-Item -Force -LiteralPath $target -Destination $previous
+                if ($name -eq 'bubbleplay-host.exe') { $hostPreviousHash = Get-Sha256 $previous }
+            }
+            # Pre-rollback-scheme leftovers.
+            Remove-Item -Force -LiteralPath "$target.previous" -ErrorAction SilentlyContinue
+            Move-Item -Force -LiteralPath $temp -Destination $target
+            if ((Get-Sha256 $target) -ne (Get-Sha256 $sources[$name])) { throw "Hash mismatch after copying $name." }
+        }
+        if ($changed -contains 'bubbleplay-host.exe') {
+            # The tray puts a pending host on probation and rolls back on failure.
+            New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+            $state = [ordered]@{
+                status        = 'pending'
+                newHash       = Get-Sha256 (Join-Path $InstallDir 'bubbleplay-host.exe')
+                previousHash  = $hostPreviousHash
+                updatedUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                reason        = $null
+            }
+            $json = $state | ConvertTo-Json
+            [IO.File]::WriteAllText((Join-Path $dataDir 'update-state.json'), $json, (New-Object Text.UTF8Encoding($false)))
+            if (-not $hostPreviousHash) { Write-Warning 'No previous host to roll back to; this update cannot be rolled back automatically.' }
+        }
+        Write-Host "Updated: $($changed -join ', ')"
+    }
 
-if (-not $NoStart -and -not (Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)) {
-    if ($PSCmdlet.ShouldProcess($TrayExe, 'Start tray')) {
-        if (-not (Test-Path -LiteralPath $TrayExe)) { throw "Tray not installed at $TrayExe; run setup-tray.ps1 first." }
-        Start-Process -FilePath $TrayExe -WorkingDirectory $InstallDir
-        Write-Host 'Tray started.'
+    # Flutter Devices app (optional): mirrored beside the tray exe.
+    if (Test-Path -LiteralPath (Join-Path $AppDir $AppExeName) -PathType Leaf) {
+        [void](Sync-AppFiles -Source $AppDir -Target $InstallDir)
+    }
+    else {
+        Write-Host "Note: no $AppExeName in $AppDir; the Flutter app is not installed (optional)."
+    }
+
+    # Send To entry (file transfer), for installs made before it existed.
+    $SendToShortcut = Join-Path ([Environment]::GetFolderPath('SendTo')) 'BubblePlay.lnk'
+    if ((Test-Path -LiteralPath $TrayExe) -and -not (Test-Path -LiteralPath $SendToShortcut)) {
+        if ($PSCmdlet.ShouldProcess($SendToShortcut, "Create Send To entry for $TrayExe --send-files")) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $SendToShortcut) | Out-Null
+            $shell = New-Object -ComObject WScript.Shell
+            $link = $shell.CreateShortcut($SendToShortcut)
+            $link.TargetPath = $TrayExe
+            $link.Arguments = '--send-files'
+            $link.WorkingDirectory = $InstallDir
+            $link.Description = 'Offer files to the connected BubblePlay viewer'
+            $link.IconLocation = "$TrayExe,0"
+            $link.Save()
+            Write-Host "Created $SendToShortcut."
+        }
+    }
+
+    $updateOk = $true
+}
+finally {
+    # A remote user must never be left without a host: if anything failed after the tray was
+    # stopped, bring it back (the original error still propagates).
+    if (-not $NoStart -and -not $WhatIfPreference -and (Test-Path -LiteralPath $TrayExe) -and -not (Get-Process bubbleplay_tray -ErrorAction SilentlyContinue)) {
+        if ($updateOk -or $trayWasRunning) {
+            if ($PSCmdlet.ShouldProcess($TrayExe, 'Start tray')) { Start-Process -FilePath $TrayExe -WorkingDirectory $InstallDir; Write-Host 'Tray started.' }
+        }
     }
 }
+if (-not $NoStart -and -not $WhatIfPreference -and -not (Test-Path -LiteralPath $TrayExe)) { throw "Tray not installed at $TrayExe; run setup-tray.ps1 first." }
