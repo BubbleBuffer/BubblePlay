@@ -33,27 +33,20 @@ impl Session {
         shared: &Mutex<Shared>,
     ) -> Result<()> {
         let now = Instant::now();
-        let alive = |id: &str| lock(shared).auth.has_batch(id, now);
-        let receiving = self
-            .receiving
-            .as_ref()
-            .filter(|receiving| !alive(&receiving.meta.batch_id))
-            .map(|receiving| receiving.state.transfer_id);
-        if let Some(id) = receiving {
-            info!(
-                transfer = id,
-                "upload stopped: its batch was cancelled or expired"
-            );
+        let dead = |id: Option<&str>| id.is_some_and(|id| !lock(shared).auth.has_batch(id, now));
+        let receiving = self.receiving.as_ref();
+        let upload = dead(receiving.map(|r| r.meta.batch_id.as_str()));
+        let upload_id = receiving.map(|r| r.state.transfer_id);
+        let drop_dead = dead(self.drop_upload.as_ref().map(|d| d.id.as_str()));
+        let batch_dead = dead(self.batch.id.as_deref());
+        if let (true, Some(id)) = (upload, upload_id) {
+            info!(transfer = id, "upload stopped: its batch is gone");
             self.fail_upload(Some(ws), id, "cancelled", shared);
         }
-        if self
-            .drop_upload
-            .as_ref()
-            .is_some_and(|drop| !alive(&drop.id))
-        {
+        if drop_dead {
             self.cancel_drop(ws, "cancelled", shared)?;
         }
-        if self.batch.id.as_deref().is_some_and(|id| !alive(id)) {
+        if batch_dead {
             self.batch = Batch::default();
         }
         Ok(())
