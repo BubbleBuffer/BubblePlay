@@ -1,6 +1,7 @@
 @Tags(['golden'])
 library;
 
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import '../support/harness.dart';
@@ -17,8 +18,13 @@ void main() {
     'exported': Scene(contractState('home'), setUp: (tester) async {
       await openSettings(tester);
       await tester.tap(find.text('Export'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(EditableText), 'pw');
+      await tester.pump();
+      await tester.tap(find.text('Export').last);
       await tester.pump();
       await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
     }),
   });
 }

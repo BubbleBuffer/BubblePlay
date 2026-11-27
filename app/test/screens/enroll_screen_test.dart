@@ -88,6 +88,7 @@ void main() {
       await tester.tap(find.text('Export key'));
       await tester.pumpAndSettle();
       await tester.enterText(find.byType(EditableText), 'pw');
+      await tester.pump();
       await tester.tap(find.text('Export'));
       await tester.pumpAndSettle();
       expect(app.channel.exportPassphrases, ['pw']);
