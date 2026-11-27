@@ -326,7 +326,9 @@ mod tests {
                     && item["mtimeMs"].as_u64().is_some()
                     && item["sha256"].as_str().is_some_and(|hash| {
                         hash.len() == SHA256_BYTES * 2
-                            && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                            && hash
+                                .bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                     })
             })
     }

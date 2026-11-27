@@ -50,7 +50,13 @@ impl Relay {
             .map(|(id, _)| *id)
             .collect();
         for id in &sockets {
-            self.close(*id, 1008, reasons::PEER_REMOVED, "admin.pc-removed", &mut out);
+            self.close(
+                *id,
+                1008,
+                reasons::PEER_REMOVED,
+                "admin.pc-removed",
+                &mut out,
+            );
         }
         for id in sockets {
             self.forget(id, &mut out);

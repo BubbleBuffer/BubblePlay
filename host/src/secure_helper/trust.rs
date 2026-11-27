@@ -284,12 +284,17 @@ mod tests {
     fn image_chain_reaches_a_differently_cased_root_and_fails_closed_otherwise() {
         let image = Path::new(r"C:\PROGRAM FILES\BubblePlay\helper.exe");
         let chain = image_chain(image, Path::new(r"c:\Program Files")).unwrap();
-        assert_eq!(chain.len(), 3, "image, its folder and the root are all checked");
-        assert!(image_chain(image, Path::new(r"C:\Program Files (x86)")).is_err());
-        assert!(
-            image_chain(Path::new(r"C:\Users\x\helper.exe"), Path::new(r"C:\Program Files"))
-                .is_err()
+        assert_eq!(
+            chain.len(),
+            3,
+            "image, its folder and the root are all checked"
         );
+        assert!(image_chain(image, Path::new(r"C:\Program Files (x86)")).is_err());
+        assert!(image_chain(
+            Path::new(r"C:\Users\x\helper.exe"),
+            Path::new(r"C:\Program Files")
+        )
+        .is_err());
     }
 
     use super::*;

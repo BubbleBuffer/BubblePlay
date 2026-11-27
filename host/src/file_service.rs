@@ -38,8 +38,8 @@ mod upload_batch;
 
 use crate::file_auth::Authorizations;
 use crate::file_control::{
-    file_batch_ack_message, file_offer_message, random_id128, to_hex, BatchAnnouncement, ClientControl,
-    DownloadRequest, FileOfferItem,
+    file_batch_ack_message, file_offer_message, random_id128, to_hex, BatchAnnouncement,
+    ClientControl, DownloadRequest, FileOfferItem,
 };
 use crate::file_hash::Sha256;
 use crate::file_transfer::{
