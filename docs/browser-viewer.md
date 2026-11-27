@@ -92,7 +92,8 @@ Settings has two groups that matter here.
 - `sharp-session.js`: the sharp-viewport negotiation with the host (requested, committed and pending crop, the transition timeout and the session-wide disable). The receiver supplies the desktop size, viewport geometry and transport through `createSharpSession(env)` and renders the crop the session reports. Crop math stays in `sharp-viewport.js`.
 - `composition-gate.js`: commits secure-desktop Android composition text once, through one pending transaction.
 - `connection-status.js`: pure model of the connection chip (state, label, tooltip, Admin warning).
-- `keyboard-draft.js`: the on-screen keyboard field: diffs the draft against what was sent, chunks text under the packet limit, and sends protected input only on a secure desktop.
+- `keyboard-draft.js`: the on-screen keyboard field: diffs the draft against what was sent, chunks text under the packet limit, and sends protected input only on a secure desktop. While a sticky modifier is held, typed letters, digits and space go out as key events instead of text.
+- `modifier-latch.js`: the state of the sticky Ctrl, Alt, Shift and Win keys (off, latched, locked), their press and release on the PC, and how a preset chord treats them. `modifier-ui.js` draws the buttons, the strip's latch label and the bar above the soft keyboard.
 - `wss-audio.js`: the WSS audio player for one media session, its sound-controller sink, and cumulative counters across restarts.
 - `hud-text.js`: the text of the diagnostics HUD overlay (pure formatter).
 - `recovery-tracker.js`: the state of a recovery after a lost signaling connection (loss time, retry budget, attempts, suspended time) and its log line; the decisions are the pure functions in `recovery.js`.

@@ -63,3 +63,20 @@ test("secure composition commits once: the trailing input consumes it, the timer
   h.timers.forEach(cb => cb());
   assert.deepEqual(h.sent, [["text", "é"]]);
 });
+
+test("a held modifier turns a soft-keyboard letter into a key event; a one-shot ends after it", () => {
+  const mods = { held: true, oneShot: true };
+  const h = harness({ modifiers: { active: () => mods.held, consumeOneShot: () => { if (mods.oneShot) mods.held = false; } } });
+  h.field.value = "c"; h.draft.input({});
+  assert.deepEqual(h.sent, [["key", 0x43, false], ["key", 0x43, true]]);
+  assert.equal(h.field.value, "");
+  h.field.value = "d"; h.draft.input({});
+  assert.deepEqual(h.sent.slice(2), [["text", "d"]]);
+});
+
+test("a lock keeps turning typed letters into key events", () => {
+  const h = harness({ modifiers: { active: () => true, consumeOneShot: () => {} } });
+  for (const letter of ["a", "b"]) { h.field.value = letter; h.draft.input({}); }
+  assert.deepEqual(h.sent.filter(([kind]) => kind === "text"), []);
+  assert.equal(h.sent.length, 4);
+});

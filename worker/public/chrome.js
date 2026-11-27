@@ -16,7 +16,10 @@ export const SHORTCUTS = Object.freeze([
   { id: "paste", label: "Paste", keys: [CTRL, "KeyV"], desktop: false },
   { id: "cut", label: "Cut", keys: [CTRL, "KeyX"], desktop: false },
   { id: "undo", label: "Undo", keys: [CTRL, "KeyZ"], desktop: false },
+  { id: "redo", label: "Redo", keys: [CTRL, "KeyY"], desktop: false },
   { id: "select-all", label: "Select all", keys: [CTRL, "KeyA"], desktop: false },
+  { id: "save", label: "Save", keys: [CTRL, "KeyS"], desktop: false },
+  { id: "find", label: "Find", keys: [CTRL, "KeyF"], desktop: false },
   { id: "close-tab", label: "Close tab", keys: [CTRL, "KeyW"] },
   { id: "new-tab", label: "New tab", keys: [CTRL, "KeyT"] },
   { id: "new-window", label: "New window", keys: [CTRL, "KeyN"] },
@@ -26,6 +29,9 @@ export const SHORTCUTS = Object.freeze([
   { id: "start", label: "Start menu", keys: [WIN] },
   { id: "show-desktop", label: "Show desktop", keys: [WIN, "KeyD"] },
   { id: "task-manager", label: "Task Manager", keys: [CTRL, SHIFT, "Escape"] },
+  { id: "escape", label: "Escape", keys: ["Escape"], desktop: false },
+  { id: "tab", label: "Tab", keys: ["Tab"], desktop: false },
+  { id: "enter", label: "Enter", keys: ["Enter"], desktop: false },
 ].map(Object.freeze));
 
 const KEY_NAMES = Object.freeze({
@@ -46,6 +52,11 @@ export function chordLabel(keys) { return keys.map(keyName).join("+"); }
 /** Press every key in order, then release in reverse: [[code, up], ...]. */
 export function chordSteps(keys) {
   return [...keys.map(code => [code, false]), ...[...keys].reverse().map(code => [code, true])];
+}
+
+/** Ctrl+Alt+Shift+M: the viewer's own Work/Game switch, never sent to the PC. */
+export function isModeShortcut(event) {
+  return event.code === "KeyM" && event.ctrlKey && event.altKey && event.shiftKey && !event.metaKey;
 }
 
 export function shortcutsFor(layout) {
