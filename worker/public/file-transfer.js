@@ -33,12 +33,16 @@ const encoder = new TextEncoder();
 const strictDecoder = new TextDecoder("utf-8", { fatal: true });
 
 function uint32(value) { return Number.isInteger(value) && value >= 0 && value <= 0xffff_ffff; }
+const ID_BYTES = 16;
+const HEX_RADIX = 16;
+const HEX_DIGITS_PER_BYTE = 2;
+const MAX_ERROR_CODE_CHARS = 64;
 /** Batch and offer ids: 32 lowercase hex digits (128 random bits). */
 export function validId128(value) { return typeof value === "string" && /^[0-9a-f]{32}$/.test(value); }
 export function randomId128() {
-  return bytesToHex(crypto.getRandomValues(new Uint8Array(16)));
+  return bytesToHex(crypto.getRandomValues(new Uint8Array(ID_BYTES)));
 }
-export function bytesToHex(bytes) { return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join(""); }
+export function bytesToHex(bytes) { return Array.from(bytes, byte => byte.toString(HEX_RADIX).padStart(HEX_DIGITS_PER_BYTE, "0")).join(""); }
 function utf8Bytes(text) { return encoder.encode(text).byteLength; }
 
 function bytesOf(value) {
@@ -189,7 +193,7 @@ export function fileRequestMessage(offerId, ids) { return { type: "file-request"
 export function validBatchAck(message) {
   return plainObject(message) && message.type === "file-batch-ack" && message.protocol === 1 &&
     validId128(message.batchId) && typeof message.ok === "boolean" &&
-    (message.error === undefined || (typeof message.error === "string" && message.error.length <= 64));
+    (message.error === undefined || (typeof message.error === "string" && message.error.length <= MAX_ERROR_CODE_CHARS));
 }
 
 /** Validates host -> client `file-offer` signaling text. */

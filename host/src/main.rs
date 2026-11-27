@@ -3249,19 +3249,19 @@ fn run_serve(
                     }
                     if let Some(files) = file_service.as_ref() {
                         match control {
-                            bubbleplay_host::file_transfer::ClientControl::Batch(batch) => {
+                            bubbleplay_host::file_control::ClientControl::Batch(batch) => {
                                 let batch_id = batch.batch_id.clone();
                                 let refusal = files.announce_batch(batch).err();
                                 if let Some(reason) = refusal {
                                     warn!(reason, "file batch announcement refused");
                                 }
                                 signaling.send_text(
-                                    &bubbleplay_host::file_transfer::file_batch_ack_message(
+                                    &bubbleplay_host::file_control::file_batch_ack_message(
                                         &batch_id, refusal,
                                     ),
                                 );
                             }
-                            bubbleplay_host::file_transfer::ClientControl::Request(request) => {
+                            bubbleplay_host::file_control::ClientControl::Request(request) => {
                                 files.grant_download(&request);
                             }
                         }
@@ -6989,41 +6989,7 @@ fn physical_monitor_count() -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn serve_backoff_resets_after_a_healthy_run_and_grows_on_quick_failures() {
-        use std::time::Duration;
-        let max = Duration::from_secs(30);
-        assert_eq!(
-            super::next_serve_backoff(max, Some(Duration::from_secs(120))),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            super::next_serve_backoff(Duration::from_secs(4), Some(Duration::from_secs(5))),
-            Duration::from_secs(8)
-        );
-        assert_eq!(
-            super::next_serve_backoff(Duration::from_secs(1), None),
-            Duration::from_secs(2)
-        );
-        assert_eq!(super::next_serve_backoff(max, None), max);
-    }
-
-    #[test]
-    fn a_healthy_run_that_fails_reconnects_at_once_and_quick_failures_still_wait() {
-        use std::time::Duration;
-        let (wait, next) =
-            super::serve_retry(Duration::from_secs(8), Some(Duration::from_secs(120)));
-        assert_eq!(wait, Duration::ZERO);
-        assert_eq!(next, Duration::from_secs(1));
-        let (wait, next) = super::serve_retry(Duration::from_secs(1), Some(Duration::from_secs(5)));
-        assert_eq!(wait, Duration::from_secs(1));
-        assert_eq!(next, Duration::from_secs(2));
-        let (wait, next) = super::serve_retry(Duration::from_secs(4), None);
-        assert_eq!(
-            (wait, next),
-            (Duration::from_secs(4), Duration::from_secs(8))
-        );
-    }
+    mod backoff;
 
     #[test]
     fn audio_cli_defaults_on_and_accepts_no_audio() {

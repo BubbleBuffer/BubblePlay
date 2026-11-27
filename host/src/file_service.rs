@@ -34,11 +34,13 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 use crate::file_auth::Authorizations;
+use crate::file_control::{
+    random_id128, valid_id128, AnnouncedFile, BatchAnnouncement, DownloadRequest,
+};
 use crate::file_hash::Sha256;
 use crate::file_transfer::{
-    self as ft, BatchAnnouncement, Body, CancelPayload, DownloadRequest, FileOfferItem, Incoming,
-    OfferMeta, Packet, Purpose, RateLimiter, RequestPayload, ResultPayload, SendWindow,
-    TransferError,
+    self as ft, Body, CancelPayload, Incoming, OfferMeta, Packet, Purpose, RateLimiter,
+    RequestPayload, ResultPayload, SendWindow, TransferError,
 };
 use crate::native_file_drop::{DropBatch, NativeDropRequest};
 use crate::wss_media::{data_hello, host_socket_request_routed, HostSocket, RelayRoute};
@@ -160,7 +162,7 @@ impl CurrentOffer {
                 size: item.size,
             })
             .collect();
-        ft::file_offer_message(&self.id, &items, self.source)
+        file_offer_message(&self.id, &items, self.source)
     }
 }
 
@@ -426,7 +428,7 @@ fn publish_offer(shared: &Mutex<Shared>, source: &'static str, items: Vec<Offere
     if items.is_empty() && state.offer.is_none() {
         return;
     }
-    let id = ft::random_id128();
+    let id = random_id128();
     let offer = CurrentOffer {
         id: id.clone(),
         source,
@@ -1867,290 +1869,9 @@ fn mime_for(name: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn uploaded_clipboard_write_does_not_hold_the_input_owners_mutex() {
-        let (mut session, _server, _client, shared, dir) = native_test_session();
-        session.config.clipboard = true;
-        session.batch.saved = vec![dir.join("synthetic.txt")];
-        session.batch.purpose = Some(Purpose::Paste);
-        session.finish_batch_with(&shared, |_| {
-            // The native call can block arbitrarily. Foreground/window work
-            // must not prevent the input owner from reading or changing state.
-            let mut state = shared
-                .try_lock()
-                .expect("clipboard write held session mutex");
-            rebind(&mut state, Some("replacement-viewer"));
-            Ok(42)
-        });
-        let state = lock(&shared);
-        assert_eq!(state.own_clipboard_seq, Some(42));
-        assert_eq!(
-            state.outbox.pastes, 0,
-            "old viewer must not paste into a new session"
-        );
-        drop(state);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn live_paste_batch_queues_one_paste_for_the_bound_viewer() {
-        let (mut session, _server, _client, shared, dir) = native_test_session();
-        session.config.clipboard = true;
-        session.batch.saved = vec![dir.join("synthetic.txt")];
-        session.batch.purpose = Some(Purpose::Paste);
-        session.finish_batch_with(&shared, |_| Ok(9));
-        let state = lock(&shared);
-        assert_eq!(state.own_clipboard_seq, Some(9));
-        assert_eq!(state.outbox.pastes, 1);
-        drop(state);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn stale_batch_never_reaches_the_clipboard_or_queues_a_paste() {
-        let (mut session, _server, _client, shared, dir) = native_test_session();
-        session.config.clipboard = true;
-        session.batch.saved = vec![dir.join("synthetic.txt")];
-        session.batch.purpose = Some(Purpose::Paste);
-        rebind(&mut lock(&shared), Some("replacement-viewer"));
-        let mut called = false;
-        session.finish_batch_with(&shared, |_| {
-            called = true;
-            Ok(7)
-        });
-        assert!(!called, "a stale batch must not call the clipboard");
-        let state = lock(&shared);
-        assert_eq!(state.own_clipboard_seq, None);
-        assert_eq!(state.outbox.pastes, 0);
-        drop(state);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn clearing_the_epoch_discards_the_old_outbox_and_pending_native_drops() {
-        let (_session, _server, _client, shared, dir) = native_test_session();
-        let batch = DropBatch::new(vec![drop_meta(0, 1)]).unwrap();
-        let point = ft::DropPoint {
-            x: 12,
-            y: 34,
-            generation: 1,
-            viewport_revision: 2,
-        };
-        {
-            let mut state = lock(&shared);
-            state.outbox.signals.push("old-offer".into());
-            state.outbox.pastes = 2;
-            state
-                .outbox
-                .drops
-                .push(NativeDropRequest::new(batch, point, "test".into()));
-        }
-        let stale = rebind(&mut lock(&shared), None);
-        assert_eq!(stale.len(), 1, "the pending drop is handed back to reject");
-        for request in stale {
-            request.reject("viewer-changed");
-        }
-        let state = lock(&shared);
-        assert_eq!(state.epoch, None);
-        assert!(state.outbox.signals.is_empty());
-        assert_eq!(state.outbox.pastes, 0);
-        assert!(state.outbox.drops.is_empty());
-        drop(state);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn stale_socket_session_stops_before_reading_and_removes_its_partial_upload() {
-        let (mut session, mut ws, _client, shared, dir) = native_test_session();
-        session.receiving = Some(receiving(&dir, "pending.bin", 3));
-        let partial = session.receiving.as_ref().unwrap().partial.clone();
-        rebind(&mut lock(&shared), Some("replacement-viewer"));
-        let stop = AtomicBool::new(false);
-        session.serve(&mut ws, &shared, &stop).unwrap();
-        session.abort_all("socket-closed");
-        assert!(!partial.exists());
-        assert!(session.receiving.is_none());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn stale_viewer_packets_are_not_processed_while_the_bound_viewer_gets_them() {
-        let (mut session, mut ws, _client, shared, dir) = native_test_session();
-        announce(&shared, &[meta("a.bin", 3)], digest(b"abc"));
-        let offer = ft::encode(&Packet {
-            transfer_id: 41,
-            seq: 0,
-            body: Body::Offer(meta("a.bin", 3)),
-        });
-        session.on_packet(&mut ws, &offer, &shared).unwrap();
-        assert!(
-            session.receiving.is_some(),
-            "control: the bound viewer's offer is accepted"
-        );
-        session.abort_all("socket-closed");
-        rebind(&mut lock(&shared), Some("replacement-viewer"));
-        session.on_packet(&mut ws, &offer, &shared).unwrap();
-        assert!(session.receiving.is_none());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn an_unannounced_offer_is_refused_and_leaves_nothing_behind() {
-        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-        session
-            .on_packet(&mut ws, &offer_packet(41, &meta("planted.bin", 3)), &shared)
-            .unwrap();
-        assert_eq!(cancel_reason(&mut client), "unannounced");
-        assert!(session.receiving.is_none());
-        let mut drop_offer = drop_meta(0, 1);
-        drop_offer.batch_id = format!("{:032x}", 9);
-        session
-            .on_packet(&mut ws, &offer_packet(42, &drop_offer), &shared)
-            .unwrap();
-        assert_eq!(cancel_reason(&mut client), "unannounced");
-        assert!(session.drop_upload.is_none());
-        assert!(lock(&shared).outbox.drops.is_empty());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn an_offer_that_differs_from_its_announcement_is_refused() {
-        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-        announce(&shared, &[meta("a.bin", 3)], digest(b"abc"));
-        for wrong in [meta("a.bin", 4), meta("b.bin", 3), {
-            let mut paste = meta("a.bin", 3);
-            paste.purpose = Purpose::Paste;
-            paste
-        }] {
-            session
-                .on_packet(&mut ws, &offer_packet(41, &wrong), &shared)
-                .unwrap();
-            assert_eq!(cancel_reason(&mut client), "unannounced");
-            assert!(session.receiving.is_none());
-        }
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn bytes_that_do_not_match_the_announced_hash_never_reach_the_clipboard_or_paste() {
-        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-        let mut paste = meta("a.bin", 3);
-        paste.purpose = Purpose::Paste;
-        announce(&shared, std::slice::from_ref(&paste), digest(b"abc"));
-        session
-            .on_packet(&mut ws, &offer_packet(41, &paste), &shared)
-            .unwrap();
-        assert!(matches!(
-            ft::decode(&read_packet(&mut client)).unwrap().body,
-            Body::Accept
-        ));
-        // Right size, other bytes, and a DONE hash that matches those bytes (not the announcement).
-        session.on_data(&mut ws, 41, 0, b"abd", &shared).unwrap();
-        session
-            .on_done(&mut ws, 41, &digest(b"abd"), &shared)
-            .unwrap();
-        match ft::decode(&read_non_ack(&mut client)).unwrap().body {
-            Body::Result(result) => {
-                assert!(!result.ok);
-                assert_eq!(result.error.as_deref(), Some("hash-mismatch"));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        assert!(session.batch.saved.is_empty());
-        let state = lock(&shared);
-        assert_eq!(state.stats.uploads_ok, 0);
-        assert_eq!(state.outbox.pastes, 0);
-        assert!(state.own_clipboard_seq.is_none());
-        drop(state);
-        assert_eq!(
-            fs::read_dir(&dir).unwrap().count(),
-            0,
-            "no partial or final file"
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn an_announced_file_is_saved_once_and_a_replay_of_its_batch_is_refused() {
-        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-        let upload = meta("a.bin", 3);
-        announce(&shared, std::slice::from_ref(&upload), digest(b"abc"));
-        session
-            .on_packet(&mut ws, &offer_packet(41, &upload), &shared)
-            .unwrap();
-        read_packet(&mut client);
-        session.on_data(&mut ws, 41, 0, b"abc", &shared).unwrap();
-        session
-            .on_done(&mut ws, 41, &digest(b"abc"), &shared)
-            .unwrap();
-        match ft::decode(&read_non_ack(&mut client)).unwrap().body {
-            Body::Result(result) => assert!(result.ok),
-            other => panic!("unexpected {other:?}"),
-        }
-        assert_eq!(fs::read(dir.join("a.bin")).unwrap(), b"abc");
-        session
-            .on_packet(&mut ws, &offer_packet(42, &upload), &shared)
-            .unwrap();
-        assert_eq!(cancel_reason(&mut client), "unannounced");
-        assert!(session.receiving.is_none());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_request_is_served_only_for_an_item_the_viewer_asked_for_over_control() {
-        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-        session.request_grace = Duration::ZERO;
-        let file = dir.join("offered.bin");
-        fs::write(&file, b"secret").unwrap();
-        publish_offer(
-            &shared,
-            "clipboard",
-            vec![OfferedFile {
-                id: 1,
-                path: file,
-                name: "offered.bin".into(),
-                size: 6,
-            }],
-        );
-        let offer_id = lock(&shared).offer.as_ref().unwrap().id.clone();
-        let request = |offer_id: &str| RequestPayload {
-            offer_id: offer_id.into(),
-            id: 1,
-        };
-        // Guessing an id, and the right id nobody asked for.
-        for guess in [format!("{:032x}", 1), offer_id.clone()] {
-            session
-                .requests
-                .push_back((9, request(&guess), Instant::now()));
-            session.start_next_request(&mut ws, &shared).unwrap();
-            let reason = cancel_reason(&mut client);
-            assert!(
-                reason == "unknown-offer" || reason == "unauthorized",
-                "{reason}"
-            );
-            assert!(session.sending.is_none());
-        }
-        // Control: asked for over the sealed channel, served once.
-        lock(&shared).auth.grant(&offer_id, &[1], Instant::now());
-        session
-            .requests
-            .push_back((10, request(&offer_id), Instant::now()));
-        session.start_next_request(&mut ws, &shared).unwrap();
-        assert!(matches!(
-            ft::decode(&read_packet(&mut client)).unwrap().body,
-            Body::Offer(_)
-        ));
-        session.sending = None;
-        session
-            .requests
-            .push_back((11, request(&offer_id), Instant::now()));
-        session.start_next_request(&mut ws, &shared).unwrap();
-        assert_eq!(cancel_reason(&mut client), "unauthorized");
-        fs::remove_dir_all(dir).unwrap();
-    }
+    mod auth;
+    mod batches;
+    mod native;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -2194,7 +1915,7 @@ mod tests {
                     drop: first.drop,
                     files: metas
                         .iter()
-                        .map(|m| ft::AnnouncedFile {
+                        .map(|m| AnnouncedFile {
                             name: m.name.clone(),
                             size: m.size,
                             sha256,
@@ -2313,156 +2034,6 @@ mod tests {
         }
     }
     #[test]
-    fn prepared_large_upload_rejects_second_batch_and_bad_hash_without_delivery() {
-        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-        let mut large = drop_meta(0, 1);
-        large.size = crate::native_file_drop::PREPARE_NATIVE_DROP_BYTES;
-        announce(&shared, std::slice::from_ref(&large), [7; 32]);
-        session
-            .on_offer(&mut ws, 41, large.clone(), &shared)
-            .unwrap();
-        read_packet(&mut client);
-        let path = session
-            .drop_upload
-            .as_ref()
-            .unwrap()
-            .batch
-            .as_ref()
-            .unwrap()
-            .path(0);
-        let request = lock(&shared).outbox.drops.pop().unwrap();
-        assert!(request.preparation_required());
-        assert_eq!(request.preparation_status(), Ok(false));
-        let mut next = drop_meta(0, 1);
-        next.batch_id = format!("{:032x}", 2);
-        session.on_offer(&mut ws, 42, next, &shared).unwrap();
-        match ft::decode(&read_packet(&mut client)).unwrap().body {
-            Body::Cancel(payload) => assert_eq!(payload.reason, "busy"),
-            other => panic!("unexpected {other:?}"),
-        }
-        let chunk = vec![0; ft::MAX_DATA_BYTES];
-        for seq in 0..(large.size / chunk.len() as u64) {
-            session
-                .on_data(&mut ws, 41, seq as u32, &chunk, &shared)
-                .unwrap();
-        }
-        assert_eq!(
-            request.preparation_status(),
-            Ok(false),
-            "bytes alone never make the batch deliverable"
-        );
-        session.on_done(&mut ws, 41, &[0; 32], &shared).unwrap();
-        assert_eq!(request.preparation_status(), Err("hash-mismatch".into()));
-        match ft::decode(&read_non_ack(&mut client)).unwrap().body {
-            Body::Cancel(payload) => assert_eq!(payload.reason, "hash-mismatch"),
-            other => panic!("unexpected {other:?}"),
-        }
-        request.reject("test-cleanup");
-        assert!(session.drop_upload.is_none());
-        assert!(!path.exists());
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
-        fs::remove_dir(&dir).unwrap();
-    }
-    #[test]
-    fn native_batch_starts_at_metadata_and_results_wait_for_every_hash() {
-        let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-        announce(&shared, &[drop_meta(0, 2), drop_meta(1, 2)], digest(b"abc"));
-        session
-            .on_offer(&mut ws, 1, drop_meta(0, 2), &shared)
-            .unwrap();
-        assert!(matches!(
-            ft::decode(&read_packet(&mut client)).unwrap().body,
-            Body::Accept
-        ));
-        assert!(lock(&shared).outbox.drops.is_empty());
-        session
-            .on_offer(&mut ws, 2, drop_meta(1, 2), &shared)
-            .unwrap();
-        read_packet(&mut client);
-        assert_eq!(lock(&shared).outbox.drops.len(), 1);
-        // A fake target accepts; hashes still gate RESULT for the entire batch.
-        session
-            .drop_upload
-            .as_ref()
-            .unwrap()
-            .batch
-            .as_ref()
-            .unwrap()
-            .accepted_for_test();
-        let mut hash = Sha256::new().unwrap();
-        hash.update(b"abc");
-        let digest = hash.finish();
-        session.on_data(&mut ws, 1, 0, b"abc", &shared).unwrap();
-        session.on_done(&mut ws, 1, &digest, &shared).unwrap();
-        assert!(matches!(
-            ft::decode(&read_packet(&mut client)).unwrap().body,
-            Body::Ack(3)
-        ));
-        assert_eq!(lock(&shared).stats.uploads_ok, 0);
-        assert_eq!(
-            fs::read_dir(&dir).unwrap().count(),
-            0,
-            "drop files never reach Downloads"
-        );
-        session.on_data(&mut ws, 2, 0, b"abc", &shared).unwrap();
-        session.on_done(&mut ws, 2, &digest, &shared).unwrap();
-        for _ in 0..2 {
-            assert!(matches!(
-                ft::decode(&read_non_ack(&mut client)).unwrap().body,
-                Body::Result(ResultPayload { ok: true, .. })
-            ));
-        }
-        assert_eq!(lock(&shared).stats.uploads_ok, 2);
-        assert_eq!(lock(&shared).outbox.pastes, 0);
-        lock(&shared).outbox.drops.clear();
-        fs::remove_dir(&dir).unwrap();
-    }
-    #[test]
-    fn native_target_reject_and_hash_failure_cancel_and_remove_private_cache() {
-        for reject_target in [true, false] {
-            let (mut session, mut ws, mut client, shared, dir) = native_test_session();
-            announce(&shared, &[drop_meta(0, 1)], digest(b"abc"));
-            session
-                .on_offer(&mut ws, 7, drop_meta(0, 1), &shared)
-                .unwrap();
-            read_packet(&mut client);
-            let path = session
-                .drop_upload
-                .as_ref()
-                .unwrap()
-                .batch
-                .as_ref()
-                .unwrap()
-                .path(0);
-            let request = lock(&shared).outbox.drops.pop().unwrap();
-            if reject_target {
-                request.reject("drop-unavailable");
-                session.poll_drop(&mut ws, &shared).unwrap();
-            } else {
-                session.on_data(&mut ws, 7, 0, b"abc", &shared).unwrap();
-                session.on_done(&mut ws, 7, &[0; 32], &shared).unwrap();
-                request.reject("test-cleanup");
-            }
-            let bytes = read_non_ack(&mut client);
-            match ft::decode(&bytes).unwrap().body {
-                Body::Cancel(payload) => assert_eq!(
-                    payload.reason,
-                    if reject_target {
-                        "drop-unavailable"
-                    } else {
-                        "hash-mismatch"
-                    }
-                ),
-                other => panic!("unexpected {other:?}"),
-            }
-            assert!(session.drop_upload.is_none());
-            assert!(!path.exists());
-            assert_eq!(lock(&shared).stats.uploads_failed, 1);
-            fs::remove_dir(&dir).unwrap();
-        }
-    }
-
-    #[test]
     fn partial_and_final_files_carry_the_mark_of_the_web() {
         let dir = scratch("motw");
         let mut upload = receiving(&dir, "report.pdf", 5);
@@ -2563,7 +2134,7 @@ mod tests {
             serde_json::from_str(&lock(&shared).outbox.signals[0]).unwrap();
         assert_eq!(first["source"], "sendto");
         let first_id = first["offerId"].as_str().unwrap().to_owned();
-        assert!(ft::valid_id128(&first_id));
+        assert!(valid_id128(&first_id));
         assert_eq!(
             first["items"].as_array().unwrap().len(),
             2,
@@ -2584,7 +2155,7 @@ mod tests {
             .collect();
         assert_eq!(messages.len(), 3);
         let second_id = messages[1]["offerId"].as_str().unwrap();
-        assert!(ft::valid_id128(second_id));
+        assert!(valid_id128(second_id));
         assert_ne!(second_id, first_id, "every offer gets a fresh random id");
         assert_eq!(messages[1]["items"].as_array().unwrap().len(), 1);
         assert_eq!(messages[2]["items"].as_array().unwrap().len(), 0);

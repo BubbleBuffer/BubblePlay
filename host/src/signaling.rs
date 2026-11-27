@@ -945,7 +945,7 @@ pub enum SignalEvent {
     RemoteCandidate(String),
     FileDragPreview(FileDragPreviewControl),
     /// A viewer's `file-batch` announcement or `file-request`, from the sealed control channel.
-    FileControl(crate::file_transfer::ClientControl),
+    FileControl(crate::file_control::ClientControl),
     /// Authenticated browser profiling snapshot (enabled with ?profile=1).
     ClientDiagnostics {
         seq: u64,
@@ -1620,7 +1620,7 @@ impl Signaling {
                             events.push(SignalEvent::WindowList(control));
                             continue;
                         }
-                        if let Some(control) = crate::file_transfer::parse_client_control(&text) {
+                        if let Some(control) = crate::file_control::parse_client_control(&text) {
                             // Sealed control only: this text came out of the device-key AEAD.
                             events.push(SignalEvent::FileControl(control));
                             continue;
@@ -2735,26 +2735,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    #[test]
-    fn signaling_keepalive_expires_only_after_the_bounded_silence_window() {
-        let acknowledged = Instant::now();
-        assert!(!keepalive_expired(
-            acknowledged,
-            acknowledged + KEEPALIVE_TIMEOUT
-        ));
-        assert!(keepalive_expired(
-            acknowledged,
-            acknowledged + KEEPALIVE_TIMEOUT + Duration::from_millis(1)
-        ));
-    }
-
-    #[test]
-    fn signaling_pong_has_a_distinct_wire_shape() {
-        assert_eq!(
-            serde_json::to_string(&SignalMsg::Pong).unwrap(),
-            r#"{"type":"pong"}"#
-        );
-    }
+    mod keepalive;
 
     #[test]
     fn feedback_roi_activity_serializes_a_complete_inactive_capability_window() {

@@ -8,7 +8,8 @@
 
 use std::time::{Duration, Instant};
 
-use crate::file_transfer::{BatchAnnouncement, DropPoint, OfferMeta, Purpose, SHA256_BYTES};
+use crate::file_control::BatchAnnouncement;
+use crate::file_transfer::{DropPoint, OfferMeta, Purpose, SHA256_BYTES};
 
 /// An announced batch is dropped when this long passes without progress on it.
 const BATCH_IDLE: Duration = Duration::from_secs(15 * 60);
@@ -173,7 +174,7 @@ impl Authorizations {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_transfer::AnnouncedFile;
+    use crate::file_control::AnnouncedFile;
 
     fn id(n: u32) -> String {
         format!("{n:032x}")

@@ -27,6 +27,7 @@ pub(crate) mod encoder_reconfigure;
 pub mod feedback_roi;
 pub mod feedback_store;
 pub mod file_auth;
+pub mod file_control;
 pub mod file_hash;
 pub mod file_service;
 pub mod file_transfer;

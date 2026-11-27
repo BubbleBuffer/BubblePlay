@@ -1104,9 +1104,7 @@ async function handleEndpointSignal(socket, generation, msg) {
       renderSoundSlot();
       if (sessionState.wssSelected && !sessionState.usingWssMedia) requestWssMediaStart();
       break;
-    case "file-offer":
-      fileClient.setOffer(msg);
-      break;
+    case "file-offer": fileClient.setOffer(msg); break;
     case "file-batch-ack": fileClient.onBatchAck(msg); break;
     case "first-frame":
       handleFirstFrameMessage(msg);
