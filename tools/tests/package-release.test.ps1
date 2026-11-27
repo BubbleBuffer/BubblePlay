@@ -72,6 +72,11 @@ try {
     finally { $zip.Dispose() }
     $count++
 
+    # SHA256SUMS sits next to the ZIP and matches it in `sha256sum -c` format.
+    $sums = [IO.File]::ReadAllText((Join-Path $parameters.OutputDir 'SHA256SUMS'))
+    Assert ($sums -ceq ("{0} *{1}`n" -f $first.sha256, [IO.Path]::GetFileName($first.path))) 'SHA256SUMS lists the ZIP by its actual hash.'
+    $count++
+
     $parameters.OutputDir = Join-Path $fixture 'out-two'
     $second = & $Builder @parameters
     Assert ($first.sha256 -ceq $second.sha256) 'Identical inputs produce a byte-identical ZIP independent of output path.'
