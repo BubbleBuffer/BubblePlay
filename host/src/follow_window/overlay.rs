@@ -39,7 +39,11 @@ fn covers_monitor(window: Rect, monitor: Rect) -> bool {
 /// the Snipping Tool's capture layer, not a window living on one monitor. Following it would jump
 /// monitors, so it is ignored like a shell window.
 pub fn spans_multiple_monitors(window: Rect, monitors: &[Rect]) -> bool {
-    monitors.iter().filter(|m| covers_monitor(window, **m)).count() >= 2
+    monitors
+        .iter()
+        .filter(|m| covers_monitor(window, **m))
+        .count()
+        >= 2
 }
 
 /// Whether `window` contains the whole monitor rectangle. A maximised window stops at the
@@ -106,7 +110,11 @@ mod tests {
             // The normal window, and a maximised one (work area: the taskbar is excluded).
             ("SnippingTool.exe", Rect::new(300, 200, 900, 600), false),
             ("SnippingTool.exe", Rect::new(0, 0, 1920, 1040), false),
-            ("ScreenClippingHost.exe", Rect::new(1920, 0, 2560, 1400), false),
+            (
+                "ScreenClippingHost.exe",
+                Rect::new(1920, 0, 2560, 1400),
+                false,
+            ),
             // Other executables are never ignored by name, fullscreen or not.
             ("Game.exe", left, false),
             ("", left, false),
