@@ -469,7 +469,7 @@
   },
   "host/src/secure_helper/trust.rs": {
     "clippy::let_underscore_must_use": 2,
-    "clippy::unwrap_used": 2
+    "clippy::unwrap_used": 1
   },
   "host/src/session_watchdog.rs": {
     "clippy::let_underscore_must_use": 1
