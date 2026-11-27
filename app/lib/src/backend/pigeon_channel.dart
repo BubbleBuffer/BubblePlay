@@ -22,7 +22,10 @@ class PigeonChannel implements AppChannel, AppFlutterApi {
   Future<void> act(String actionJson) => _host.act(actionJson);
 
   @override
-  Future<String> exportKey() => _host.exportKey();
+  Future<String> exportKey({String? passphrase}) => _host.exportKey(passphrase);
+
+  @override
+  bool get sealsExport => true;
 
   @override
   Stream<void> get changes => _changes.stream;

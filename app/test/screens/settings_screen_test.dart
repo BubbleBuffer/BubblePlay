@@ -47,17 +47,50 @@ void main() {
       expect(find.text('About'), findsOneWidget);
     });
 
-    testWidgets('Export saves the key and confirms it', (tester) async {
+    testWidgets('Export seals the key under the typed passphrase', (tester) async {
       final app = await pumpApp(tester, contractState('home'));
       await _openSettings(tester);
       await tester.tap(find.text('Export'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(EditableText), 'pw');
+      await tester.pump();
+      await tester.tap(find.text('Export').last);
       await tester.pump();
       await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(app.channel.exportPassphrases, ['pw']);
       expect(
         app.keyFiles.saved['bubbleplay-device-key.bpkey'],
-        app.channel.keyText,
+        '${app.channel.keyText}#sealed:pw',
       );
       expect(find.text('Key file saved'), findsOneWidget);
+    });
+
+    testWidgets('Export without a passphrase needs a second confirm', (tester) async {
+      final app = await pumpApp(tester, contractState('home'));
+      await _openSettings(tester);
+      await tester.tap(find.text('Export'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Export without passphrase'));
+      await tester.pumpAndSettle();
+      // Nothing is exported until the warning is confirmed.
+      expect(app.channel.exportPassphrases, isEmpty);
+      expect(find.text('Export without passphrase?'), findsOneWidget);
+      await tester.tap(find.text('Export').last);
+      await tester.pumpAndSettle();
+      expect(app.channel.exportPassphrases, [null]);
+      expect(app.keyFiles.saved['bubbleplay-device-key.bpkey'], app.channel.keyText);
+    });
+
+    testWidgets('Cancelling the export writes nothing', (tester) async {
+      final app = await pumpApp(tester, contractState('home'));
+      await _openSettings(tester);
+      await tester.tap(find.text('Export'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(app.channel.exportPassphrases, isEmpty);
+      expect(app.keyFiles.saved, isEmpty);
     });
 
     testWidgets('the theme select sets Dark, Light and System', (tester) async {
@@ -124,24 +157,6 @@ void main() {
       expect(find.text(_keyPath()), findsOneWidget);
       expect(find.text('Version'), findsOneWidget);
       expect(find.text('0.1.0'), findsOneWidget);
-    });
-
-    testWidgets('Export saves the key on a phone too', (tester) async {
-      final app = await pumpApp(
-        tester,
-        contractState('home'),
-        screen: Screen.phone,
-        windows: false,
-      );
-      await _openSettings(tester);
-      await tester.tap(find.text('Export'));
-      await tester.pump();
-      await tester.pump();
-      expect(
-        app.keyFiles.saved['bubbleplay-device-key.bpkey'],
-        app.channel.keyText,
-      );
-      expect(find.text('Key file saved'), findsOneWidget);
     });
 
     testWidgets('the back arrow closes the page', (tester) async {

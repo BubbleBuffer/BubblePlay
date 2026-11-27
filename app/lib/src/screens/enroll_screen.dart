@@ -4,6 +4,7 @@ import 'package:flutter/widgets.dart' hide Action, Flow;
 import '../app.dart';
 import '../app_tokens.dart';
 import '../model/model.dart';
+import 'key_export.dart';
 
 /// The file this device stores its own key in. Its passphrase prompt is the unlock step, not an
 /// import from another device.
@@ -118,10 +119,7 @@ class _CreatedState extends State<_Created> {
   bool _saved = false;
 
   Future<void> _export() async {
-    final env = AppScope.of(context);
-    final text = await env.controller.exportKey();
-    if (!mounted) return;
-    final saved = await env.keyFiles.save(exportedKeyFileName, text);
+    final saved = await exportKeyFile(context);
     if (!mounted) return;
     if (saved) setState(() => _saved = true);
   }

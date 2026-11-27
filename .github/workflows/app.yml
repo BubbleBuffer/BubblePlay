@@ -69,11 +69,21 @@ jobs:
           distribution: temurin
           java-version: "17"
           cache: gradle
-      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
-        with:
-          channel: stable
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-          cache: true
+      - name: Flutter SDK
+        # Not subosito/flutter-action: its cache step uses actions/cache@v5, which the repository's
+        # pin-to-SHA policy rejects. Same install as flutter-apk.yml: one copy per version in the home.
+        run: |
+          dir="$HOME/flutter-$FLUTTER_VERSION"
+          if [ ! -x "$dir/bin/flutter" ]; then
+            tmp="$(mktemp -d)"
+            curl --proto '=https' --tlsv1.2 -sSfL -o "$tmp/flutter.tar.xz"               "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz"
+            tar -xJf "$tmp/flutter.tar.xz" -C "$tmp"
+            rm -rf "$dir"
+            mv "$tmp/flutter" "$dir"
+            rm -rf "$tmp"
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          echo "PUB_CACHE=$HOME/.pub-cache" >> "$GITHUB_ENV"
       - name: Flutter configuration
         run: |
           flutter --version
