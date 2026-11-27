@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   SETTINGS_KEY, SETTINGS_VERSION, DEFAULT_SETTINGS,
-  loadSettings, normalizeSettings, qualityStorageView, saveSettings,
+  loadSettings, normalizeSettings, pointerModeFor, qualityStorageView, rememberPointerMode, saveSettings,
 } from "../public/settings.js";
 import {
-  SHORTCUTS, chordLabel, chordSteps, createEdgeReveal, keyName, popoverPosition, shortcutsFor,
+  SHORTCUTS, isModeShortcut, chordLabel, chordSteps, createEdgeReveal, keyName, popoverPosition, shortcutsFor,
 } from "../public/chrome.js";
 import { parseQualityPreset } from "../public/transport.js";
 
@@ -64,9 +64,9 @@ test("follow active window is a boolean setting, off by default, added without r
   // A version-1 record saved before the field existed keeps every other choice.
   const older = { version: SETTINGS_VERSION, quality: "saver", pointerMode: "game", keyboardLock: false, scrollSpeed: 2, defaultMonitor: "\\\\.\\DISPLAY2" };
   const storage = memoryStorage({ [SETTINGS_KEY]: JSON.stringify(older) });
-  assert.deepEqual(loadSettings(storage), { ...older, followWindow: false, clipboardAutoCopy: true });
+  assert.deepEqual(loadSettings(storage), { ...older, followWindow: false, clipboardAutoCopy: true, pointerModes: {} });
   saveSettings(storage, { ...loadSettings(storage), followWindow: true });
-  assert.deepEqual(loadSettings(storage), { ...older, followWindow: true, clipboardAutoCopy: true });
+  assert.deepEqual(loadSettings(storage), { ...older, followWindow: true, clipboardAutoCopy: true, pointerModes: {} });
 });
 
 test("automatic PC clipboard copying defaults on and persists an explicit opt-out", () => {
@@ -172,4 +172,38 @@ test("file transfer lives in the Files popover with a picker, gated on the capab
   // Drop and paste uploads stay wired through file-ui.js and the paste hook.
   assert.match(client, /const pastedFiles = fileTransferAvailable\(\) \? filesFromPaste\(e\) : \[\]/);
   assert.match(client, /veil: document\.getElementById\("file-drop-veil"\)/);
+});
+
+test("pointer mode is remembered per PC and falls back to the global value", () => {
+  const storage = memoryStorage();
+  const settings = loadSettings(storage);
+  rememberPointerMode(settings, "pc-a", "game");
+  saveSettings(storage, settings);
+  const reloaded = loadSettings(storage);
+  assert.equal(pointerModeFor(reloaded, "pc-a"), "game");
+  assert.equal(pointerModeFor(reloaded, "pc-b"), "desktop");
+  assert.equal(pointerModeFor({ ...DEFAULT_SETTINGS, pointerMode: "game" }, "pc-b"), "game");
+  rememberPointerMode(reloaded, "pc-b", "desktop");
+  assert.equal(pointerModeFor(reloaded, "pc-b"), "desktop");
+  assert.equal(pointerModeFor(reloaded, "pc-a"), "game");
+  assert.equal(normalizeSettings({ pointerModes: { x: "bogus", y: "game", __proto__: "game" } }).pointerModes.x, undefined);
+});
+
+test("the Shortcuts list holds every Android row in Android's order, plus named web extras", () => {
+  const android = [
+    "Copy", "Paste", "Cut", "Undo", "Redo", "Select all", "Save", "Find", "Close tab", "New tab",
+    "Reopen closed tab", "Switch window", "Close window", "Start menu", "Show desktop", "Task Manager",
+    "Escape", "Tab", "Enter",
+  ];
+  // The browser swallows Ctrl+N, so the preset is the only way to send it from the web viewer.
+  const webExtras = ["New window"];
+  const labels = SHORTCUTS.map(shortcut => shortcut.label);
+  assert.deepEqual(labels.filter(label => !android.includes(label)), webExtras);
+  assert.deepEqual(labels.filter(label => android.includes(label)), android);
+});
+
+test("Ctrl+Alt+Shift+M is the mode shortcut and nothing else is", () => {
+  const press = over => ({ code: "KeyM", ctrlKey: true, altKey: true, shiftKey: true, metaKey: false, ...over });
+  assert.equal(isModeShortcut(press()), true);
+  for (const over of [{ ctrlKey: false }, { altKey: false }, { shiftKey: false }, { metaKey: true }, { code: "KeyN" }]) assert.equal(isModeShortcut(press(over)), false);
 });
